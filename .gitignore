@@ -1,0 +1,6 @@
+target/
+.gos-cache/
+bin/
+data/
+dist/
+project.lock

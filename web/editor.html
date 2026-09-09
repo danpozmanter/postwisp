@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Editor — postwisp</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/theme-boot.js"></script>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/" id="brand">postwisp</a>
+  <nav class="site-nav">
+    <a href="/posts">Posts</a>
+    <a href="/settings">Settings</a>
+    <a href="/admin">Admin</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+  <h1 class="page-title" id="heading">New post</h1>
+  <p class="page-sub">Write in markdown. The preview renders live.</p>
+
+  <div id="gate" hidden class="notice">
+    You need to be logged in to write. <a href="/admin">Go to the admin dashboard to log in</a>,
+    then come back here.
+  </div>
+
+  <div id="editor" hidden>
+    <div class="meta-row">
+      <div class="field">
+        <label for="title">Title</label>
+        <input id="title" maxlength="200" placeholder="Post title">
+      </div>
+      <div class="field">
+        <label for="status">Status</label>
+        <select id="status">
+          <option value="draft">Draft</option>
+          <option value="published">Published</option>
+        </select>
+      </div>
+    </div>
+    <div class="meta-row">
+      <div class="field">
+        <label for="slug">Slug</label>
+        <input id="slug" maxlength="96" placeholder="auto-generated from title">
+      </div>
+      <div class="field">
+        <label for="tags">Tags (comma-separated)</label>
+        <input id="tags" placeholder="essays, tech">
+      </div>
+    </div>
+
+    <div class="cover-row" id="cover-row">
+      <div class="cover-thumb" id="cover-thumb">no cover</div>
+      <div class="cover-controls">
+        <div class="cover-title">Cover image</div>
+        <p class="cover-sub">Picked from Unsplash search (Hashnode-style) — becomes the post's header on the public page. The first image in the markdown is the cover.</p>
+        <div class="row">
+          <button type="button" class="btn" id="cover-pick">Search Unsplash</button>
+          <button type="button" class="btn ghost" id="cover-remove" hidden>Remove</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <button type="button" class="btn" data-before="**" data-after="**"><b>B</b></button>
+      <button type="button" class="btn" data-before="*" data-after="*"><i>I</i></button>
+      <button type="button" class="btn" data-before="## " data-after="">H2</button>
+      <button type="button" class="btn" data-before="### " data-after="">H3</button>
+      <button type="button" class="btn" data-before="`" data-after="`">Code</button>
+      <button type="button" class="btn" data-before="- " data-after="">List</button>
+      <button type="button" class="btn" data-before="> " data-after="">Quote</button>
+      <button type="button" class="btn" id="linkbtn">Link</button>
+      <button type="button" class="btn" id="imgbtn">Image</button>
+    </div>
+
+    <div class="editor-grid">
+      <div class="pane">
+        <textarea id="source" placeholder="# Heading&#10;&#10;Write your post in markdown&hellip;"></textarea>
+        <div class="statusline"><span id="wc">0 words</span> &middot; <span id="slugline"></span></div>
+      </div>
+      <div class="pane prose" id="preview">
+        <p class="muted">Preview appears here as you type.</p>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="save">Save</button>
+      <button type="button" class="btn" id="publish">Publish now</button>
+      <a class="btn" id="viewlink" hidden>View post</a>
+      <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
+      <span id="msg" class="flash" hidden></span>
+    </div>
+  </div>
+</div>
+
+<footer class="site-footer"><div class="wrap">Powered by postwisp</div></footer>
+
+<script>
+// theme applied pre-paint by /theme-boot.js (localStorage choice first,
+// site-wide setting as fallback) — no flash of the wrong theme.
+
+const $ = id => document.getElementById(id);
+let postId = null;
+let slugTouched = false;
+
+async function jfetch(u, opts) {
+    const r = await fetch(u, Object.assign({
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin'
+    }, opts));
+    let data = null;
+    try { data = await r.json(); } catch (e) { /* no body */ }
+    if (!r.ok) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    return data;
+}
+
+function slugify(s) {
+    return s.toLowerCase().trim()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 96);
+}
+
+function updateWc() {
+    const n = ($('source').value.trim().match(/\S+/g) || []).length;
+    $('wc').textContent = n + (n === 1 ? ' word' : ' words');
+}
+
+let pt = null;
+function previewSoon() {
+    if (pt) clearTimeout(pt);
+    pt = setTimeout(renderPreview, 350);
+}
+
+async function renderPreview() {
+    const src = $('source').value;
+    if (!src.trim()) {
+        $('preview').innerHTML = '<p class="muted">Preview appears here as you type.</p>';
+        return;
+    }
+    try {
+        const d = await jfetch('/api/preview', {
+            method: 'POST',
+            body: JSON.stringify({ markdown: src })
+        });
+        $('preview').innerHTML = d.html || '';
+    } catch (e) { /* preview is best-effort; saving still works */ }
+}
+
+function flash(msg, isErr) {
+    const m = $('msg');
+    m.textContent = msg;
+    m.className = 'flash' + (isErr ? ' err' : '');
+    m.hidden = false;
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { m.hidden = true; }, 2600);
+}
+
+function wrapSel(before, after) {
+    const ta = $('source');
+    const s = ta.selectionStart, e = ta.selectionEnd, v = ta.value;
+    ta.value = v.slice(0, s) + before + v.slice(s, e) + after + v.slice(e);
+    ta.selectionStart = s + before.length;
+    ta.selectionEnd = e + before.length;
+    ta.focus();
+    updateWc();
+    previewSoon();
+}
+
+async function save(status) {
+    const title = $('title').value.trim();
+    const slug = ($('slug').value.trim() || slugify(title)).slice(0, 96);
+    if (!title) { flash('A title is required.', true); return; }
+    if (!slug) { flash('Could not derive a slug &mdash; set one manually.', true); return; }
+    const body = JSON.stringify({
+        title: title,
+        slug: slug,
+        source: $('source').value,
+        tags: $('tags').value,
+        status: status
+    });
+    try {
+        const p = postId
+            ? await jfetch('/api/posts/' + postId, { method: 'PUT', body: body })
+            : await jfetch('/api/posts', { method: 'POST', body: body });
+        postId = p.id;
+        $('status').value = p.status;
+        $('slug').value = p.slug;
+        $('slugline').textContent = '/' + p.username + '/' + p.slug;
+        $('delete').hidden = false;
+        $('viewlink').hidden = p.status !== 'published';
+        if (p.status === 'published') {
+            $('viewlink').href = '/' + encodeURIComponent(p.username) + '/' + encodeURIComponent(p.slug);
+        }
+        history.replaceState(null, '', '/editor?id=' + p.id);
+        $('heading').textContent = 'Edit post';
+        flash(p.status === 'published' ? 'Saved &middot; published.' : 'Saved &middot; draft.');
+    } catch (e) {
+        flash(e.message, true);
+    }
+}
+
+$('title').addEventListener('input', () => {
+    if (!slugTouched && !postId) $('slug').value = slugify($('title').value);
+});
+$('slug').addEventListener('input', () => { slugTouched = true; });
+
+// ---- cover image (first markdown image = the post header) ----
+function syncCover() {
+    if (typeof pw === 'undefined' || !pw.coverFrom) return;
+    const c = pw.coverFrom($('source').value);
+    const thumb = $('cover-thumb');
+    if (c && c.url) {
+        thumb.textContent = '';
+        thumb.style.backgroundImage = 'url("' + c.url.replace(/"/g, '%22') + '")';
+        $('cover-remove').hidden = false;
+    } else {
+        thumb.textContent = 'no cover';
+        thumb.style.backgroundImage = '';
+        $('cover-remove').hidden = true;
+    }
+}
+$('cover-pick').onclick = () => {
+    pw.pickUnsplash({ defaultQuery: $('title').value.trim() }, d => {
+        $('source').value = pw.setCover($('source').value,
+            'Photo by ' + d.credit + ' on Unsplash', d.url);
+        syncCover(); updateWc(); previewSoon();
+    });
+};
+$('cover-remove').onclick = () => {
+    $('source').value = pw.removeCover($('source').value);
+    syncCover(); updateWc(); previewSoon();
+};
+
+// ---- insert an Unsplash image at the cursor ----
+$('imgbtn').onclick = () => {
+    pw.pickUnsplash({}, d => {
+        wrapSel('![' + 'Photo by ' + d.credit + ' on Unsplash' + '](' + d.url + ')', '\n\n');
+        syncCover();
+    });
+};
+
+$('source').addEventListener('input', () => { updateWc(); previewSoon(); syncCover(); });
+$('save').onclick = () => save($('status').value);
+$('publish').onclick = () => save('published');
+$('delete').onclick = async () => {
+    if (!postId || !confirm('Delete this post permanently?')) return;
+    try {
+        await jfetch('/api/posts/' + postId, { method: 'DELETE' });
+        location.href = '/admin';
+    } catch (e) { flash(e.message, true); }
+};
+document.querySelectorAll('.toolbar [data-before]').forEach(b => {
+    b.onclick = () => wrapSel(b.dataset.before, b.dataset.after || '');
+});
+$('linkbtn').onclick = () => {
+    const url = prompt('Link URL:', 'https://');
+    if (url) wrapSel('[', '](' + url + ')');
+};
+
+(async () => {
+    try { await jfetch('/api/me'); }
+    catch (e) { $('gate').hidden = false; return; }
+    $('editor').hidden = false;
+
+    const id = new URLSearchParams(location.search).get('id');
+    if (id) {
+        try {
+            const p = await jfetch('/api/posts/' + id);
+            postId = p.id;
+            $('heading').textContent = 'Edit post';
+            $('title').value = p.title;
+            $('slug').value = p.slug;
+            $('source').value = p.source;
+            $('tags').value = p.tags;
+            $('status').value = p.status;
+            $('slugline').textContent = '/' + p.username + '/' + p.slug;
+            $('delete').hidden = false;
+            $('viewlink').hidden = p.status !== 'published';
+            if (p.status === 'published') {
+                $('viewlink').href = '/' + encodeURIComponent(p.username) + '/' + encodeURIComponent(p.slug);
+            }
+            renderPreview();
+        } catch (e) {
+            flash(e.message, true);
+        }
+    }
+    updateWc();
+    syncCover();
+})();
+</script>
+</body>
+</html>
+

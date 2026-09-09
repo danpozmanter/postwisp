@@ -1,0 +1,511 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>postwisp</title>
+<link rel="stylesheet" href="/app.css">
+<style>
+/* admin-specific bits not in the shared design system */
+main form.auth { margin-top: 2.5rem; }
+.item .m code { font-family: var(--font-mono); font-size: 0.85em; }
+</style>
+<script src="/theme-boot.js"></script>
+<script>
+// ---- tiny helpers ----
+function api(method, path, body) {
+  const opts = {method, headers: {'Content-Type': 'application/json'}, credentials: 'same-origin'};
+  if (body !== undefined) opts.body = JSON.stringify(body);
+  return fetch(path, opts).then(async r => {
+    const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    return data;
+  });
+}
+function esc(s) {
+  return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtDate(ms) {
+  if (!ms) return '';
+  return new Date(ms).toISOString().slice(0, 10);
+}
+function slugify(t) {
+  return t.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+}
+function validSlug(s) { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 96; }
+
+// theme applied pre-paint by /theme-boot.js; toggleTheme below only
+// flips it and remembers the choice.
+function toggleTheme() {
+  const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.documentElement.dataset.theme = cur;
+  localStorage.setItem('postwisp-theme', cur);
+}
+
+// ---- state ----
+let me = null;
+let editing = null;        // post being edited, or null for a new one
+let slugTouched = false;   // stop auto-following once the user edits the slug field
+
+// ---- views ----
+// Populated in onReady(): this script runs in <head>, before the DOM exists.
+const views = {};
+function initViews() {
+  for (const id of ['view-setup', 'view-login', 'view-dashboard', 'view-editor'])
+    views[id] = document.getElementById(id);
+}
+function show(id) {
+  for (const k in views) views[k].classList.toggle('hidden', k !== id);
+  document.getElementById('bar').classList.toggle('hidden', id === 'view-setup' || id === 'view-login');
+}
+
+// ---- boot ----
+async function boot() {
+  const params = new URLSearchParams(location.search);
+  let netErr = null;
+  try {
+    me = await api('GET', '/api/me');
+  } catch (e) {
+    me = null;
+    if (!/HTTP 401/.test(e.message)) netErr = e.message;
+  }
+  if (netErr) showFatal('Could not reach the postwisp server: ' + netErr);
+  if (me) { renderBar(); await loadDashboard(); return; }
+  const site = await api('GET', '/api/public/site').catch(() => null);
+  const setupPending = !!(site && site.setup_pending);
+  const onSetupPage = location.pathname === '/setup' || params.get('token');
+  if (onSetupPage && setupPending) {
+    document.getElementById('setup-token').value = params.get('token') || '';
+    show('view-setup');
+  } else {
+    if (onSetupPage) {
+      document.getElementById('login-err').textContent =
+        'Setup is already complete — log in with your admin account instead.';
+    }
+    if (setupPending) document.getElementById('login-hint').hidden = false;
+    show('view-login');
+  }
+}
+
+function renderBar() {
+  document.getElementById('bar-right').innerHTML =
+    me ? `<span class="who">Welcome, ${esc(me.username)}</span>
+         <button class="ghost" onclick="openEditor(null)">New post</button>
+         <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
+         <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
+         ${me.role === 'admin' ? '<button class="ghost" id="users-btn" onclick="toggleUsers()">Users</button>' : ''}
+         <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
+         <button class="ghost" onclick="doLogout()">Log out</button>` : '';
+}
+
+// ---- about page ----
+// Each author maintains one about page: a singleton post with the slug
+// "about". Find yours or create it, then open it in the editor.
+async function openAbout() {
+  const el = document.getElementById('dash-err');
+  el.textContent = '';
+  try {
+    if (!allPosts.length) allPosts = await api('GET', '/api/posts');
+    const mine = allPosts.find(p => p.slug === 'about');
+    if (mine) { openEditor(mine.id); return; }
+    const created = await api('POST', '/api/posts', {
+      title: 'About',
+      slug: 'about',
+      source: 'This site runs on postwisp, a small self-hosted blog.\n\n' +
+              'Replace this with whatever you want people to know about you or this site.',
+      tags: '',
+      status: 'published'
+    });
+    openEditor(created.id);
+  } catch (e) { el.textContent = e.message; }
+}
+
+// ---- setup / login / logout ----
+async function doSetup(ev) {
+  ev.preventDefault();
+  const el = document.getElementById('setup-err');
+  el.textContent = '';
+  try {
+    await api('POST', '/api/setup', {
+      token: document.getElementById('setup-token').value.trim(),
+      username: document.getElementById('setup-username').value.trim(),
+      email: document.getElementById('setup-email').value.trim(),
+      password: document.getElementById('setup-password').value,
+    });
+    me = await api('GET', '/api/me');
+    renderBar();
+    history.replaceState(null, '', '/admin');
+    await loadDashboard();
+  } catch (e) { el.textContent = e.message; }
+}
+
+async function doLogin(ev) {
+  ev.preventDefault();
+  const el = document.getElementById('login-err');
+  el.textContent = '';
+  try {
+    me = await api('POST', '/api/login', {
+      username: document.getElementById('login-username').value.trim(),
+      password: document.getElementById('login-password').value,
+    });
+    renderBar();
+    await loadDashboard();
+  } catch (e) { el.textContent = e.message; }
+}
+
+async function doLogout() {
+  try { await api('POST', '/api/logout', {}); } catch (e) {}
+  me = null;
+  show('view-login');
+}
+
+// ---- dashboard ----
+let allPosts = [];
+async function loadDashboard() {
+  const el = document.getElementById('dash-err');
+  el.textContent = '';
+  try {
+    allPosts = await api('GET', '/api/posts');
+    renderDashboard();
+    show('view-dashboard');
+  } catch (e) {
+    // Never a blank screen: show the dashboard with the error visible.
+    el.textContent = 'Could not load your posts: ' + e.message;
+    show('view-dashboard');
+  }
+}
+
+function renderDashboard() {
+  const q = document.getElementById('search').value.trim().toLowerCase();
+  const match = p => !q ||
+    (p.title + ' ' + p.source + ' ' + p.tags).toLowerCase().includes(q);
+  const drafts = allPosts.filter(p => p.status === 'draft' && match(p));
+  const pub = allPosts.filter(p => p.status === 'published' && match(p));
+  const item = p => `
+    <div class="item">
+      <div>
+        <div class="t"><a href="#" onclick="openEditor(${p.id});return false">${esc(p.title)}</a></div>
+        <div class="m">
+          ${p.status === 'published'
+            ? `/${esc(p.username)}/${esc(p.slug)} · published ${fmtDate(p.published_at)}`
+            : `draft · edited ${fmtDate(p.modified_at)}`}
+          ${p.tags ? ' · ' + p.tags.split(',').map(t => `<span class="chip">${esc(t)}</span>`).join(' ') : ''}
+        </div>
+      </div>
+      <div class="row">
+        ${p.status === 'published' ? `<a class="btn ghost" href="/${esc(p.username)}/${esc(p.slug)}" target="_blank">view</a>` : ''}
+        <button class="ghost" onclick="openEditor(${p.id})">edit</button>
+        <button class="danger" onclick="delPost(${p.id})">delete</button>
+      </div>
+    </div>`;
+  const section = (title, list, empty) =>
+    `<div class="list"><h2>${title}</h2>${list.length ? list.map(item).join('') : `<div class="m" style="color:var(--muted)">${empty}</div>`}</div>`;
+  document.getElementById('dash-lists').innerHTML =
+    section('Drafts', drafts, 'No drafts.') +
+    section('Published', pub, 'Nothing published yet.');
+}
+
+async function delPost(id) {
+  const p = allPosts.find(x => x.id === id);
+  if (!confirm('Delete "' + (p ? p.title : 'this post') + '"? This cannot be undone.')) return;
+  try { await api('DELETE', '/api/posts/' + id, {}); } catch (e) {
+    document.getElementById('dash-err').textContent = e.message; return;
+  }
+  await loadDashboard();
+}
+
+// ---- admin users panel ----
+async function toggleUsers() {
+  const panel = document.getElementById('users-panel');
+  if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  const list = document.getElementById('users-list');
+  list.innerHTML = '';
+  // no GET /api/users list endpoint in v1; the panel is create-only
+}
+
+async function createUser(ev) {
+  ev.preventDefault();
+  const el = document.getElementById('users-err');
+  el.textContent = '';
+  try {
+    await api('POST', '/api/users', {
+      username: document.getElementById('new-username').value.trim(),
+      email: document.getElementById('new-email').value.trim(),
+      password: document.getElementById('new-password').value,
+    });
+    el.className = 'ok';
+    el.textContent = 'Author account created.';
+    document.getElementById('users-form').reset();
+  } catch (e) { el.className = 'err'; el.textContent = e.message; }
+}
+
+// ---- editor ----
+async function openEditor(id) {
+  const el = document.getElementById('editor-err');
+  el.textContent = '';
+  editing = null;
+  slugTouched = false;
+  document.getElementById('editor-title').value = '';
+  document.getElementById('editor-slug').value = '';
+  document.getElementById('editor-tags').value = '';
+  document.getElementById('editor-source').value = '';
+  document.getElementById('editor-status').value = 'draft';
+  document.getElementById('slug-state').textContent = '';
+  document.getElementById('preview-pane').innerHTML = '';
+  if (id !== null) {
+    try {
+      editing = await api('GET', '/api/posts/' + id);
+    } catch (e) { el.textContent = e.message; return; }
+    document.getElementById('editor-title').value = editing.title;
+    document.getElementById('editor-slug').value = editing.slug;
+    document.getElementById('editor-tags').value = editing.tags;
+    document.getElementById('editor-source').value = editing.source;
+    document.getElementById('editor-status').value = editing.status;
+    slugTouched = true;
+  }
+  show('view-editor');
+  document.getElementById('editor-title').focus();
+}
+
+function onTitleInput() {
+  if (!slugTouched) {
+    document.getElementById('editor-slug').value = slugify(document.getElementById('editor-title').value);
+    checkSlug();
+  }
+}
+function onSlugInput() { slugTouched = true; checkSlug(); }
+
+let slugTimer = null;
+function checkSlug() {
+  clearTimeout(slugTimer);
+  const slug = document.getElementById('editor-slug').value;
+  const state = document.getElementById('slug-state');
+  if (!slug) { state.textContent = ''; return; }
+  if (!validSlug(slug)) { state.textContent = 'malformed slug'; state.className = 'slug-state err'; return; }
+  state.textContent = '…'; state.className = 'slug-state';
+  slugTimer = setTimeout(async () => {
+    try {
+      const r = await api('GET', '/api/slug-check?slug=' + encodeURIComponent(slug));
+      if (r.ok) { state.textContent = 'ok'; state.className = 'slug-state ok'; }
+      else if (r.reason === 'taken') { state.textContent = 'taken'; state.className = 'slug-state err'; }
+      else { state.textContent = 'malformed'; state.className = 'slug-state err'; }
+    } catch (e) { state.textContent = ''; }
+  }, 250);
+}
+
+function collectPost() {
+  return {
+    title: document.getElementById('editor-title').value.trim(),
+    slug: document.getElementById('editor-slug').value.trim(),
+    source: document.getElementById('editor-source').value,
+    tags: document.getElementById('editor-tags').value,
+    status: document.getElementById('editor-status').value,
+  };
+}
+
+async function savePost() {
+  const el = document.getElementById('editor-err');
+  el.textContent = '';
+  const body = collectPost();
+  if (!body.title) { el.textContent = 'A title is required.'; return; }
+  if (!validSlug(body.slug)) { el.textContent = 'The slug is malformed.'; return; }
+  try {
+    if (editing) await api('PUT', '/api/posts/' + editing.id, body);
+    else await api('POST', '/api/posts', body);
+    await loadDashboard();
+  } catch (e) { el.textContent = e.message; }
+}
+
+async function previewPost() {
+  const pane = document.getElementById('preview-pane');
+  const el = document.getElementById('editor-err');
+  el.textContent = '';
+  try {
+    const r = await api('POST', '/api/preview', {markdown: document.getElementById('editor-source').value});
+    pane.innerHTML = r.html;
+  } catch (e) { el.textContent = e.message; }
+}
+
+// Insert markdown at the cursor (image uploads use this).
+function insertAtCursor(text) {
+  const ta = document.getElementById('editor-source');
+  const s = ta.selectionStart, e = ta.selectionEnd;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+  ta.selectionStart = ta.selectionEnd = s + text.length;
+  ta.focus();
+}
+
+async function uploadImage(file) {
+  const el = document.getElementById('editor-err');
+  try {
+    const r = await fetch('/api/media', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: {'Content-Type': file.type},
+      body: file,
+    }).then(async resp => {
+      const d = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(d.error || 'upload failed');
+      return d;
+    });
+    insertAtCursor(`![${file.name}](${r.url})`);
+  } catch (e) { el.textContent = e.message; }
+}
+
+function pickImage() {
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.accept = 'image/png,image/jpeg,image/webp,image/gif';
+  inp.onchange = () => { if (inp.files[0]) uploadImage(inp.files[0]); };
+  inp.click();
+}
+
+// Hashnode-style Unsplash search, inserting the picked photo at the cursor.
+function pickUnsplashImage() {
+  if (typeof pw === 'undefined' || !pw.pickUnsplash) return;
+  pw.pickUnsplash({}, d => {
+    insertAtCursor(`![Photo by ${d.credit} on Unsplash](${d.url})`);
+  });
+}
+
+// ---- wire up ----
+// This script lives in <head>, so nothing may touch the DOM until it is ready.
+function onReady(fn) {
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn);
+  else fn();
+}
+onReady(function () {
+  try {
+    initViews();
+    document.getElementById('setup-form').addEventListener('submit', doSetup);
+    document.getElementById('login-form').addEventListener('submit', doLogin);
+    document.getElementById('users-form').addEventListener('submit', createUser);
+    document.getElementById('search').addEventListener('input', renderDashboard);
+    document.getElementById('editor-title').addEventListener('input', onTitleInput);
+    document.getElementById('editor-slug').addEventListener('input', onSlugInput);
+    document.getElementById('editor-source').addEventListener('drop', ev => {
+      const f = ev.dataTransfer.files[0];
+      if (f && f.type.startsWith('image/')) { ev.preventDefault(); uploadImage(f); }
+    });
+    boot();
+  } catch (e) {
+    showFatal(e && e.message ? e.message : String(e));
+  }
+});
+</script>
+</head>
+<body>
+<div id="fatal" class="fatal hidden">
+  <span id="fatal-msg"></span>
+  <button type="button" onclick="this.parentElement.classList.add('hidden')">dismiss</button>
+</div>
+<script>
+// Registered before anything else so that any later failure is displayed,
+// never a blank screen.
+function showFatal(msg) {
+  var el = document.getElementById('fatal-msg');
+  if (el) el.textContent = String(msg || 'Unexpected error');
+  var box = document.getElementById('fatal');
+  if (box) box.classList.remove('hidden');
+}
+window.addEventListener('error', function (ev) {
+  showFatal(ev && ev.message ? ev.message : 'Script error');
+});
+window.addEventListener('unhandledrejection', function (ev) {
+  showFatal(ev && ev.reason && ev.reason.message ? ev.reason.message : 'Unhandled promise rejection');
+});
+</script>
+<noscript><div class="fatal">postwisp's admin needs JavaScript enabled.</div></noscript>
+<header class="appbar hidden" id="bar">
+  <div><a href="/admin" style="text-decoration:none;font-weight:700">postwisp</a></div>
+  <div class="row" id="bar-right"></div>
+</header>
+<main>
+
+<section id="view-setup" class="hidden">
+  <form id="setup-form" class="auth">
+    <h1>First boot — create the admin account</h1>
+    <label>Setup token</label>
+    <input type="text" id="setup-token" required>
+    <label>Username</label>
+    <input type="text" id="setup-username" required maxlength="32">
+    <label>Email</label>
+    <input type="email" id="setup-email">
+    <label>Password (≥ 10 chars, a digit, a non-alphanumeric)</label>
+    <input type="password" id="setup-password" required>
+    <div class="err" id="setup-err"></div>
+    <button type="submit">Create admin</button>
+  </form>
+</section>
+
+<section id="view-login">
+  <h1>Log in</h1>
+  <div class="hint" id="login-hint" hidden>
+    No admin account exists yet. The server prints a one-time setup URL on
+    first boot — open the <code>/setup?token=…</code> URL from its console
+    to create the admin account.
+  </div>
+  <form id="login-form" class="auth">
+    <h1>Log in</h1>
+    <label>Username</label>
+    <input type="text" id="login-username" required autocomplete="username">
+    <label>Password</label>
+    <input type="password" id="login-password" required autocomplete="current-password">
+    <div class="err" id="login-err"></div>
+    <button type="submit">Log in</button>
+  </form>
+</section>
+
+<section id="view-dashboard" class="hidden">
+  <div class="err" id="dash-err"></div>
+  <input type="text" id="search" placeholder="Search your posts…">
+  <div id="dash-lists"></div>
+  <div id="users-panel" class="hidden">
+    <h2>Users</h2>
+    <form id="users-form" style="max-width:none;margin:0">
+      <div class="row">
+        <div><label>Username</label><input type="text" id="new-username" required maxlength="32"></div>
+        <div><label>Email</label><input type="email" id="new-email"></div>
+        <div><label>Password</label><input type="password" id="new-password" required></div>
+        <div style="align-self:end"><button type="submit">Create author</button></div>
+      </div>
+      <div class="err" id="users-err"></div>
+    </form>
+    <div id="users-list"></div>
+  </div>
+</section>
+
+<section id="view-editor" class="hidden">
+  <div class="row" style="justify-content:space-between">
+    <h1 id="editor-heading" style="margin:0">New post</h1>
+    <div class="row">
+      <button class="ghost" onclick="loadDashboard()">back</button>
+      <button class="ghost" onclick="pickImage()">image</button>
+      <button class="ghost" onclick="pickUnsplashImage()">unsplash</button>
+      <button class="ghost" onclick="previewPost()">preview</button>
+      <button onclick="savePost()">save</button>
+    </div>
+  </div>
+  <div class="err" id="editor-err"></div>
+  <div class="row" style="align-items:end">
+    <div style="flex:2;min-width:14rem"><label>Title</label>
+      <input type="text" id="editor-title" maxlength="200"></div>
+    <div style="flex:2;min-width:12rem"><label>Slug<span id="slug-state" class="slug-state"></span></label>
+      <input type="text" id="editor-slug" maxlength="96"></div>
+    <div style="flex:1;min-width:8rem"><label>Tags (comma-separated)</label>
+      <input type="text" id="editor-tags"></div>
+    <div style="flex:1;min-width:7rem"><label>Status</label>
+      <select id="editor-status"><option value="draft">draft</option><option value="published">published</option></select></div>
+  </div>
+  <div class="editor-grid">
+    <div><label>Markdown source (drag an image here to upload)</label>
+      <textarea id="editor-source" placeholder="# Heading&#10;&#10;Write **markdown** here."></textarea></div>
+    <div><label>Preview</label><div id="preview-pane"></div></div>
+  </div>
+</section>
+
+</main>
+</body>
+</html>

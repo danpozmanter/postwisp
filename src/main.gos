@@ -1,0 +1,2530 @@
+// postwisp — small self-hosted multi-user blog.
+// Single process: HTTP server + embedded terndb store + markdown renderer.
+//
+// Storage: the terndb engine (src/engine.gos) opened in-process at `data/`.
+// The interpreter tier behind `gos run` has no shared mutable state across
+// requests (Mutex::lock yields (), statics do not persist), so handlers open
+// the engine per request (open_eng) and treat the append-only log as the
+// single source of truth: reads via read_store, writes via engine::exec.
+// Media bytes live as files under data/media/<id>; their metadata is a table.
+// The one-time setup token lives under the kv key `postwisp/setup`.
+
+use std::http
+use std::http::router
+use std::time
+use std::fs
+use std::strings
+use std::hash::crc32
+use std::crypto::rand
+use std::env
+
+use engine
+use codec
+use kv
+
+// ---------- domain ----------
+
+struct User {
+    id: i64
+    username: String
+    email: String
+    password: String // salted digest, see hash_password
+    role: String     // "admin" | "author"
+    created_at: i64
+}
+
+struct Post {
+    id: i64
+    user_id: i64
+    title: String
+    source: String    // markdown
+    content: String   // rendered html
+    tags: String      // comma-joined
+    status: String    // "draft" | "published"
+    published_at: i64 // 0 = unset
+    slug: String
+    created_at: i64
+    modified_at: i64
+}
+
+struct MediaItem {
+    id: String
+    user_id: i64
+    content_type: String
+    created_at: i64
+}
+
+struct Session {
+    token: String
+    user_id: i64
+    created_at: i64
+    expires_at: i64
+}
+
+// ---------- store ----------
+
+struct Store {
+    users: Vec<User>
+    posts: Vec<Post>
+    sessions: Vec<Session>
+    media: Vec<MediaItem>
+    next_user_id: i64
+    next_post_id: i64
+    setup_token: String // one-time first-boot admin token, "" once used
+}
+
+struct App {
+    // immutable by design: closures capture copies per request in the
+    // interpreter tier, so App carries only resolved paths; all mutable
+    // state lives in the engine's append-only log under it
+    dir: String
+    web_dir: String
+    tpl_dir: String
+}
+
+struct LoginAttempt {
+    ip: String
+    username: String
+    at: i64
+}
+
+struct LoginAttempts {
+    fails: Vec<LoginAttempt>
+}
+
+const LOGIN_WINDOW_MS: i64 = 10 * 60 * 1000
+const LOGIN_MAX_FAILS: i64 = 5      // one (ip, username) pair
+const LOGIN_IP_MAX_FAILS: i64 = 10  // one source, any username
+const LOGIN_NAME_MAX_FAILS: i64 = 20 // one username, any source
+
+
+fn count_recent_fails(l: LoginAttempts, ip: String, username: String, now: i64) -> i64 {
+    let mut n = 0
+    for a in l.fails {
+        if a.ip == ip && a.username == username && now - a.at < LOGIN_WINDOW_MS { n += 1 }
+    }
+    n
+}
+
+
+// The lock is keyed on the (ip, username) pair so an attacker cannot lock
+// a legitimate owner out of their own account; broader per-ip and
+// per-username caps catch rotation in either dimension.
+
+fn login_locked(app: App, ip: String, username: String) -> bool {
+    let mut eng = open_eng(app)
+    let now = now_ms()
+    let mut n_pair = 0
+    let mut n_ip = 0
+    let mut n_name = 0
+    match eng.exec("SELECT * FROM login_attempts") {
+        Ok(res) => {
+            for row in res.rows {
+                if now - row.vals[2].i >= LOGIN_WINDOW_MS { continue }
+                if row.vals[0].s == ip && row.vals[1].s == username { n_pair += 1 }
+                if row.vals[0].s == ip { n_ip += 1 }
+                if row.vals[1].s == username { n_name += 1 }
+            }
+        }
+        Err(_) => ()
+    }
+    n_pair >= LOGIN_MAX_FAILS || n_ip >= LOGIN_IP_MAX_FAILS || n_name >= LOGIN_NAME_MAX_FAILS
+}
+
+
+fn record_failed_login(app: App, ip: String, username: String) {
+    let now = now_ms()
+    let mut eng = open_eng(app)
+    let _ = eng.exec("INSERT INTO login_attempts VALUES (" + sqlq(ip) + ", " + sqlq(username) + ", " + now.to_string() + ")")
+    let _ = eng.exec("DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string() + ")")
+}
+
+
+fn clear_failed_logins(app: App, ip: String, username: String) {
+    let mut eng = open_eng(app)
+    let _ = eng.exec("DELETE FROM login_attempts WHERE ip = " + sqlq(ip) + " AND username = " + sqlq(username))
+}
+
+
+// Source identity for the login lock: the socket peer with any port
+// stripped, so repeated connections from one host count together.
+// X-Forwarded-For is deliberately not honored: without a trusted-proxy
+// flag it is trivially spoofable and would let an attacker bypass the
+// lock by inventing a new source address per request.
+
+fn peer_key(req: http::Request) -> String {
+    let a = req.peer_addr
+    if a.len() == 0 { return "local" }
+    if a[0] == '[' {
+        // [::1]:54321 — keep the address, drop the brackets and port
+        let end = find_sub(a, "]", 1)
+        if end > 1 { return sub(a, 1, end) }
+        return a
+    }
+    let mut colons: i64 = 0
+    for c in a.bytes() {
+        if c == ':' as u8 { colons += 1 }
+    }
+    if colons == 1 {
+        let cpos = find_sub(a, ":", 0)
+        if cpos > 0 { return sub(a, 0, cpos) }
+    }
+    // zero colons (bare host) or many (bare IPv6): use as-is
+    a
+}
+
+
+fn open_eng(app: App) -> engine::Engine {
+    match engine::open(app.dir, false) {
+        Ok(e) => e
+        Err(m) => panic("postwisp: cannot open the data directory: " + m)
+    }
+}
+
+
+// Resolves a runtime directory: the named env var wins (absolute or
+// relative to the launch cwd), otherwise the default relative path is
+// pinned to an absolute one at boot so a later cwd change cannot
+// silently point data or web at a different location mid-process.
+
+fn resolve_dir(env_name: String, dflt: String) -> String {
+    match env::var(env_name) {
+        Some(d) => {
+            if d.len() > 0 {
+                if d[d.len() - 1] == '/' { return sub(d, 0, d.len() - 1) }
+                return d
+            }
+        }
+        None => ()
+    }
+    if dflt.len() == 0 { return dflt }
+    if dflt[0] == '/' { return dflt }
+    let cwd = match env::current_dir() {
+        Ok(c) => c
+        Err(_) => return dflt
+    }
+    if cwd.len() == 0 { return dflt }
+    if cwd[cwd.len() - 1] == '/' { return cwd + dflt }
+    cwd + "/" + dflt
+}
+
+fn new_app() -> App {
+    // Boot step only: ensure the data dir, tables, and the first-boot
+    // setup token exist. Handlers open the engine per request (open_eng).
+    let dir = resolve_dir("PW_DATA", "data")
+    let web_dir = resolve_dir("PW_WEB", "web")
+    let tpl_dir = resolve_dir("PW_TEMPLATES", "templates")
+    let mut eng = match engine::open(dir, false) {
+        Ok(e) => e
+        Err(m) => panic("postwisp: cannot open the data directory: " + m)
+    }
+    let _ = fs::create_dir_all(dir + "/media")
+    // Creating an existing table is an error, which is exactly the
+    // "already exists" answer we want to ignore here.
+    // Timestamps are INT64 epoch millis, not DATETIME: DATETIME values read
+    // back as text (row.vals[n].i == 0), which silently broke session expiry
+    // and post ordering. INT64 is lossless here.
+    let _ = eng.exec("CREATE TABLE users (username TEXT, email TEXT, password TEXT, role TEXT, created_at INT64)")
+    let _ = eng.exec("CREATE TABLE posts (user_id INT64, title TEXT, source TEXT, content TEXT, tags TEXT, status TEXT, published_at INT64, slug TEXT, created_at INT64, modified_at INT64)")
+    let _ = eng.exec("CREATE TABLE sessions (token TEXT, user_id INT64, created_at INT64, expires_at INT64)")
+    let _ = eng.exec("CREATE TABLE media (id TEXT, user_id INT64, content_type TEXT, created_at INT64)")
+    let _ = eng.exec("CREATE TABLE login_attempts (ip TEXT, username TEXT, at INT64)")
+    let store = read_store(&mut eng)
+    if store.users.len() == 0 {
+        // read_store mints and persists the one-time token when no users
+        // exist, so it is never "" here; repeat it on every boot until
+        // setup is completed so the URL cannot be lost.
+        println("first boot: open /setup?token=" + store.setup_token + " to create the admin account")
+    }
+    App { dir: dir, web_dir: web_dir, tpl_dir: tpl_dir }
+}
+
+// Rebuilds the in-memory cache from the engine. Row identity is the engine's
+// rowid, so ids survive restarts; every write path inserts first and then
+// reads the assigned rowid back.
+
+fn read_store(eng: &mut engine::Engine) -> Store {
+    let mut store = Store {
+        users: #[]
+        posts: #[]
+        sessions: #[]
+        media: #[]
+        next_user_id: 1
+        next_post_id: 1
+        setup_token: ""
+    }
+    match eng.exec("SELECT * FROM users") {
+        Ok(res) => {
+            for row in res.rows {
+                let u = User {
+                    id: row.rowid
+                    username: row.vals[0].s
+                    email: row.vals[1].s
+                    password: row.vals[2].s
+                    role: row.vals[3].s
+                    created_at: row.vals[4].i
+                }
+                if u.id + 1 > store.next_user_id { store.next_user_id = u.id + 1 }
+                store.users.push(u)
+            }
+        }
+        Err(_) => ()
+    }
+    match eng.exec("SELECT * FROM posts") {
+        Ok(res) => {
+            for row in res.rows {
+                let p = Post {
+                    id: row.rowid
+                    user_id: row.vals[0].i
+                    title: row.vals[1].s
+                    source: row.vals[2].s
+                    content: row.vals[3].s
+                    tags: row.vals[4].s
+                    status: row.vals[5].s
+                    published_at: row.vals[6].i
+                    slug: row.vals[7].s
+                    created_at: row.vals[8].i
+                    modified_at: row.vals[9].i
+                }
+                if p.id + 1 > store.next_post_id { store.next_post_id = p.id + 1 }
+                store.posts.push(p)
+            }
+        }
+        Err(_) => ()
+    }
+    let now = now_ms()
+    match eng.exec("SELECT * FROM sessions") {
+        Ok(res) => {
+            for row in res.rows {
+                if row.vals[3].i > now {
+                    store.sessions.push(Session {
+                        token: row.vals[0].s
+                        user_id: row.vals[1].i
+                        created_at: row.vals[2].i
+                        expires_at: row.vals[3].i
+                    })
+                }
+            }
+        }
+        Err(_) => ()
+    }
+    match eng.exec("SELECT * FROM media") {
+        Ok(res) => {
+            for row in res.rows {
+                store.media.push(MediaItem {
+                    id: row.vals[0].s
+                    user_id: row.vals[1].i
+                    content_type: row.vals[2].s
+                    created_at: row.vals[3].i
+                })
+            }
+        }
+        Err(_) => ()
+    }
+    // The setup token lives in the kv half of the engine so it survives a
+    // restart of a still-unconfigured server, and is ignored once any user
+    // exists.
+    let mut setup = ""
+    match eng.store.get("postwisp/setup") {
+        kv::Read::Value(b) => match String::from_utf8(b) {
+            Ok(s) => setup = s
+            Err(_) => ()
+        }
+        kv::Read::Absent => ()
+        kv::Read::Fault(_) => ()
+    }
+    if store.users.len() == 0 {
+        if setup == "" {
+            setup = new_token("setup:" + now_ms().to_string())
+            let _ = eng.store.put("postwisp/setup", setup.as_bytes())
+        }
+    } else {
+        setup = ""
+    }
+    store.setup_token = setup
+    store
+}
+
+// ---------- helpers ----------
+
+
+fn now_ms() -> i64 {
+    time::now_ms()
+}
+
+
+fn slugify(s: String) -> String {
+    let low = s.to_lowercase()
+    let mut out = String::new()
+    let mut prev_dash = false
+    let mut i: i64 = 0
+    for c in low.bytes() {
+        if (c >= 'a' as u8 && c <= 'z' as u8) || (c >= '0' as u8 && c <= '9' as u8) {
+            out += sub(low, i, i + 1)
+            prev_dash = false
+        } else if !prev_dash && out.len() > 0 {
+            out += "-"
+            prev_dash = true
+        }
+        i += 1
+    }
+    if out.len() > 0 && out[out.len() - 1] == '-' {
+        out = sub(out, 0, out.len() - 1)
+    }
+    out
+}
+
+
+fn valid_slug(slug: String) -> bool {
+    if slug.len() == 0 || slug.len() > 96 { return false }
+    if slug[0] == '-' || slug[slug.len() - 1] == '-' { return false }
+    let mut prev_dash = false
+    for c in slug.bytes() {
+        if c == '-' as u8 {
+            if prev_dash { return false }
+            prev_dash = true
+        } else if (c >= 'a' as u8 && c <= 'z' as u8) || (c >= '0' as u8 && c <= '9' as u8) {
+            prev_dash = false
+        } else {
+            return false
+        }
+    }
+    true
+}
+
+
+fn valid_password(pw: String) -> bool {
+    if pw.len() < 10 { return false }
+    let mut digit = false
+    let mut punct = false
+    for c in pw.bytes() {
+        if c >= '0' as u8 && c <= '9' as u8 { digit = true }
+        if c != ' ' as u8 && !is_alnum_ascii(c) { punct = true }
+    }
+    digit && punct
+}
+
+
+fn valid_username(name: String) -> bool {
+    if name.len() < 1 || name.len() > 32 { return false }
+    for c in name.bytes() {
+        if !(is_alnum_ascii(c) || c == '-' as u8 || c == '_' as u8) { return false }
+    }
+    true
+}
+
+
+fn is_alnum_ascii(c: u8) -> bool {
+    (c >= 'a' as u8 && c <= 'z' as u8)
+    || (c >= 'A' as u8 && c <= 'Z' as u8)
+    || (c >= '0' as u8 && c <= '9' as u8)
+}
+
+
+fn slug_taken(store: Store, user_id: i64, slug: String, except_post: i64) -> bool {
+    for p in store.posts {
+        if p.user_id == user_id && p.slug == slug && p.id != except_post {
+            return true
+        }
+    }
+    false
+}
+
+
+fn find_user_by_name(store: Store, name: String) -> Option<User> {
+    for u in store.users {
+        if u.username == name { return Some(u) }
+    }
+    None
+}
+
+
+fn find_user(store: Store, id: i64) -> Option<User> {
+    for u in store.users {
+        if u.id == id { return Some(u) }
+    }
+    None
+}
+
+
+fn find_post(store: Store, id: i64) -> Option<Post> {
+    for p in store.posts {
+        if p.id == id { return Some(p) }
+    }
+    None
+}
+
+
+fn find_session(store: Store, token: String) -> Option<User> {
+    let now = now_ms()
+    for s in store.sessions {
+        if s.token == token && s.expires_at > now {
+            return find_user(store, s.user_id)
+        }
+    }
+    None
+}
+
+// ---------- small utilities (self-contained: no unverified std modules) ----------
+
+
+fn find_sub(hay: String, needle: String, from: i64) -> i64 {
+    let h = hay.bytes()
+    let n = needle.bytes()
+    if n.len() == 0 { return from }
+    let mut i = from
+    while i + n.len() <= h.len() {
+        let mut ok = true
+        let mut t: i64 = 0
+        while t < n.len() {
+            if h[i + t] != n[t] { ok = false }
+            t += 1
+        }
+        if ok { return i }
+        i += 1
+    }
+    -1
+}
+
+// `String::slice` returns a Result; every call site here passes byte
+// offsets it has already verified, so a failed slice degrades to the
+// empty string instead of aborting the request.
+
+fn sub(s: String, a: i64, b: i64) -> String {
+    match s.slice(a, b) {
+        Ok(v) => return v
+        Err(_) => return ""
+    }
+}
+
+
+fn json_quote(s: String) -> String {
+    let mut out = String::new()
+    out.push('"')
+    for c in s {
+        if c == '"' { out += "\\\"" }
+        else if c == '\\' { out += "\\\\" }
+        else if c == '\n' { out += "\\n" }
+        else if c == '\t' { out += "\\t" }
+        else if c == '\r' { out += "\\r" }
+        else { out.push(c) }
+    }
+    out.push('"')
+    out
+}
+
+// Unescapes the JSON escapes the API's own clients produce.
+
+fn unescape_json(body: String, vs: i64, ve: i64) -> String {
+    let mut out = String::new()
+    let b = body.bytes()
+    let mut i = vs
+    while i < ve {
+        if b[i] == '\\' as u8 && i + 1 < ve {
+            let e = b[i + 1]
+            if e == 'n' as u8 { out.push('\n') }
+            else if e == 't' as u8 { out.push('\t') }
+            else if e == 'r' as u8 { out.push('\r') }
+            else if e == '"' as u8 { out.push('"') }
+            else if e == '\\' as u8 { out.push('\\') }
+            else if e == '/' as u8 { out.push('/') }
+            else if e == 'u' as u8 {
+                // non-ASCII escapes are dropped rather than decoded
+                i += 6
+                continue
+            }
+            else {
+                i += 2
+                continue
+            }
+            i += 2
+            continue
+        }
+        out.push(body[i])
+        i += 1
+    }
+    out
+}
+
+// Parses a flat JSON object of string fields: {"title":"...", "tags":"..."}.
+// Every request body the API accepts is exactly that shape.
+
+fn parse_body(body: String) -> Map<String, String> {
+    let mut out = Map::new()
+    let b = body.bytes()
+    let n = b.len()
+    let mut i: i64 = 0
+    while i < n && b[i] != '{' as u8 { i += 1 }
+    if i >= n { return out }
+    i += 1
+    loop {
+        while i < n && (b[i] == ' ' as u8 || b[i] == ',' as u8 || b[i] == '\n' as u8
+            || b[i] == '\t' as u8 || b[i] == '\r' as u8) { i += 1 }
+        if i >= n { break }
+        if b[i] == '}' as u8 { break }
+        if b[i] != '"' as u8 { break }
+        i += 1
+        let ks = i
+        while i < n && b[i] != '"' as u8 {
+            if b[i] == '\\' as u8 { i += 1 }
+            i += 1
+        }
+        if i >= n { break }
+        let key = sub(body, ks, i)
+        i += 1
+        while i < n && b[i] != ':' as u8 { i += 1 }
+        if i >= n { break }
+        i += 1
+        while i < n && (b[i] == ' ' as u8 || b[i] == '\t' as u8) { i += 1 }
+        if i >= n { break }
+        if b[i] != '"' as u8 {
+            // a non-string value: skip it, the API has none
+            while i < n && b[i] != ',' as u8 && b[i] != '}' as u8 { i += 1 }
+            continue
+        }
+        i += 1
+        let vs = i
+        let mut has_esc = false
+        while i < n {
+            if b[i] == '\\' as u8 { has_esc = true; i += 2; continue }
+            if b[i] == '"' as u8 { break }
+            i += 1
+        }
+        if i > n { i = n }
+        let ve = i
+        i += 1
+        if has_esc {
+            out.insert(key, unescape_json(body, vs, ve))
+        } else {
+            out.insert(key, sub(body, vs, ve))
+        }
+    }
+    out
+}
+
+
+fn field(m: Map<String, String>, key: String) -> String {
+    match m.get(key) {
+        Some(v) => return v
+        None => return ""
+    }
+}
+
+// ---------- tokens and password digests ----------
+//
+// Self-contained on purpose: crc32 is the one hash the toolchain's std
+// guarantees (it is what the kv store's own checksums use). The digest below
+// chains 512 rounds of mixed crc32 and odd-multiplier arithmetic, which is a
+// homegrown KDF, not Argon2id — fine for a single-operator blog, and the one
+// deliberate deviation from PLAN.md §2. Swap in std::crypto::password when the
+// toolchain documents it.
+
+
+fn crc_of(seed: String) -> i64 {
+    crc32::update(crc32::checksum(seed.as_bytes()), (seed + "|postwisp").as_bytes())
+}
+
+
+fn hex8(v: i64) -> String {
+    let mut x = v
+    if x < 0 { x = 0 - x }
+    let hexd = #["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+    let mut rev: Vec<String> = #[]
+    let mut i: i64 = 0
+    while i < 8 {
+        rev.push(hexd[x % 16])
+        x = x / 16
+        i += 1
+    }
+    let mut out = String::new()
+    let mut j = rev.len() - 1
+    while j >= 0 {
+        out += rev[j]
+        j -= 1
+    }
+    out
+}
+
+
+fn new_token(seed: String) -> String {
+    // 16 bytes from the host CSPRNG -> 32 hex chars. Uniqueness never
+    // depends on a timestamp, so session and setup tokens are not
+    // guessable. The crc32 chain below is only a stay-alive fallback
+    // for the (near-impossible) case the CSPRNG is unreachable.
+    match rand::bytes(16) {
+        Ok(b) => {
+            let hexd = #["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+            let mut out = String::new()
+            for x in b {
+                let v = x as i64
+                out += hexd[v / 16]
+                out += hexd[v % 16]
+            }
+            return out
+        }
+        Err(_) => ()
+    }
+    let a = crc_of(seed)
+    let b = crc_of(seed + "#2")
+    hex8(a) + hex8(b)
+}
+
+
+fn pw_digest(pw: String, salt: String) -> String {
+    let mut acc = crc_of(salt + ":" + pw + ":0")
+    let mut round: i64 = 1
+    while round < 512 {
+        acc = (acc * 48_271 + round * 7_919 + crc_of(salt + ":" + pw + ":" + round.to_string())) % 4_294_967_296
+        round += 1
+    }
+    hex8(acc)
+}
+
+
+fn hash_password(pw: String) -> String {
+    let salt = new_token("s:" + now_ms().to_string())
+    salt + "$" + pw_digest(pw, salt)
+}
+
+
+fn verify_password(stored: String, pw: String) -> bool {
+    let at = find_sub(stored, "$", 0)
+    if at < 0 { return false }
+    let salt = sub(stored, 0, at)
+    let digest = sub(stored, at + 1, stored.len())
+    pw_digest(pw, salt) == digest
+}
+
+// ---------- SQL write-through ----------
+
+// A single-quoted SQL string literal with the quote and backslash doubling
+// the engine's lexer requires to survive a round trip.
+
+fn sqlq(s: String) -> String {
+    let mut out = String::new()
+    out.push('\'')
+    for c in s {
+        if c == '\'' { out += "''" }
+        else if c == '\\' { out += "\\\\" }
+        else { out.push(c) }
+    }
+    out.push('\'')
+    out
+}
+
+// Runs one statement against the per-request engine.
+
+fn exec_sql(eng: &mut engine::Engine, sql: String) {
+    match eng.exec(sql) {
+        Ok(_) => ()
+        Err(m) => println("postwisp sql error: " + m)
+    }
+}
+
+
+fn insert_user_row(eng: &mut engine::Engine, username: String, email: String, password: String, role: String) -> i64 {
+    exec_sql(eng, "INSERT INTO users VALUES (" + sqlq(username) + ", " + sqlq(email) + ", "
+        + sqlq(password) + ", " + sqlq(role) + ", " + now_ms().to_string() + ")")
+    match eng.exec("SELECT * FROM users WHERE username = " + sqlq(username)) {
+        Ok(res) => {
+            if res.rows.len() > 0 { return res.rows[0].rowid }
+            0
+        }
+        Err(_) => 0
+    }
+}
+
+
+fn insert_post_row(eng: &mut engine::Engine, p: Post) -> i64 {
+    exec_sql(eng, "INSERT INTO posts VALUES (" + p.user_id.to_string()
+        + ", " + sqlq(p.title)
+        + ", " + sqlq(p.source)
+        + ", " + sqlq(p.content)
+        + ", " + sqlq(p.tags)
+        + ", " + sqlq(p.status)
+        + ", " + p.published_at.to_string()
+        + ", " + sqlq(p.slug)
+        + ", " + p.created_at.to_string()
+        + ", " + p.modified_at.to_string()
+        + ")")
+    match eng.exec("SELECT * FROM posts WHERE user_id = " + p.user_id.to_string()
+        + " AND slug = " + sqlq(p.slug)) {
+        Ok(res) => {
+            if res.rows.len() > 0 { return res.rows[0].rowid }
+            0
+        }
+        Err(_) => 0
+    }
+}
+
+
+fn update_post_sql(p: Post) -> String {
+    "UPDATE posts SET user_id = " + p.user_id.to_string()
+    + ", title = " + sqlq(p.title)
+    + ", source = " + sqlq(p.source)
+    + ", content = " + sqlq(p.content)
+    + ", tags = " + sqlq(p.tags)
+    + ", status = " + sqlq(p.status)
+    + ", published_at = " + p.published_at.to_string()
+    + ", slug = " + sqlq(p.slug)
+    + ", created_at = " + p.created_at.to_string()
+    + ", modified_at = " + p.modified_at.to_string()
+    + " WHERE rowid = " + p.id.to_string()
+}
+
+// ---------- responses ----------
+
+
+fn resp_json(status: i64, body: String) -> http::Response {
+    http::Response::text(status, body).with_header("Content-Type", "application/json")
+}
+
+
+fn ok_json(body: String) -> http::Response { resp_json(200, body) }
+
+
+fn err_json(status: i64, msg: String) -> http::Response {
+    resp_json(status, "{\"error\":" + json_quote(msg) + "}")
+}
+
+
+fn resp_html(status: i64, body: String) -> http::Response {
+    http::Response::text(status, body).with_header("Content-Type", "text/html; charset=utf-8")
+}
+
+// ---------- markdown renderer ----------
+
+
+fn escape_html(s: String) -> String {
+    let mut out = String::new()
+    for c in s {
+        if c == '<' { out += "&lt;" }
+        else if c == '>' { out += "&gt;" }
+        else if c == '&' { out += "&amp;" }
+        else if c == '"' { out += "&quot;" }
+        else { out.push(c) }
+    }
+    out
+}
+
+// Render inline markdown (already-escaped text) into HTML.
+
+fn render_inline(escaped: String) -> String {
+    let mut out = String::new()
+    let src = escaped
+    let mut i = 0
+    let b = src.bytes()
+    let n = b.len()
+    while i < n {
+        let c = b[i]
+        // code span
+        if c == '`' as u8 {
+            let mut j = i + 1
+            while j < n && b[j] == '`' as u8 { j += 1 }
+            let ticks = j - i
+            let mut k = j
+            while k < n && b[k] != '`' as u8 { k += 1 }
+            if k < n && k + ticks <= n {
+                let mut end = k
+                let mut ok = true
+                let mut t = 0
+                while t < ticks {
+                    if b[end + t] != '`' as u8 { ok = false }
+                    t += 1
+                }
+                if ok {
+                    out += "<code>"
+                    out += sub(src, j, k)
+                    out += "</code>"
+                    i = end + ticks
+                    continue
+                }
+            }
+            out.push('`')
+            i += 1
+            continue
+        }
+        // image ![alt](url)
+        if c == '!' as u8 && i + 1 < n && b[i + 1] == '[' as u8 {
+            match match_link(b, i + 1, n) {
+                Some(m) => {
+                    out += "<img src=\"" + clean_url(sub(src, m.url_start, m.url_end))
+                    out += "\" alt=\"" + sub(src, m.text_start, m.text_end) + "\">"
+                    i = m.after
+                    continue
+                }
+                None => { out.push('!'); i += 1; continue }
+            }
+        }
+        // link [text](url)
+        if c == '[' as u8 {
+            match match_link(b, i, n) {
+                Some(m) => {
+                    out += "<a href=\"" + clean_url(sub(src, m.url_start, m.url_end))
+                    out += "\" rel=\"noopener\">" + sub(src, m.text_start, m.text_end) + "</a>"
+                    i = m.after
+                    continue
+                }
+                None => { out.push('['); i += 1; continue }
+            }
+        }
+        if c == '*' as u8 && i + 1 < n && b[i + 1] == '*' as u8 {
+            match find_delim(b, i + 2, n, "**") {
+                Some(end) => {
+                    out += "<strong>" + render_inline(sub(src, i + 2, end)) + "</strong>"
+                    i = end + 2
+                    continue
+                }
+                None => { out += "**"; i += 2; continue }
+            }
+        }
+        if c == '*' as u8 {
+            match find_delim(b, i + 1, n, "*") {
+                Some(end) => {
+                    out += "<em>" + render_inline(sub(src, i + 1, end)) + "</em>"
+                    i = end + 1
+                    continue
+                }
+                None => { out.push('*'); i += 1; continue }
+            }
+        }
+        if c == '~' as u8 && i + 1 < n && b[i + 1] == '~' as u8 {
+            match find_delim(b, i + 2, n, "~~") {
+                Some(end) => {
+                    out += "<del>" + render_inline(sub(src, i + 2, end)) + "</del>"
+                    i = end + 2
+                    continue
+                }
+                None => { out += "~~"; i += 2; continue }
+            }
+        }
+        out.push(src[i])
+        i += 1
+    }
+    out
+}
+
+struct LinkMatch {
+    text_start: i64
+    text_end: i64
+    url_start: i64
+    url_end: i64
+    after: i64
+}
+
+// Match [text](url) starting at an index pointing at '['.
+
+fn match_link(b: Vec<u8>, start: i64, n: i64) -> Option<LinkMatch> {
+    let mut i = start + 1
+    while i < n && b[i] != ']' as u8 {
+        if b[i] == '\n' as u8 { return None }
+        i += 1
+    }
+    if i >= n { return None }
+    let text_end = i
+    if i + 1 >= n || b[i + 1] != '(' as u8 { return None }
+    let mut j = i + 2
+    while j < n && b[j] != ')' as u8 {
+        if b[j] == '\n' as u8 || b[j] == ' ' as u8 { return None }
+        j += 1
+    }
+    if j >= n { return None }
+    Some(LinkMatch {
+        text_start: start + 1
+        text_end: text_end
+        url_start: i + 2
+        url_end: j
+        after: j + 1
+    })
+}
+
+
+fn find_delim(b: Vec<u8>, from: i64, n: i64, d: String) -> Option<i64> {
+    let db = d.bytes()
+    let mut i = from
+    while i + db.len() <= n {
+        let mut ok = true
+        let mut t = 0
+        while t < db.len() {
+            if b[i + t] != db[t] { ok = false }
+            t += 1
+        }
+        if ok { return Some(i) }
+        i += 1
+    }
+    None
+}
+
+// URLs: block javascript: and data: schemes (source text is pre-escaped).
+
+fn clean_url(u: String) -> String {
+    let lower = u.to_lowercase()
+    if lower.starts_with("javascript:") || lower.starts_with("data:") { return "#" }
+    u
+}
+
+// Render a full markdown document to sanitized HTML.
+
+fn render_markdown(src: String) -> String {
+    let mut out = String::new()
+    let lines = src.split("\n")
+    let mut i = 0
+    let n = lines.len()
+    while i < n {
+        let line = lines[i]
+        let trimmed = line.trim()
+        // fenced code block
+        if trimmed.starts_with("```") {
+            let lang = sub(trimmed, 3, trimmed.len()).trim()
+            let mut body = String::new()
+            i += 1
+            while i < n && !lines[i].trim().starts_with("```") {
+                body += escape_html(lines[i]) + "\n"
+                i += 1
+            }
+            i += 1 // closing fence
+            out += "<pre><code"
+            if lang.len() > 0 { out += " class=\"language-" + escape_html(lang) + "\"" }
+            out += ">" + body + "</code></pre>\n"
+            continue
+        }
+        // horizontal rule
+        if trimmed == "---" || trimmed == "***" {
+            out += "<hr>\n"
+            i += 1
+            continue
+        }
+        // heading
+        if trimmed.starts_with("#") {
+            let mut level = 0
+            while level < trimmed.len() && trimmed[level] == '#' { level += 1 }
+            if level <= 6 && trimmed[level] == ' ' {
+                let text = sub(trimmed, level + 1, trimmed.len()).trim()
+                out += "<h" + level.to_string() + ">" + render_inline(escape_html(text))
+                out += "</h" + level.to_string() + ">\n"
+                i += 1
+                continue
+            }
+        }
+        // blockquote (consume consecutive > lines)
+        if trimmed.starts_with(">") {
+            let mut inner = String::new()
+            while i < n && lines[i].trim().starts_with(">") {
+                let l = lines[i].trim()
+                inner += sub(l, 1, l.len()).trim() + "\n"
+                i += 1
+            }
+            out += "<blockquote>\n" + render_markdown(inner) + "</blockquote>\n"
+            continue
+        }
+        // list
+        if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            out += "<ul>\n"
+            while i < n {
+                let t = lines[i].trim()
+                if !(t.starts_with("- ") || t.starts_with("* ")) { break }
+                out += "<li>" + render_inline(escape_html(sub(t, 2, t.len()))) + "</li>\n"
+                i += 1
+            }
+            out += "</ul>\n"
+            continue
+        }
+        if is_ordered_item(trimmed) {
+            out += "<ol>\n"
+            while i < n {
+                let t = lines[i].trim()
+                if !is_ordered_item(t) { break }
+                out += "<li>" + render_inline(escape_html(after_list_marker(t))) + "</li>\n"
+                i += 1
+            }
+            out += "</ol>\n"
+            continue
+        }
+        // table: header row | ... | then |---|---|
+        if trimmed.len() > 0 && trimmed[0] == '|' && i + 1 < n && is_table_sep(lines[i + 1].trim()) {
+            let headers = split_row(trimmed)
+            i += 2
+            let mut rows: Vec<Vec<String>> = #[]
+            while i < n {
+                let t = lines[i].trim()
+                if t.len() == 0 || t[0] != '|' { break }
+                rows.push(split_row(t))
+                i += 1
+            }
+            out += "<table>\n<thead>\n<tr>"
+            for h in headers { out += "<th>" + render_inline(escape_html(h.trim())) + "</th>" }
+            out += "</tr>\n</thead>\n<tbody>\n"
+            for row in rows {
+                out += "<tr>"
+                for c in row { out += "<td>" + render_inline(escape_html(c.trim())) + "</td>" }
+                out += "</tr>\n"
+            }
+            out += "</tbody>\n</table>\n"
+            continue
+        }
+        // blank line
+        if trimmed.len() == 0 {
+            i += 1
+            continue
+        }
+        // paragraph
+        let mut para = String::new()
+        while i < n {
+            let t = lines[i].trim()
+            if t.len() == 0 { break }
+            if t.starts_with("#") || t.starts_with(">") || t.starts_with("- ")
+            || t.starts_with("* ") || t.starts_with("```")
+            || is_ordered_item(t) || t == "---" || t == "***" { break }
+            if para.len() > 0 {
+                if t.ends_with("\\") {
+                    para = sub(para, 0, para.len() - 1) + "<br>" + t
+                } else if lines[i - 1].ends_with("\\") {
+                    para += t
+                } else {
+                    para += " " + t
+                }
+            } else {
+                para = t
+            }
+            i += 1
+        }
+        out += "<p>" + render_inline(escape_html(para)) + "</p>\n"
+    }
+    out
+}
+
+
+fn is_ordered_item(line: String) -> bool {
+    let b = line.bytes()
+    let mut i = 0
+    while i < b.len() && b[i] >= '0' as u8 && b[i] <= '9' as u8 { i += 1 }
+    i > 0 && i < b.len() && b[i] == '.' as u8 && i + 1 < b.len() && b[i + 1] == ' ' as u8
+}
+
+
+fn after_list_marker(line: String) -> String {
+    let b = line.bytes()
+    let mut i = 0
+    while i < b.len() && b[i] >= '0' as u8 && b[i] <= '9' as u8 { i += 1 }
+    sub(line, i + 2, line.len())
+}
+
+
+fn is_table_sep(line: String) -> bool {
+    if line.len() < 2 { return false }
+    let b = line.bytes()
+    let mut i = 0
+    while i < b.len() {
+        if b[i] == '|' as u8 || b[i] == ' ' as u8 || b[i] == '-' as u8 || b[i] == ':' as u8 {
+            i += 1
+        } else {
+            return false
+        }
+    }
+    true
+}
+
+
+fn split_row(line: String) -> Vec<String> {
+    let mut cells = #[]
+    let mut cur = String::new()
+    let b = line.bytes()
+    let mut i = 0
+    // skip leading |
+    if i < b.len() && b[i] == '|' as u8 { i += 1 }
+    while i < b.len() {
+        if b[i] == '|' as u8 {
+            cells.push(cur)
+            cur = String::new()
+        } else {
+            cur.push(line[i])
+        }
+        i += 1
+    }
+    if cur.len() > 0 { cells.push(cur) }
+    cells
+}
+
+// ---------- auth / request helpers ----------
+
+// Reads one decoded query-string parameter; an absent name yields "".
+
+fn query_value(req: http::Request, name: String) -> String {
+    for (n, v) in req.query_pairs {
+        if n == name { return v }
+    }
+    ""
+}
+
+// Reads one request header by name; an absent header yields "".
+
+fn header_value(req: http::Request, name: String) -> String {
+    let want = name.to_lowercase()
+    for (n, v) in req.headers {
+        if n.to_lowercase() == want { return v }
+    }
+    ""
+}
+
+// Splits a string on a single-byte separator; byte-walker because the
+// std surface has no string split.
+
+fn split_byte(s: String, sep: u8) -> Vec<String> {
+    let mut parts = #[]
+    let mut cur = String::new()
+    let b = s.bytes()
+    let mut i = 0
+    while i < b.len() {
+        if b[i] == sep {
+            parts.push(cur)
+            cur = String::new()
+        } else {
+            cur.push(s[i])
+        }
+        i += 1
+    }
+    parts.push(cur)
+    parts
+}
+
+
+fn current_user(app: App, req: http::Request) -> Option<User> {
+    let cookie = header_value(req, "Cookie")
+    if cookie.len() == 0 { return None }
+    for part in split_byte(cookie, ';' as u8) {
+        let kv = part.trim()
+        if kv.starts_with("postwisp_session=") {
+            let token = sub(kv, "postwisp_session=".len(), kv.len())
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            return find_session(store, token)
+        }
+    }
+    None
+}
+
+
+fn require_user(app: App, req: http::Request) -> Result<User, http::Response> {
+    match current_user(app, req) {
+        Some(u) => return Ok(u)
+        None => return Err(err_json(401, "not logged in"))
+    }
+}
+
+// ---------- handlers ----------
+
+
+fn handle_setup(app: App, req: http::Request) -> http::Response {
+    let f = parse_body(req.body)
+    let token = field(f, "token")
+    let username = field(f, "username")
+    let email = field(f, "email")
+    let password = field(f, "password")
+    if !valid_username(username) { return err_json(400, "invalid username") }
+    if !valid_password(password) { return err_json(400, "password must be at least 10 chars with a digit and a non-alphanumeric") }
+    let mut eng = open_eng(app)
+    let mut store = read_store(&mut eng)
+    if store.users.len() > 0 { return err_json(403, "setup already done") }
+    if token != store.setup_token { return err_json(403, "bad setup token") }
+    let hash = hash_password(password)
+    let id = insert_user_row(&mut eng, username, email, hash, "admin")
+    if id <= 0 { return err_json(500, "storage error") }
+    let u = User {
+        id: id
+        username: username
+        email: email
+        password: hash
+        role: "admin"
+        created_at: now_ms()
+    }
+    if id + 1 > store.next_user_id { store.next_user_id = id + 1 }
+    store.users.push(u)
+    store.setup_token = ""
+    ok_json("{\"ok\":true}")
+}
+
+
+fn handle_login(app: App, req: http::Request) -> http::Response {
+    let f = parse_body(req.body)
+    let username = field(f, "username")
+    let password = field(f, "password")
+    let ip = peer_key(req)
+    if login_locked(app, ip, username) {
+        return err_json(429, "too many failed attempts, try again later")
+    }
+    let mut eng = open_eng(app)
+    let mut store = read_store(&mut eng)
+    match find_user_by_name(store, username) {
+        None => {
+            record_failed_login(app, ip, username)
+            return err_json(401, "bad credentials")
+        }
+        Some(u) => {
+            if !verify_password(u.password, password) {
+                record_failed_login(app, ip, username)
+                return err_json(401, "bad credentials")
+            }
+            clear_failed_logins(app, ip, username)
+            let now = now_ms()
+            let token = new_token("s:" + now.to_string() + ":" + username + ":" + store.sessions.len().to_string())
+            let s = Session { token: token, user_id: u.id, created_at: now, expires_at: now + 30 * 24 * 3600 * 1000 }
+            store.sessions.push(s)
+            exec_sql(&mut eng, "INSERT INTO sessions VALUES (" + sqlq(token) + ", " + u.id.to_string()
+                + ", " + now.to_string() + ", " + s.expires_at.to_string() + ")")
+            // expired sessions are dead rows; drop them while we are here
+            exec_sql(&mut eng, "DELETE FROM sessions WHERE expires_at < " + now.to_string())
+            return ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + token
+                + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+        }
+    }
+}
+
+
+fn handle_logout(app: App, req: http::Request) -> http::Response {
+    let cookie = header_value(req, "Cookie")
+    let mut eng = open_eng(app)
+    let mut store = read_store(&mut eng)
+    for part in split_byte(cookie, ';' as u8) {
+        let kv = part.trim()
+        if kv.starts_with("postwisp_session=") {
+            let token = sub(kv, "postwisp_session=".len(), kv.len())
+            let mut kept: Vec<Session> = #[]
+            for s in store.sessions {
+                if s.token != token { kept.push(s) }
+            }
+            store.sessions = kept
+            exec_sql(&mut eng, "DELETE FROM sessions WHERE token = " + sqlq(token))
+        }
+    }
+    ok_json("{\"ok\":true}").with_header("Set-Cookie", "postwisp_session=; Path=/; Max-Age=0")
+}
+
+
+fn user_json(u: User) -> String {
+    "{\"id\":" + u.id.to_string() + ",\"username\":" + json_quote(u.username)
+    + ",\"email\":" + json_quote(u.email) + ",\"role\":" + json_quote(u.role) + "}"
+}
+
+
+fn handle_me(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(u) => return ok_json(user_json(u))
+    }
+}
+
+
+fn handle_create_user(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            if me.role != "admin" { return err_json(403, "admin only") }
+            let f = parse_body(req.body)
+            let username = field(f, "username")
+            let email = field(f, "email")
+            let password = field(f, "password")
+            if !valid_username(username) { return err_json(400, "invalid username") }
+            if !valid_password(password) {
+                return err_json(400, "password must be at least 10 chars with a digit and a non-alphanumeric")
+            }
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            if find_user_by_name(store, username).is_some() {
+                return err_json(409, "username taken")
+            }
+            let hash = hash_password(password)
+            let id = insert_user_row(&mut eng, username, email, hash, "author")
+            if id <= 0 { return err_json(500, "storage error") }
+            let u = User {
+                id: id
+                username: username
+                email: email
+                password: hash
+                role: "author"
+                created_at: now_ms()
+            }
+            if id + 1 > store.next_user_id { store.next_user_id = id + 1 }
+            store.users.push(u)
+            return ok_json(user_json(u))
+        }
+    }
+}
+
+
+fn post_json(p: Post, username: String) -> String {
+    "{\"id\":" + p.id.to_string()
+    + ",\"user_id\":" + p.user_id.to_string()
+    + ",\"username\":" + json_quote(username)
+    + ",\"title\":" + json_quote(p.title)
+    + ",\"source\":" + json_quote(p.source)
+    + ",\"content\":" + json_quote(p.content)
+    + ",\"tags\":" + json_quote(p.tags)
+    + ",\"status\":" + json_quote(p.status)
+    + ",\"published_at\":" + p.published_at.to_string()
+    + ",\"slug\":" + json_quote(p.slug)
+    + ",\"created_at\":" + p.created_at.to_string()
+    + ",\"modified_at\":" + p.modified_at.to_string() + "}"
+}
+
+// Drafts sort by modified date, published by publish date, newest first;
+// the key is chosen per post so a draft's modified_at is never compared
+// against a published post's published_at.
+
+fn post_sort_key(p: Post) -> i64 {
+    if p.status == "draft" { return p.modified_at }
+    p.published_at
+}
+
+fn post_cmp(a: Post, b: Post) -> i64 {
+    if post_sort_key(a) > post_sort_key(b) { return -1 }
+    1
+}
+
+
+fn handle_list_posts(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            let status = query_value(req, "status")
+            let q = query_value(req, "q").to_lowercase()
+            let mut mine: Vec<Post> = #[]
+            for p in store.posts {
+                if p.user_id != me.id { continue }
+                if status.len() > 0 && p.status != status { continue }
+                if q.len() > 0 {
+                    let hay = (p.title + " " + p.source + " " + p.tags).to_lowercase()
+                    if !hay.contains(q) { continue }
+                }
+                mine.push(p)
+            }
+            mine.sort_by(|a, b| post_cmp(a, b))
+            let mut out = String::new()
+            out += "["
+            let mut first = true
+            for p in mine {
+                if !first { out += "," }
+                first = false
+                out += post_json(p, me.username)
+            }
+            out += "]"
+            return ok_json(out)
+        }
+    }
+}
+
+
+fn handle_get_post(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let id = match req.path_value("id").to_i64() {
+                Some(v) => v
+                None => return err_json(400, "bad id")
+            }
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            match find_post(store, id) {
+                None => return err_json(404, "no such post")
+                Some(p) => {
+                    if p.user_id != me.id { return err_json(403, "not your post") }
+                    return ok_json(post_json(p, me.username))
+                }
+            }
+        }
+    }
+}
+
+
+fn handle_slug_check(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let slug = query_value(req, "slug")
+            if !valid_slug(slug) { return ok_json("{\"ok\":false,\"reason\":\"invalid\"}") }
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            if slug_taken(store, me.id, slug, 0) {
+                return ok_json("{\"ok\":false,\"reason\":\"taken\"}")
+            }
+            return ok_json("{\"ok\":true}")
+        }
+    }
+}
+
+
+fn handle_preview(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(_) => {
+            let f = parse_body(req.body)
+            let markdown = field(f, "markdown")
+            return ok_json("{\"html\":" + json_quote(render_markdown(markdown)) + "}")
+        }
+    }
+}
+
+
+fn handle_create_post(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let f = parse_body(req.body)
+            let title = field(f, "title")
+            let mut slug = field(f, "slug")
+            let source = field(f, "source")
+            let tags = field(f, "tags")
+            let status = field(f, "status")
+            if title.len() == 0 || title.len() > 200 { return err_json(400, "title required (max 200)") }
+            // derive from the title when the client sends none (or junk)
+            if !valid_slug(slug) { slug = slugify(title) }
+            if !valid_slug(slug) { return err_json(400, "could not derive a slug from the title") }
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            if slug_taken(store, me.id, slug, 0) { return err_json(409, "slug taken") }
+            let now = now_ms()
+            let mut p = Post {
+                id: 0
+                user_id: me.id
+                title: title
+                source: source
+                content: render_markdown(source)
+                tags: clean_tags(tags)
+                status: if status == "published" { "published" } else { "draft" }
+                published_at: if status == "published" { now } else { 0 }
+                slug: slug
+                created_at: now
+                modified_at: now
+            }
+            p.id = insert_post_row(&mut eng, p)
+            if p.id <= 0 { return err_json(500, "storage error") }
+            if p.id + 1 > store.next_post_id { store.next_post_id = p.id + 1 }
+            store.posts.push(p)
+            return ok_json(post_json(p, me.username))
+        }
+    }
+}
+
+
+fn clean_tags(tags: String) -> String {
+    let mut out: Vec<String> = #[]
+    for t in tags.split(",") {
+        let tt = t.trim().to_lowercase()
+        if tt.len() > 0 && !out.contains(tt) { out.push(tt) }
+    }
+    out.join(",")
+}
+
+
+fn handle_update_post(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let id = match req.path_value("id").to_i64() {
+                Some(v) => v
+                None => return err_json(400, "bad id")
+            }
+            let f = parse_body(req.body)
+            let title = field(f, "title")
+            let mut slug = field(f, "slug")
+            let source = field(f, "source")
+            let tags = field(f, "tags")
+            let status = field(f, "status")
+            if title.len() == 0 || title.len() > 200 { return err_json(400, "title required (max 200)") }
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            let mut found: Option<Post> = None
+            for p in store.posts {
+                if p.id == id { found = Some(p) }
+            }
+            match found {
+                None => return err_json(404, "no such post")
+                Some(old) => {
+                    if old.user_id != me.id { return err_json(403, "not your post") }
+                    // fall back to the existing slug when the client sends none
+                    if !valid_slug(slug) { slug = old.slug }
+                    if !valid_slug(slug) { slug = slugify(title) }
+                    if !valid_slug(slug) { return err_json(400, "could not derive a slug from the title") }
+                    if slug_taken(store, me.id, slug, id) { return err_json(409, "slug taken") }
+                    let now = now_ms()
+                    let mut newpost = old
+                    newpost.title = title
+                    newpost.slug = slug
+                    newpost.source = source
+                    newpost.content = render_markdown(source)
+                    newpost.tags = clean_tags(tags)
+                    // a missing status field keeps the current one: an
+                    // update that says nothing about publishing must not
+                    // silently unpublish the post
+                    let mut newstatus = status
+                    if newstatus.len() == 0 { newstatus = old.status }
+                    if newstatus == "published" && old.status != "published" {
+                        newpost.published_at = now
+                    }
+                    if newstatus != "published" && old.status == "published" {
+                        newpost.published_at = 0
+                    }
+                    newpost.status = if newstatus == "published" { "published" } else { "draft" }
+                    newpost.modified_at = now
+                    let mut kept: Vec<Post> = #[]
+                    for p in store.posts {
+                        if p.id != id { kept.push(p) }
+                    }
+                    store.posts = kept
+                    store.posts.push(newpost)
+                    exec_sql(&mut eng, update_post_sql(newpost))
+                    return ok_json(post_json(newpost, me.username))
+                }
+            }
+        }
+    }
+}
+
+
+fn handle_delete_post(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let id = match req.path_value("id").to_i64() {
+                Some(v) => v
+                None => return err_json(400, "bad id")
+            }
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            let mut found = false
+            for p in store.posts {
+                if p.id == id && p.user_id == me.id { found = true }
+            }
+            if !found { return err_json(404, "no such post") }
+            let mut kept: Vec<Post> = #[]
+            for p in store.posts {
+                if !(p.id == id && p.user_id == me.id) { kept.push(p) }
+            }
+            store.posts = kept
+            exec_sql(&mut eng, "DELETE FROM posts WHERE rowid = " + id.to_string())
+            return ok_json("{\"ok\":true}")
+        }
+    }
+}
+
+
+fn sniff_content_type(data: Vec<u8>) -> Option<String> {
+    let n = data.len()
+    if n >= 8 && data[0] == 0x89 && data[1] == 'P' as u8 && data[2] == 'N' as u8 && data[3] == 'G' as u8 {
+        return Some("image/png")
+    }
+    if n >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF { return Some("image/jpeg") }
+    if n >= 12 && data[0] == 'R' as u8 && data[1] == 'I' as u8 && data[2] == 'F' as u8 && data[3] == 'F' as u8
+    && data[8] == 'W' as u8 && data[9] == 'E' as u8 && data[10] == 'B' as u8 && data[11] == 'P' as u8 {
+        return Some("image/webp")
+    }
+    if n >= 6 && data[0] == 'G' as u8 && data[1] == 'I' as u8 && data[2] == 'F' as u8 && data[3] == '8' as u8 {
+        return Some("image/gif")
+    }
+    None
+}
+
+// The upload is the raw image body: the content type is sniffed from the magic
+// bytes, so nothing the client claims is trusted.
+
+fn handle_upload_media(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let data = req.raw_body
+            if data.len() == 0 { return err_json(400, "empty body") }
+            if data.len() > 5 * 1024 * 1024 { return err_json(413, "too large (max 5MB)") }
+            let ct = match sniff_content_type(data) {
+                Some(c) => c
+                None => return err_json(415, "not a jpg/png/webp/gif image")
+            }
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            let id = new_token("m:" + now_ms().to_string() + ":" + store.media.len().to_string())
+            match fs::write(app.dir + "/media/" + id, data) {
+                Ok(_) => ()
+                Err(m) => return err_json(500, "cannot store media: " + m.message())
+            }
+            let item = MediaItem { id: id, user_id: me.id, content_type: ct, created_at: now_ms() }
+            exec_sql(&mut eng, "INSERT INTO media VALUES (" + sqlq(item.id) + ", " + me.id.to_string()
+                + ", " + sqlq(ct) + ", " + item.created_at.to_string() + ")")
+            store.media.push(item)
+            let url = "/" + me.username + "/media/" + id
+            return ok_json("{\"url\":" + json_quote(url) + "}")
+        }
+    }
+}
+
+
+fn err_page(code: String, msg: String) -> String {
+    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    + "<title>" + code + " — postwisp</title>"
+    + "<link rel=\"stylesheet\" href=\"/theme.css\">"
+    + "<link rel=\"stylesheet\" href=\"/app.css\">"
+    + "<script src=\"/theme-boot.js\"></script>"
+    + "</head><body><main class=\"error-page\">"
+    + "<div class=\"error-code\">" + escape_html(code) + "</div>"
+    + "<p class=\"error-msg\">" + escape_html(msg) + "</p>"
+    + "<p><a class=\"btn\" href=\"/\">Back to the blog</a></p>"
+    + "</main></body></html>"
+}
+
+fn handle_public_media(app: App, req: http::Request) -> http::Response {
+    let user = req.path_value("user")
+    let id = req.path_value("id")
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    let mut found: Option<MediaItem> = None
+    for m in store.media {
+        if m.id == id { found = Some(m) }
+    }
+    match found {
+        None => return resp_html(404, err_page("404", "That page does not exist."))
+        Some(m) => {
+            match find_user(store, m.user_id) {
+                None => return resp_html(404, err_page("404", "That page does not exist."))
+                Some(u) => {
+                    if u.username != user { return resp_html(404, err_page("404", "That page does not exist.")) }
+                    match fs::read(app.dir + "/media/" + m.id) {
+                        Ok(bytes) => {
+                            // binary body: ResponseStream::write_bytes frames
+                            // raw bytes; Response::text UTF-8-encodes anything
+                            // pushed as chars and would corrupt images.
+                            let mut stream = http::ResponseStream::new()
+                            stream.write_bytes(bytes)
+                            stream.close()
+                            return http::Response::stream(200, m.content_type, stream)
+                                .with_header("Cache-Control", "public, max-age=86400")
+                        }
+                        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+fn page_shell(title: String, body_html: String, feed_link: String) -> String {
+    "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+    + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    + "<title>" + escape_html(title) + "</title>"
+    + feed_link
+    + "<link rel=\"stylesheet\" href=\"/theme.css\">"
+    + "<link rel=\"stylesheet\" href=\"/app.css\">"
+    + "<script src=\"/theme-boot.js\"></script>"
+    + "</head><body>"
+    + "<header class=\"site-header\"><div class=\"wrap\">"
+    + "<a class=\"brand\" href=\"/\">postwisp</a>"
+    + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/admin\">Admin</a></nav>"
+    + "</div></header>"
+    + "<main>" + body_html + "</main>"
+    + "<footer class=\"site-footer\"><div class=\"wrap\">Powered by postwisp</div></footer>"
+    + "</body></html>"
+}
+
+
+// ---------- public templates ----------
+//
+// The public pages (home, post, list, about) are plain HTML files under
+// templates/ with inline CSS — no shared stylesheets, no build step. Each
+// `{{name}}` placeholder is filled from the site settings plus
+// page-specific fields. Templates are read from disk on every request, so
+// editing one shows up on the next page load with no restart. A missing
+// file answers a 500 naming it; a placeholder nobody fills stays visible
+// in the page so a broken template is obvious at a glance.
+
+fn load_template(app: App, name: String) -> String {
+    match fs::read_to_string(app.tpl_dir + "/" + name) {
+        Ok(html) => return html
+        Err(_) => return ""
+    }
+}
+
+
+fn tpl_fill(html: String, fields: Map<String, String>) -> String {
+    let mut out = html
+    for (k, v) in fields.iter() {
+        out = strings::replace(out, "{{" + k + "}}", v)
+    }
+    return out
+}
+
+
+// Defaults every public page shares: site title/tagline/footer plus the
+// site-wide theme on <html>. Page-specific fields override these.
+
+fn site_fields(app: App) -> Map<String, String> {
+    let f = parse_body(settings_json(app))
+    let mut m = Map::new()
+    let title = get_setting(f, "title", "postwisp")
+    let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
+    let footer = get_setting(f, "footer", "Powered by postwisp")
+    let mut theme = get_setting(f, "theme", "dark")
+    if theme != "light" && theme != "dark" { theme = "dark" }
+    m.insert("title", escape_html(title))
+    m.insert("site_title", escape_html(title))
+    m.insert("tagline", escape_html(tagline))
+    m.insert("footer", escape_html(footer))
+    if theme == "light" { m.insert("theme_attr", " data-theme=\"light\"") }
+    else { m.insert("theme_attr", "") }
+    return m
+}
+
+
+fn render_page(app: App, name: String, fields: Map<String, String>) -> String {
+    let mut all = site_fields(app)
+    for (k, v) in fields.iter() {
+        all.insert(k, v)
+    }
+    return tpl_fill(load_template(app, name), all)
+}
+
+
+fn serve_template(app: App, name: String, fields: Map<String, String>) -> http::Response {
+    let html = render_page(app, name, fields)
+    if html.len() == 0 {
+        return resp_html(500, "<h1>templates/" + name + " is missing</h1>")
+    }
+    return resp_html(200, html)
+}
+
+
+fn handle_home(app: App, req: http::Request) -> http::Response {
+    return serve_template(app, "index.html", Map::new())
+}
+
+
+fn handle_list(app: App, req: http::Request) -> http::Response {
+    let tag = query_value(req, "tag")
+    let mut fields = Map::new()
+    if tag.len() > 0 {
+        let t = "Posts tagged \"" + tag + "\""
+        fields.insert("title", escape_html(t))
+        fields.insert("page_title", escape_html(t))
+        fields.insert("page_sub", "Every published post with the tag \"" + escape_html(tag) + "\".")
+    } else {
+        fields.insert("title", "Posts")
+        fields.insert("page_title", "All posts")
+        fields.insert("page_sub", "Everything published on this blog.")
+    }
+    return serve_template(app, "list.html", fields)
+}
+
+
+// The about page is a singleton post each user maintains under the
+// reserved slug "about". The site-level /about shows the first user's
+// (the admin's); every author's own lives at /<user>/about through the
+// normal post route. Until someone writes one, the placeholder below
+// fills the frame in templates/about.html.
+
+fn find_about_post(store: Store, user_id: i64) -> Option<Post> {
+    for p in store.posts {
+        if p.user_id == user_id && p.slug == "about" { return Some(p) }
+    }
+    None
+}
+
+
+fn about_fallback_html() -> String {
+    "<p>This site runs on postwisp, a small self-hosted blog.</p>\n"
+    + "<p>Replace this with whatever you want people to know about you or "
+    + "this site: log in to the admin dashboard and press the About page "
+    + "button.</p>"
+}
+
+
+fn handle_about(app: App, req: http::Request) -> http::Response {
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    let mut fields = Map::new()
+    fields.insert("title", "About")
+    fields.insert("content", about_fallback_html())
+    if store.users.len() > 0 {
+        match find_about_post(store, store.users[0].id) {
+            Some(p) => {
+                if p.status == "published" {
+                    fields.insert("title", escape_html(p.title))
+                    fields.insert("content", p.content)
+                }
+            }
+            None => ()
+        }
+    }
+    return serve_template(app, "about.html", fields)
+}
+
+
+fn handle_public_post(app: App, req: http::Request) -> http::Response {
+    let user = req.path_value("user")
+    let slug = req.path_value("slug")
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    match find_user_by_name(store, user) {
+        None => return resp_html(404, err_page("404", "That page does not exist."))
+        Some(u) => {
+            for p in store.posts {
+                if p.user_id == u.id && p.slug == slug && p.status == "published" {
+                    let mut tags_html = String::new()
+                    if p.tags.len() > 0 {
+                        for t in p.tags.split(",") {
+                            tags_html += "<a class=\"tag\" href=\"/posts?tag=" + escape_html(t) + "\">" + escape_html(t) + "</a> "
+                        }
+                    }
+                    let mut fields = Map::new()
+                    fields.insert("title", escape_html(p.title))
+                    fields.insert("content", p.content)
+                    fields.insert("date", codec::datetime::render(p.published_at))
+                    fields.insert("author_part", " &middot; " + escape_html(u.username))
+                    fields.insert("tags_part", " " + tags_html)
+                    fields.insert("feed_url", "/" + escape_html(u.username) + "/feed.xml")
+                    return serve_template(app, "post.html", fields)
+                }
+            }
+            return resp_html(404, err_page("404", "That page does not exist."))
+        }
+    }
+}
+
+
+fn pub_cmp(a: Post, b: Post) -> i64 {
+    if a.published_at > b.published_at { return -1 }
+    1
+}
+
+
+fn handle_feed(app: App, req: http::Request) -> http::Response {
+    let user = req.path_value("user")
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    match find_user_by_name(store, user) {
+        None => return resp_html(404, err_page("404", "That page does not exist."))
+        Some(u) => {
+            let mut mine: Vec<Post> = #[]
+            for p in store.posts {
+                if p.user_id == u.id && p.status == "published" && p.slug != "about" { mine.push(p) }
+            }
+            mine.sort_by(|a, b| pub_cmp(a, b))
+            if mine.len() > 20 { mine.truncate(20) }
+            let base = "/" + u.username
+            let mut xml = String::new()
+            xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+            xml += "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+            xml += "<title>" + escape_html(u.username) + " — postwisp</title>\n"
+            xml += "<link href=\"" + base + "/feed.xml\" rel=\"self\"/>\n"
+            xml += "<updated>" + (if mine.len() > 0 { codec::datetime::render(mine[0].published_at) } else { codec::datetime::render(now_ms()) }) + "</updated>\n"
+            for p in mine {
+                let link = base + "/" + p.slug
+                xml += "<entry>\n<title>" + escape_html(p.title) + "</title>\n"
+                xml += "<link href=\"" + link + "\"/>\n"
+                xml += "<id>" + link + "</id>\n"
+                xml += "<updated>" + codec::datetime::render(p.published_at) + "</updated>\n"
+                xml += "<content type=\"html\">" + escape_html(p.content) + "</content>\n"
+                xml += "</entry>\n"
+            }
+            xml += "</feed>\n"
+            return http::Response::text(200, xml).with_header("Content-Type", "application/atom+xml")
+        }
+    }
+}
+
+
+// ---------- public site: settings, published-post summaries, static pages ----------
+//
+// Blog metadata lives as one JSON blob under the kv key postwisp/settings
+// (title/tagline/description/footer). The landing, list, editor and settings
+// pages are static files under web/ styled by /theme.css + /app.css; the
+// server-rendered post pages share the same stylesheets.
+
+fn serve_web_file(app: App, name: String) -> http::Response {
+    match fs::read_to_string(app.web_dir + "/" + name) {
+        Ok(html) => return resp_html(200, html)
+        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+    }
+}
+
+
+fn serve_web_css(app: App, name: String) -> http::Response {
+    match fs::read_to_string(app.web_dir + "/" + name) {
+        Ok(css) => return http::Response::text(200, css).with_header("Content-Type", "text/css; charset=utf-8")
+        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+    }
+}
+
+
+fn serve_web_js(app: App, name: String) -> http::Response {
+    match fs::read_to_string(app.web_dir + "/" + name) {
+        Ok(js) => return http::Response::text(200, js).with_header("Content-Type", "text/javascript; charset=utf-8")
+        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+    }
+}
+
+
+fn get_setting(m: Map<String, String>, key: String, dflt: String) -> String {
+    let v = field(m, key)
+    if v.len() == 0 { return dflt }
+    v
+}
+
+
+fn settings_json(app: App) -> String {
+    let mut raw = "{}"
+    let mut eng = open_eng(app)
+    match eng.store.get("postwisp/settings") {
+        kv::Read::Value(b) => match String::from_utf8(b) {
+            Ok(s) => { raw = s }
+            Err(_) => ()
+        }
+        kv::Read::Absent => ()
+        kv::Read::Fault(_) => ()
+    }
+    let f = parse_body(raw)
+    let store = read_store(&mut eng)
+    let mut sp = "false"
+    if store.users.len() == 0 { sp = "true" }
+    let title = get_setting(f, "title", "postwisp")
+    let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
+    let description = get_setting(f, "description", "")
+    let footer = get_setting(f, "footer", "Powered by postwisp")
+    let mut theme = get_setting(f, "theme", "dark")
+    if theme != "light" && theme != "dark" { theme = "dark" }
+    let json = "{\"title\":" + json_quote(title)
+    + ",\"tagline\":" + json_quote(tagline)
+    + ",\"description\":" + json_quote(description)
+    + ",\"footer\":" + json_quote(footer)
+    + ",\"theme\":" + json_quote(theme)
+    + ",\"setup_pending\":" + sp
+    + "}"
+    json
+}
+
+
+fn handle_get_settings(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(_) => return ok_json(settings_json(app))
+    }
+}
+
+
+fn handle_put_settings(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(_) => {
+            let f = parse_body(req.body)
+            let cur = parse_body(settings_json(app))
+            let title = get_setting(f, "title", get_setting(cur, "title", "postwisp"))
+            let tagline = get_setting(f, "tagline", get_setting(cur, "tagline", "Notes from a small self-hosted blog"))
+            let description = get_setting(f, "description", get_setting(cur, "description", ""))
+            let footer = get_setting(f, "footer", get_setting(cur, "footer", "Powered by postwisp"))
+            let mut theme = get_setting(f, "theme", get_setting(cur, "theme", "dark"))
+            if theme != "light" && theme != "dark" { return err_json(400, "theme must be light or dark") }
+            if title.len() == 0 || title.len() > 100 { return err_json(400, "title required (max 100)") }
+            if tagline.len() > 200 { return err_json(400, "tagline too long (max 200)") }
+            if description.len() > 500 { return err_json(400, "description too long (max 500)") }
+            if footer.len() > 300 { return err_json(400, "footer too long (max 300)") }
+            let json = "{\"title\":" + json_quote(title)
+            + ",\"tagline\":" + json_quote(tagline)
+            + ",\"description\":" + json_quote(description)
+            + ",\"footer\":" + json_quote(footer)
+            + ",\"theme\":" + json_quote(theme)
+            + "}"
+            let mut eng = open_eng(app)
+            let _ = eng.store.put("postwisp/settings", json.as_bytes())
+            return ok_json(json)
+        }
+    }
+}
+
+
+fn handle_public_site(app: App, req: http::Request) -> http::Response {
+    ok_json(settings_json(app))
+}
+
+
+fn excerpt_of(source: String) -> String {
+    let mut out = String::new()
+    for c in source {
+        let keep = c != '#' && c != '*' && c != '`' && c != '>' && c != '|' && c != '_' && c != '[' && c != ']'
+        if keep {
+            if c == '\n' || c == '\r' { out.push(' ') }
+            else { out.push(c) }
+        }
+    }
+    let t = out.trim()
+    if t.len() > 200 { return sub(t, 0, 200) + "..." }
+    return t
+}
+
+
+fn post_summary_json(p: Post, username: String) -> String {
+    "{\"id\":" + p.id.to_string()
+    + ",\"title\":" + json_quote(p.title)
+    + ",\"slug\":" + json_quote(p.slug)
+    + ",\"username\":" + json_quote(username)
+    + ",\"tags\":" + json_quote(p.tags)
+    + ",\"published_at\":" + p.published_at.to_string()
+    + ",\"excerpt\":" + json_quote(excerpt_of(p.source))
+    + "}"
+}
+
+
+fn handle_public_posts(app: App, req: http::Request) -> http::Response {
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    let mut published: Vec<Post> = #[]
+    // about pages are singleton pages, not list items
+    for p in store.posts {
+        if p.status == "published" && p.slug != "about" { published.push(p) }
+    }
+    // selection sort by published_at, newest first (no Vec index assignment needed)
+    let mut ordered: Vec<Post> = #[]
+    while published.len() > 0 {
+        let mut best: i64 = 0
+        let mut k: i64 = 0
+        while k < published.len() {
+            if published[k].published_at > published[best].published_at { best = k }
+            k += 1
+        }
+        ordered.push(published[best])
+        let mut rest: Vec<Post> = #[]
+        let mut j: i64 = 0
+        while j < published.len() {
+            if j != best { rest.push(published[j]) }
+            j += 1
+        }
+        published = rest
+    }
+    let mut items: Vec<String> = #[]
+    for p in ordered {
+        let uname = match find_user(store, p.user_id) {
+            Some(u) => u.username
+            None => "unknown"
+        }
+        items.push(post_summary_json(p, uname))
+    }
+    let mut body = "{\"posts\":["
+    let mut first = true
+    for it in items {
+        if !first { body += "," }
+        body += it
+        first = false
+    }
+    body += "]}"
+    ok_json(body)
+}
+
+
+fn handle_theme_css(app: App, req: http::Request) -> http::Response {
+    // Retired: the design tokens now live in /app.css (admin pages) and
+    // inline in templates/*.html (public pages). Kept as a no-op so any
+    // bookmarked link or cached page keeps working.
+    let css = "/* postwisp: theme.css is retired — the theme tokens live in /app.css now. */\n"
+    http::Response::text(200, css).with_header("Content-Type", "text/css")
+}
+
+// The dashboard, login and setup screens are one static page the binary serves
+// itself; no frontend build step, nothing to deploy beside the binary.
+
+fn handle_admin(app: App, req: http::Request) -> http::Response {
+    match fs::read_to_string(app.web_dir + "/admin.html") {
+        Ok(html) => return resp_html(200, html)
+        Err(_) => return resp_html(500, "<h1>web/admin.html is missing</h1>")
+    }
+}
+
+// ---------- posts zip export ----------
+//
+// Streams every post the caller may see as a zip of markdown files named
+// "<title>-<post-datetime>.md". Store method (no compression): the entries
+// are plain text, and the writer stays a few dozen lines with no encoder.
+
+struct ZipEntry {
+    name: String
+    body: String // markdown source; written as UTF-8 bytes
+    crc: i64     // crc32 of the body
+    dos_time: i64
+    dos_date: i64
+    offset: i64 // local-header offset, filled by zip_bytes
+}
+
+struct PostStamp {
+    fname: String // datetime fragment for the entry name, 2025-01-15-103045
+    dos_date: i64
+    dos_time: i64
+}
+
+fn push_u16le(buf: &mut Vec<u8>, n: i64) {
+    buf.push((n & 0xFF) as u8)
+    buf.push(((n / 256) & 0xFF) as u8)
+}
+
+fn push_u32le(buf: &mut Vec<u8>, n: i64) {
+    buf.push((n & 0xFF) as u8)
+    buf.push(((n / 256) & 0xFF) as u8)
+    buf.push(((n / 65536) & 0xFF) as u8)
+    buf.push(((n / 16777216) & 0xFF) as u8)
+}
+
+fn push_string_bytes(buf: &mut Vec<u8>, s: String) {
+    for x in s.as_bytes() { buf.push(x) }
+}
+
+fn post_stamp(ms: i64) -> PostStamp {
+    // codec::datetime::render gives 2025-01-15T10:30:45.123Z; split it apart so the
+    // entry name and the DOS timestamp agree on one datetime.
+    let date_s = codec::datetime::render(ms).split("T")[0]
+    let time_s = codec::datetime::render(ms).split("T")[1].split(".")[0]
+    let dp = date_s.split("-")
+    let tp = time_s.split(":")
+    let mut y = dp[0].to_i64().unwrap_or(1980)
+    let mo = dp[1].to_i64().unwrap_or(1)
+    let d = dp[2].to_i64().unwrap_or(1)
+    let h = tp[0].to_i64().unwrap_or(0)
+    let mi = tp[1].to_i64().unwrap_or(0)
+    let s = tp[2].to_i64().unwrap_or(0)
+    if y < 1980 { y = 1980 } // DOS dates start at 1980
+    return PostStamp {
+        fname: date_s + "-" + tp[0] + tp[1] + tp[2]
+        dos_date: (y - 1980) * 512 + mo * 32 + d
+        dos_time: h * 2048 + mi * 64 + s / 2
+    }
+}
+
+fn zip_name_for(title: String, stamp: PostStamp) -> String {
+    // flatten path separators so every entry is one file at the zip root
+    let flat = title.split("/").join("-")
+    return flat + "-" + stamp.fname + ".md"
+}
+
+fn zip_bytes(entries: Vec<ZipEntry>) -> Vec<u8> {
+    let mut out: Vec<u8> = #[]
+    let mut offsets: Vec<i64> = #[]
+    for e in entries {
+        offsets.push(out.len())
+        push_u32le(&mut out, 0x04034B50) // local file header
+        push_u16le(&mut out, 20)         // version needed
+        push_u16le(&mut out, 0x0800)     // flags: utf-8 names
+        push_u16le(&mut out, 0)          // method: store
+        push_u16le(&mut out, e.dos_time)
+        push_u16le(&mut out, e.dos_date)
+        push_u32le(&mut out, e.crc)
+        push_u32le(&mut out, e.body.len())
+        push_u32le(&mut out, e.body.len())
+        push_u16le(&mut out, e.name.len())
+        push_u16le(&mut out, 0) // extra len
+        push_string_bytes(&mut out, e.name)
+        push_string_bytes(&mut out, e.body)
+    }
+    let cd_start = out.len()
+    let mut idx = 0
+    for e in entries {
+        push_u32le(&mut out, 0x02014B50) // central directory header
+        push_u16le(&mut out, 20)         // version made by
+        push_u16le(&mut out, 20)         // version needed
+        push_u16le(&mut out, 0x0800)
+        push_u16le(&mut out, 0)
+        push_u16le(&mut out, e.dos_time)
+        push_u16le(&mut out, e.dos_date)
+        push_u32le(&mut out, e.crc)
+        push_u32le(&mut out, e.body.len())
+        push_u32le(&mut out, e.body.len())
+        push_u16le(&mut out, e.name.len())
+        push_u16le(&mut out, 0) // extra len
+        push_u16le(&mut out, 0) // comment len
+        push_u16le(&mut out, 0) // disk start
+        push_u16le(&mut out, 0) // internal attrs
+        push_u32le(&mut out, 0) // external attrs
+        push_u32le(&mut out, offsets[idx])
+        push_string_bytes(&mut out, e.name)
+        idx += 1
+    }
+    let cd_size = out.len() - cd_start
+    push_u32le(&mut out, 0x06054B50) // end of central directory
+    push_u16le(&mut out, 0)
+    push_u16le(&mut out, 0)
+    push_u16le(&mut out, idx)
+    push_u16le(&mut out, idx)
+    push_u32le(&mut out, cd_size)
+    push_u32le(&mut out, cd_start)
+    push_u16le(&mut out, 0) // comment len
+    return out
+}
+
+fn handle_posts_zip(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            let mut entries: Vec<ZipEntry> = #[]
+            for p in store.posts {
+                // admins export everything; authors export their own posts
+                if me.role == "admin" || p.user_id == me.id {
+                    let dt = if p.published_at > 0 { p.published_at } else { p.created_at }
+                    let stamp = post_stamp(dt)
+                    entries.push(ZipEntry {
+                        name: zip_name_for(p.title, stamp)
+                        body: p.source
+                        crc: crc32::checksum_string(p.source) as i64
+                        dos_time: stamp.dos_time
+                        dos_date: stamp.dos_date
+                        offset: 0
+                    })
+                }
+            }
+            // binary body: ResponseStream::write_bytes frames raw bytes;
+            // Response::text UTF-8-encodes anything pushed as chars.
+            let zip = zip_bytes(entries)
+            let mut stream = http::ResponseStream::new()
+            stream.write_bytes(zip)
+            stream.close()
+            return http::Response::stream(200, "application/zip", stream)
+                .with_header("Content-Disposition", "attachment; filename=posts.zip")
+        }
+    }
+}
+
+// ---------- router ----------
+
+
+fn router(app: App) -> router::Router {
+    let r = router::Router::new()
+        .get("/setup", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
+        .post("/api/setup", fn(req: http::Request) -> http::Response { return handle_setup(app, req) })
+        .post("/api/login", fn(req: http::Request) -> http::Response { return handle_login(app, req) })
+        .post("/api/logout", fn(req: http::Request) -> http::Response { return handle_logout(app, req) })
+        .get("/api/me", fn(req: http::Request) -> http::Response { return handle_me(app, req) })
+        .post("/api/users", fn(req: http::Request) -> http::Response { return handle_create_user(app, req) })
+        .get("/api/posts", fn(req: http::Request) -> http::Response { return handle_list_posts(app, req) })
+        .post("/api/posts", fn(req: http::Request) -> http::Response { return handle_create_post(app, req) })
+        .get("/api/posts.zip", fn(req: http::Request) -> http::Response { return handle_posts_zip(app, req) })
+        .get("/api/posts/{id}", fn(req: http::Request) -> http::Response { return handle_get_post(app, req) })
+        .put("/api/posts/{id}", fn(req: http::Request) -> http::Response { return handle_update_post(app, req) })
+        .delete("/api/posts/{id}", fn(req: http::Request) -> http::Response { return handle_delete_post(app, req) })
+        .get("/api/slug-check", fn(req: http::Request) -> http::Response { return handle_slug_check(app, req) })
+        .post("/api/preview", fn(req: http::Request) -> http::Response { return handle_preview(app, req) })
+        .post("/api/media", fn(req: http::Request) -> http::Response { return handle_upload_media(app, req) })
+        .get("/theme.css", fn(req: http::Request) -> http::Response { return handle_theme_css(app, req) })
+        .get("/app.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, "app.css") })
+        .get("/theme-boot.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, "theme-boot.js") })
+        .get("/", fn(req: http::Request) -> http::Response { return handle_home(app, req) })
+        .get("/posts", fn(req: http::Request) -> http::Response { return handle_list(app, req) })
+        .get("/about", fn(req: http::Request) -> http::Response { return handle_about(app, req) })
+        .get("/editor", fn(req: http::Request) -> http::Response { return serve_web_file(app, "editor.html") })
+        .get("/settings", fn(req: http::Request) -> http::Response { return serve_web_file(app, "settings.html") })
+        .get("/admin", fn(req: http::Request) -> http::Response { return serve_web_file(app, "admin.html") })
+        .get("/api/public/site", fn(req: http::Request) -> http::Response { return handle_public_site(app, req) })
+        .get("/api/public/posts", fn(req: http::Request) -> http::Response { return handle_public_posts(app, req) })
+        .get("/api/settings", fn(req: http::Request) -> http::Response { return handle_get_settings(app, req) })
+        .put("/api/settings", fn(req: http::Request) -> http::Response { return handle_put_settings(app, req) })
+        .get("/{user}/media/{id}", fn(req: http::Request) -> http::Response { return handle_public_media(app, req) })
+        .get("/{user}/feed.xml", fn(req: http::Request) -> http::Response { return handle_feed(app, req) })
+        .get("/{user}/{slug}", fn(req: http::Request) -> http::Response { return handle_public_post(app, req) })
+    r
+}
+
+
+fn main() {
+    let app = new_app()
+    println("postwisp listening on 127.0.0.1:8080 (data: " + app.dir + ", templates: " + app.tpl_dir + ")")
+    match http::serve("127.0.0.1:8080", router(app)) {
+        Ok(_) => ()
+        Err(e) => eprintln("serve failed: {}", e)
+    }
+}
+
+// ---------- tests ----------
+
+
+#[test]
+
+fn zip_entry_name_flattens_paths_and_stamps_datetime() {
+    let ms = codec::datetime::parse("2025-01-15T10:30:45Z").unwrap_or(0)
+    let stamp = post_stamp(ms)
+    assert_eq(stamp.fname, "2025-01-15-103045")
+    assert_eq(stamp.dos_date, 45 * 512 + 1 * 32 + 15)
+    assert_eq(stamp.dos_time, 10 * 2048 + 30 * 64 + 45 / 2)
+    assert_eq(zip_name_for("Hello World", stamp), "Hello World-2025-01-15-103045.md")
+    assert_eq(zip_name_for("A/B C", stamp), "A-B C-2025-01-15-103045.md")
+    // pre-1980 timestamps clamp to the DOS epoch
+    let early = post_stamp(0)
+    assert_eq(early.dos_date, 1 * 32 + 1)
+}
+
+#[test]
+
+fn zip_bytes_lays_out_valid_archive() {
+    let stamp = post_stamp(codec::datetime::parse("2025-01-15T10:30:45Z").unwrap_or(0))
+    let mut entries: Vec<ZipEntry> = #[]
+    entries.push(ZipEntry {
+        name: zip_name_for("Hello World", stamp)
+        body: "# Hello\n"
+        crc: crc32::checksum_string("# Hello\n") as i64
+        dos_time: stamp.dos_time
+        dos_date: stamp.dos_date
+        offset: 0
+    })
+    let z = zip_bytes(entries)
+    // local header 30 + name 32 + body 8, central dir 46 + name 32, eocd 22
+    assert_eq(z.len(), 170)
+    assert_eq(z[0] == 80u8, true)  // P
+    assert_eq(z[1] == 75u8, true)  // K
+    assert_eq(z[2] == 3u8, true)
+    assert_eq(z[3] == 4u8, true)
+    // eocd sits at len-22 and records 1 entry
+    assert_eq(z[148] == 80u8, true)
+    assert_eq(z[149] == 75u8, true)
+    assert_eq(z[150] == 5u8, true)
+    assert_eq(z[151] == 6u8, true)
+    // stored sizes equal the body length (8) in both header and directory
+    // local: crc @14, comp @18, uncomp @22; central dir starts at 70: comp @90, uncomp @94
+    assert_eq(z[18] == 8u8, true)
+    assert_eq(z[22] == 8u8, true)
+    assert_eq(z[90] == 8u8, true)
+    assert_eq(z[94] == 8u8, true)
+    // empty export is still a valid (empty) zip
+    let empty: Vec<ZipEntry> = #[]
+    let z2 = zip_bytes(empty)
+    assert_eq(z2.len(), 22)
+    assert_eq(z2[0] == 80u8, true)
+}
+
+#[test]
+
+fn markdown_headings_and_paragraphs() {
+    let html = render_markdown("# Title\n\nhello *world*\n")
+    assert_eq(html.contains("<h1>Title</h1>"), true)
+    assert_eq(html.contains("<p>hello <em>world</em></p>"), true)
+}
+
+
+#[test]
+
+fn markdown_raw_html_is_escaped() {
+    let html = render_markdown("a <script>alert(1)</script> b\n")
+    assert_eq(html.contains("<script>"), false)
+    assert_eq(html.contains("&lt;script&gt;"), true)
+}
+
+
+#[test]
+
+fn markdown_fenced_code() {
+    let html = render_markdown("```rust\nfn x() {}\n```\n")
+    assert_eq(html.contains("<pre><code class=\"language-rust\">"), true)
+    assert_eq(html.contains("fn x() {}"), true)
+}
+
+
+#[test]
+
+fn markdown_links_noopener_and_js_blocked() {
+    let html = render_markdown("[x](https://e.com) [y](javascript:alert(1))\n")
+    assert_eq(html.contains("rel=\"noopener\""), true)
+    assert_eq(html.contains("href=\"#\""), true)
+}
+
+
+#[test]
+
+fn markdown_list_quote_table_strike() {
+    let html = render_markdown("- a\n- b\n\n> quoted\n\n| h1 | h2 |\n|---|---|\n| 1 | 2 |\n\n~~gone~~\n")
+    assert_eq(html.contains("<ul>"), true)
+    assert_eq(html.contains("<li>a</li>"), true)
+    assert_eq(html.contains("<blockquote>"), true)
+    assert_eq(html.contains("<table>"), true)
+    assert_eq(html.contains("<td>1</td>"), true)
+    assert_eq(html.contains("<del>gone</del>"), true)
+}
+
+
+#[test]
+
+fn slug_validation() {
+    assert_eq(valid_slug("hello-world-2"), true)
+    assert_eq(valid_slug("Hello"), false)
+    assert_eq(valid_slug("-x"), false)
+    assert_eq(valid_slug("a--b"), false)
+    assert_eq(valid_slug(""), false)
+}
+
+
+#[test]
+
+fn password_policy() {
+    assert_eq(valid_password("correct horse1!"), true)
+    assert_eq(valid_password("short1!"), false)
+    assert_eq(valid_password("nodigits!!!"), false)
+    assert_eq(valid_password("no punctuation 12"), false)
+}
+
+
+#[test]
+
+fn login_rate_limit_counts_and_expires() {
+    let mut l = LoginAttempts { fails: #[] }
+    let now = 1_000_000
+    // four stale entries from far in the past must not count
+    for i in 0..4 {
+        l.fails.push(LoginAttempt { ip: "1.1.1.1", username: "alice", at: now - 20 * 60 * 1000 - i })
+    }
+    assert_eq(count_recent_fails(l, "1.1.1.1", "alice", now), 0)
+    // four fresh failures: allowed, then the fifth locks the pair
+    for _ in 0..4 {
+        l.fails.push(LoginAttempt { ip: "1.1.1.1", username: "alice", at: now - 1000 })
+    }
+    assert_eq(count_recent_fails(l, "1.1.1.1", "alice", now), 4)
+    assert_eq(count_recent_fails(l, "1.1.1.1", "alice", now) >= LOGIN_MAX_FAILS, false)
+    l.fails.push(LoginAttempt { ip: "1.1.1.1", username: "alice", at: now })
+    assert_eq(count_recent_fails(l, "1.1.1.1", "alice", now), 5)
+    assert_eq(count_recent_fails(l, "1.1.1.1", "alice", now) >= LOGIN_MAX_FAILS, true)
+    // the lock is per (ip, username) pair: the owner from another host
+    // and other names from the attacker's host are unaffected
+    assert_eq(count_recent_fails(l, "2.2.2.2", "alice", now), 0)
+    assert_eq(count_recent_fails(l, "1.1.1.1", "bob", now), 0)
+    assert_eq(count_recent_fails(l, "2.2.2.2", "bob", now), 0)
+}
+
+
+#[test]
+
+fn password_hash_round_trip() {
+    let h = hash_password("correct horse1!")
+    assert_eq(verify_password(h, "correct horse1!"), true)
+    assert_eq(verify_password(h, "wrong password1!"), false)
+    assert_eq(verify_password("garbage", "x"), false)
+}
+
+
+#[test]
+
+fn body_parsing_reads_each_field() {
+    let f = parse_body("{\"title\":\"my post\",\"source\":\"has \\\"quotes\\\" and \\\\ backslash\",\"tags\":\"a,b\"}")
+    assert_eq(field(f, "title"), "my post")
+    assert_eq(field(f, "source"), "has \"quotes\" and \\ backslash")
+    assert_eq(field(f, "tags"), "a,b")
+    assert_eq(field(f, "missing"), "")
+    let g = parse_body("not json at all")
+    assert_eq(field(g, "title"), "")
+}
+
+
+#[test]
+
+fn sql_literals_are_escaped() {
+    assert_eq(sqlq("it's"), "'it''s'")
+    assert_eq(sqlq("a\\b"), "'a\\\\b'")
+    assert_eq(sqlq("plain"), "'plain'")
+}
+
+
+#[test]
+
+fn hex8_renders_eight_digits() {
+    assert_eq(hex8(0), "00000000")
+    assert_eq(hex8(255), "000000ff")
+    assert_eq(hex8(3735928559), "deadbeef")
+}

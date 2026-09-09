@@ -1,0 +1,8 @@
+[project]
+name = "postwisp"
+id = "net.daniel.postwisp"
+version = "0.1.0"
+output = "target/debug/postwisp"
+gossamer-version = "^v0.58.3"
+
+[dependencies]

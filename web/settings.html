@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blog settings — postwisp</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/theme-boot.js"></script>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="/" id="brand">postwisp</a>
+  <nav class="site-nav">
+    <a href="/posts">Posts</a>
+    <a href="/editor">Write</a>
+    <a href="/admin">Admin</a>
+  </nav>
+</div></header>
+
+<div class="wrap">
+  <h1 class="page-title">Blog settings</h1>
+  <p class="page-sub">
+    These control the name, tagline, description and footer shown on the
+    landing page, the posts list and around every post.
+  </p>
+
+  <div id="gate" hidden class="notice">
+    You need to be logged in to change settings.
+    <a href="/admin">Go to the admin dashboard to log in</a>, then come back here.
+  </div>
+
+  <div id="form" hidden style="max-width:560px">
+    <div class="field">
+      <label for="title">Site title</label>
+      <input id="title" maxlength="100" placeholder="My Blog">
+    </div>
+    <div class="field">
+      <label for="tagline">Tagline</label>
+      <input id="tagline" maxlength="200" placeholder="A few words shown under the title">
+    </div>
+    <div class="field">
+      <label for="description">Description</label>
+      <textarea id="description" rows="3" maxlength="500"
+        placeholder="A longer description of what this blog is about"></textarea>
+    </div>
+    <div class="field">
+      <label for="footer">Footer text</label>
+      <input id="footer" maxlength="300" placeholder="Powered by postwisp">
+    </div>
+    <div class="field">
+      <label for="theme">Site theme</label>
+      <select id="theme">
+        <option value="dark">Dark (default)</option>
+        <option value="light">Light</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="ukey">Unsplash access key (cover photos &amp; image search)</label>
+      <input id="ukey" placeholder="Paste a free key from unsplash.com/oauth/applications">
+      <p class="hint" id="ukey-hint">The key is stored in this browser only, never on the
+        server. Without it, the Unsplash button in the editor asks for one when first used.</p>
+    </div>
+    <div class="actions">
+      <button type="button" class="btn btn-primary" id="save">Save settings</button>
+      <a class="btn" href="/" target="_blank">View landing page</a>
+      <span id="msg" class="flash" hidden></span>
+    </div>
+  </div>
+</div>
+
+<footer class="site-footer"><div class="wrap">Powered by postwisp</div></footer>
+
+<script>
+// theme applied pre-paint by /theme-boot.js (localStorage choice first,
+// site-wide setting as fallback) — no flash of the wrong theme.
+
+const $ = id => document.getElementById(id);
+
+async function jfetch(u, opts) {
+    const r = await fetch(u, Object.assign({
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin'
+    }, opts));
+    let data = null;
+    try { data = await r.json(); } catch (e) { /* no body */ }
+    if (!r.ok) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    return data;
+}
+
+function flash(msg, isErr) {
+    const m = $('msg');
+    m.textContent = msg;
+    m.className = 'flash' + (isErr ? ' err' : '');
+    m.hidden = false;
+    clearTimeout(flash._t);
+    flash._t = setTimeout(() => { m.hidden = true; }, 2600);
+}
+
+$('save').onclick = async () => {
+    try {
+        await jfetch('/api/settings', {
+            method: 'PUT',
+            body: JSON.stringify({
+                title: $('title').value.trim(),
+                tagline: $('tagline').value.trim(),
+                description: $('description').value.trim(),
+                footer: $('footer').value.trim(),
+                theme: $('theme').value
+            })
+        });
+        flash('Saved.');
+        const key = $('ukey').value.trim();
+        if (key) {
+            // stored per-browser; the server-side settings API has no slot for it
+            try { localStorage.setItem('postwisp-unsplash-key', key); } catch (e) { /* private mode */ }
+            $('ukey-hint').textContent = 'Key saved in this browser — the Unsplash picker will use it.';
+        }
+    } catch (e) {
+        flash(e.message, true);
+    }
+};
+
+(function () {
+    $('ukey-hint').dataset.default = $('ukey-hint').textContent;
+    try { $('ukey').value = localStorage.getItem('postwisp-unsplash-key') || ''; } catch (e) { /* ignore */ }
+})();
+
+(async () => {
+    let s;
+    try { s = await jfetch('/api/settings'); }
+    catch (e) { $('gate').hidden = false; return; }
+    $('form').hidden = false;
+    $('title').value = s.title || '';
+    $('tagline').value = s.tagline || '';
+    $('description').value = s.description || '';
+    $('footer').value = s.footer || '';
+    $('theme').value = (s.theme === 'light') ? 'light' : 'dark';
+})();
+</script>
+</body>
+</html>
