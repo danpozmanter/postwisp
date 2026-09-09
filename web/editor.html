@@ -13,7 +13,7 @@
   <nav class="site-nav">
     <a href="/posts">Posts</a>
     <a href="/settings">Settings</a>
-    <a href="/admin">Admin</a>
+    <a href="/dashboard">Dashboard</a>
   </nav>
 </div></header>
 
@@ -22,9 +22,11 @@
   <p class="page-sub">Write in markdown. The preview renders live.</p>
 
   <div id="gate" hidden class="notice">
-    You need to be logged in to write. <a href="/admin">Go to the admin dashboard to log in</a>,
+    You need to be logged in to write. <a href="/dashboard">Go to the dashboard to log in</a>,
     then come back here.
   </div>
+
+  <div id="neterr" hidden class="err"></div>
 
   <div id="editor" hidden>
     <div class="meta-row">
@@ -113,7 +115,13 @@ async function jfetch(u, opts) {
     }, opts));
     let data = null;
     try { data = await r.json(); } catch (e) { /* no body */ }
-    if (!r.ok) throw new Error((data && data.error) || ('HTTP ' + r.status));
+    if (!r.ok) {
+        // status travels on the Error so callers can tell "no session yet"
+        // (401, an expected state) from a real fault
+        const err = new Error((data && data.error) || ('HTTP ' + r.status));
+        err.status = r.status;
+        throw err;
+    }
     return data;
 }
 
@@ -287,7 +295,7 @@ $('delete').onclick = async () => {
     if (!postId || !confirm('Delete this post permanently?')) return;
     try {
         await jfetch('/api/posts/' + postId, { method: 'DELETE' });
-        location.href = '/admin';
+        location.href = '/dashboard';
     } catch (e) { flash(e.message, true); }
 };
 document.querySelectorAll('.toolbar [data-before]').forEach(b => {
@@ -300,7 +308,15 @@ $('linkbtn').onclick = () => {
 
 (async () => {
     try { await jfetch('/api/me'); }
-    catch (e) { $('gate').hidden = false; return; }
+    catch (e) {
+        // 401 is the expected logged-out state: show the log-in notice.
+        // Anything else is a fault and is named as one, never as "you
+        // need to be logged in".
+        if (e.status === 401) { $('gate').hidden = false; return; }
+        $('neterr').hidden = false;
+        $('neterr').textContent = 'Could not reach the postwisp server: ' + e.message;
+        return;
+    }
     $('editor').hidden = false;
 
     const id = new URLSearchParams(location.search).get('id');

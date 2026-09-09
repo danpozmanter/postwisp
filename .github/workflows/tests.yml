@@ -1,0 +1,35 @@
+# Runs the test suite on every commit (and on pull requests).
+#
+# The Gossamer toolchain is installed with the upstream installer, pinned
+# to the release this project is developed against — keep GOSSAMER_VERSION
+# in step with `gossamer-version` in project.toml.
+name: tests
+
+on:
+  push:
+  pull_request:
+
+env:
+  GOSSAMER_VERSION: v0.59.2
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show toolchain
+        run: |
+          gos --version
+          gos env
+
+      - name: Typecheck
+        run: gos check src/main.gos
+
+      - name: Tests
+        run: gos test

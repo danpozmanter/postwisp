@@ -118,7 +118,7 @@ echo "Your blog:"
 echo "  Home:             $BASE_URL/"
 echo "  All posts:        $BASE_URL/posts  (?tag=NAME lists one tag)"
 echo "  About:            $BASE_URL/about"
-echo "  Admin dashboard:  $BASE_URL/admin"
+echo "  Dashboard:        $BASE_URL/dashboard"
 echo
 echo "To stop it:      kill $SERVER_PID"
 echo "To start again later: ./$BIN"

@@ -23,9 +23,15 @@ function api(method, path, body) {
   const opts = {method, headers: {'Content-Type': 'application/json'}, credentials: 'same-origin'};
   if (body !== undefined) opts.body = JSON.stringify(body);
   return fetch(path, opts).then(async r => {
-    const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
-    return data;
+      const data = r.status === 204 ? {} : await r.json().catch(() => ({}));
+      if (!r.ok) {
+        // Carry the HTTP status on the thrown Error so callers can tell
+        // "no session yet" (401, an expected state) from a real fault.
+        const err = new Error(data.error || ('HTTP ' + r.status));
+        err.status = r.status;
+        throw err;
+      }
+      return data;
   });
 }
 function esc(s) {
@@ -56,9 +62,11 @@ let slugTouched = false;   // stop auto-following once the user edits the slug f
 
 // ---- views ----
 // Populated in onReady(): this script runs in <head>, before the DOM exists.
+// The fatal box is outside this map: it is shown by showFatal() directly,
+// never through show(), so it does not need a section of its own.
 const views = {};
 function initViews() {
-  for (const id of ['view-setup', 'view-login', 'view-dashboard', 'view-editor'])
+  for (const id of ['view-setup', 'view-login', 'view-dashboard', 'view-editor', 'view-account'])
     views[id] = document.getElementById(id);
 }
 function show(id) {
@@ -74,7 +82,10 @@ async function boot() {
     me = await api('GET', '/api/me');
   } catch (e) {
     me = null;
-    if (!/HTTP 401/.test(e.message)) netErr = e.message;
+    // 401 is the expected "not logged in yet" answer, not a fault: being
+    // logged out is the normal state of a visitor. Only a non-401 failure
+    // means the server was unreachable or misbehaving.
+    if (e.status !== 401) netErr = e.message;
   }
   if (netErr) showFatal('Could not reach the postwisp server: ' + netErr);
   if (me) { renderBar(); await loadDashboard(); return; }
@@ -94,14 +105,19 @@ async function boot() {
   }
 }
 
+// ---- top bar ----
+// Rendered from scratch whenever `me` changes; its buttons are wired with
+// inline onclick handlers, so a re-render can never leave a stale listener
+// or a null getElementById behind (the bar starts empty, before login).
 function renderBar() {
   document.getElementById('bar-right').innerHTML =
     me ? `<span class="who">Welcome, ${esc(me.username)}</span>
          <button class="ghost" onclick="openEditor(null)">New post</button>
          <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
          <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
-         ${me.role === 'admin' ? '<button class="ghost" id="users-btn" onclick="toggleUsers()">Users</button>' : ''}
-         <button class="ghost" id="media-btn" title="Browse, copy and delete your uploaded files">Media</button>
+         ${me.role === 'admin' ? '<button class="ghost" onclick="toggleUsers()">Users</button>' : ''}
+         <a class="btn ghost" href="/settings" title="Title, tagline, theme and other site settings">Settings</a>
+         <button class="ghost" onclick="showAccount()" title="Change your email or password">Account</button>
          <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
          <button class="ghost" onclick="doLogout()">Log out</button>` : '';
 }
@@ -142,7 +158,7 @@ async function doSetup(ev) {
     });
     me = await api('GET', '/api/me');
     renderBar();
-    history.replaceState(null, '', '/admin');
+    history.replaceState(null, '', '/dashboard');
     await loadDashboard();
   } catch (e) { el.textContent = e.message; }
 }
@@ -168,6 +184,9 @@ async function doLogout() {
 }
 
 // ---- dashboard ----
+// What every logged-in user works with: their own drafts, published posts,
+// media and about page. The Users panel (admin only) is toggled from the
+// top bar.
 let allPosts = [];
 async function loadDashboard() {
   const el = document.getElementById('dash-err');
@@ -177,6 +196,9 @@ async function loadDashboard() {
     renderDashboard();
     show('view-dashboard');
   } catch (e) {
+    // A session that expired mid-visit is not an error to display: back
+    // to the login view, exactly like a fresh visit.
+    if (e.status === 401) { me = null; renderBar(); show('view-login'); return; }
     // Never a blank screen: show the dashboard with the error visible.
     el.textContent = 'Could not load your posts: ' + e.message;
     show('view-dashboard');
@@ -223,10 +245,14 @@ async function delPost(id) {
 }
 
 // ---- media library panel ----
+// A sub-panel of the dashboard: opening it shows the dashboard view, closing
+// it just hides the panel again. Toggling is driven by inline onclick
+// handlers in the rendered media list, so no listener wiring is needed.
 let allMedia = null;
 async function toggleMedia() {
   const panel = document.getElementById('media-panel');
   if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
+  show('view-dashboard');
   panel.classList.remove('hidden');
   const list = document.getElementById('media-list');
   list.innerHTML = '<div class="m" style="color:var(--muted)">Loading…</div>';
@@ -285,9 +311,12 @@ async function delMedia(id) {
 }
 
 // ---- admin users panel ----
+// Only rendered for admins (renderBar); the server enforces the same rule
+// on POST /api/users, so the button is cosmetic, not the gate.
 async function toggleUsers() {
   const panel = document.getElementById('users-panel');
   if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
+  show('view-dashboard');
   panel.classList.remove('hidden');
   const list = document.getElementById('users-list');
   list.innerHTML = '';
@@ -308,6 +337,38 @@ async function createUser(ev) {
     el.textContent = 'Author account created.';
     document.getElementById('users-form').reset();
   } catch (e) { el.className = 'err'; el.textContent = e.message; }
+}
+
+// ---- account (own email / password) ----
+// Any logged-in user manages their own account; admins additionally create
+// other accounts through the Users panel. Username and role are not
+// editable — a rename would break every published /<user>/... URL.
+function showAccount() {
+  document.getElementById('account-username').value = me ? me.username : '';
+  document.getElementById('account-email').value = me ? me.email : '';
+  document.getElementById('account-password').value = '';
+  document.getElementById('account-password2').value = '';
+  document.getElementById('account-err').textContent = '';
+  document.getElementById('account-err').className = 'err';
+  show('view-account');
+}
+async function saveAccount(ev) {
+  ev.preventDefault();
+  const el = document.getElementById('account-err');
+  el.textContent = '';
+  el.className = 'err';
+  const email = document.getElementById('account-email').value.trim();
+  const pw = document.getElementById('account-password').value;
+  const pw2 = document.getElementById('account-password2').value;
+  if (pw !== pw2) { el.textContent = 'The new passwords do not match.'; return; }
+  try {
+    me = await api('PUT', '/api/account', { email, password: pw });
+    renderBar();
+    el.className = 'ok';
+    el.textContent = 'Saved.';
+    document.getElementById('account-password').value = '';
+    document.getElementById('account-password2').value = '';
+  } catch (e) { el.textContent = e.message; }
 }
 
 // ---- editor ----
@@ -453,6 +514,9 @@ function pickUnsplashImage() {
 
 // ---- wire up ----
 // This script lives in <head>, so nothing may touch the DOM until it is ready.
+// Every element wired below exists in the static markup; the dynamically
+// rendered bar buttons use inline onclick handlers instead (see renderBar),
+// because their elements only exist after login.
 function onReady(fn) {
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fn);
   else fn();
@@ -463,6 +527,7 @@ onReady(function () {
     document.getElementById('setup-form').addEventListener('submit', doSetup);
     document.getElementById('login-form').addEventListener('submit', doLogin);
     document.getElementById('users-form').addEventListener('submit', createUser);
+    document.getElementById('account-form').addEventListener('submit', saveAccount);
     document.getElementById('search').addEventListener('input', renderDashboard);
     document.getElementById('editor-title').addEventListener('input', onTitleInput);
     document.getElementById('editor-slug').addEventListener('input', onSlugInput);
@@ -470,8 +535,9 @@ onReady(function () {
       const f = ev.dataTransfer.files[0];
       if (f && /^(image|video|audio)\//.test(f.type)) { ev.preventDefault(); uploadImage(f); }
     });
-    document.getElementById('media-panel').classList.add('hidden');
-    document.getElementById('media-btn').addEventListener('click', toggleMedia);
+    // note: the Media and Users buttons live in the top bar, which
+    // renderBar() fills in after login — they use inline onclick handlers,
+    // so they are not wired here.
     boot();
   } catch (e) {
     showFatal(e && e.message ? e.message : String(e));
@@ -500,9 +566,9 @@ window.addEventListener('unhandledrejection', function (ev) {
   showFatal(ev && ev.reason && ev.reason.message ? ev.reason.message : 'Unhandled promise rejection');
 });
 </script>
-<noscript><div class="fatal">postwisp's admin needs JavaScript enabled.</div></noscript>
+<noscript><div class="fatal">postwisp's dashboard needs JavaScript enabled.</div></noscript>
 <header class="appbar hidden" id="bar">
-  <div><a href="/admin" style="text-decoration:none;font-weight:700">postwisp</a></div>
+  <div><a href="/dashboard" style="text-decoration:none;font-weight:700">postwisp</a></div>
   <div class="row" id="bar-right"></div>
 </header>
 <main>
@@ -542,11 +608,15 @@ window.addEventListener('unhandledrejection', function (ev) {
 </section>
 
 <section id="view-dashboard" class="hidden">
+  <h1 style="margin-top:1rem">Your posts</h1>
   <div class="err" id="dash-err"></div>
   <input type="text" id="search" placeholder="Search your posts…">
   <div id="dash-lists"></div>
   <div id="users-panel" class="hidden">
     <h2>Users</h2>
+    <p class="m" style="color:var(--muted)">Admin only: add another author to this
+      postwisp. They log in with their own password and can write and manage
+      their own posts, about page, media and settings.</p>
     <form id="users-form" style="max-width:none;margin:0">
       <div class="row">
         <div><label>Username</label><input type="text" id="new-username" required maxlength="32"></div>
@@ -563,6 +633,24 @@ window.addEventListener('unhandledrejection', function (ev) {
     <p class="m" style="color:var(--muted)">Your uploaded photos, videos and audio. Copy a link to embed it in a post; delete removes it for good (blocked while a post still uses it).</p>
     <div id="media-list"></div>
   </div>
+</section>
+
+<section id="view-account" class="hidden">
+  <h1 style="margin-top:1rem">Your account</h1>
+  <p class="m" style="color:var(--muted)">Change the email you log in with, or set a
+    new password. Your username stays as it is.</p>
+  <form id="account-form" class="auth" style="margin-top:1rem">
+    <label>Username (fixed)</label>
+    <input type="text" id="account-username" disabled>
+    <label>Email</label>
+    <input type="email" id="account-email">
+    <label>New password (leave empty to keep the current one)</label>
+    <input type="password" id="account-password" autocomplete="new-password">
+    <label>Repeat new password</label>
+    <input type="password" id="account-password2" autocomplete="new-password">
+    <div id="account-err" class="err"></div>
+    <button type="submit">Save account</button>
+  </form>
 </section>
 
 <section id="view-editor" class="hidden">

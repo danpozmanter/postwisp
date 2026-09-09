@@ -486,15 +486,49 @@ fn find_sub(hay: String, needle: String, from: i64) -> i64 {
     -1
 }
 
-// `String::slice` returns a Result; every call site here passes byte
-// offsets it has already verified, so a failed slice degrades to the
-// empty string instead of aborting the request.
+// Byte-exact slicing, built on the byte view rather than `String::slice`:
+// slice's Result rejects ranges this code legitimately produces — a range
+// ending at the string's final byte when that char is multi-byte (every
+// accent or emoji at the end of a field), which silently dropped text.
+// The walk below clamps like `substring` and answers "" for an empty
+// range or one that splits a UTF-8 sequence.
 
 fn sub(s: String, a: i64, b: i64) -> String {
-    match s.slice(a, b) {
-        Ok(v) => return v
-        Err(_) => return ""
+    let bb = s.bytes()
+    let n = bb.len()
+    if a < 0 || a >= b { return "" }
+    let mut end = b
+    if end > n { end = n }
+    let mut out: Vec<u8> = #[]
+    let mut i = a
+    while i < end {
+        out.push(bb[i])
+        i += 1
     }
+    match String::from_utf8(out) {
+        Ok(v) => v
+        Err(_) => ""
+    }
+}
+
+
+// Appends the UTF-8 sequence starting at byte offset `i` of `s` to `out`
+// and answers the offset just past it. Byte-walking loops must use this
+// (not `s[i]`, which is a CHAR index): indexing a string by a byte offset
+// that exceeds its char count panics, so any non-ASCII input would take
+// the handler down.
+
+fn append_byte_at(out: &mut String, s: String, b: Vec<u8>, i: i64) -> i64 {
+    let n = b.len()
+    if i >= n { return i }
+    if b[i] < 0x80 {
+        out.push(b[i] as char)
+        return i + 1
+    }
+    let mut j = i + 1
+    while j < n && (b[j] & 0xC0) == 0x80 { j += 1 }
+    *out += sub(s, i, j)
+    j
 }
 
 
@@ -507,6 +541,11 @@ fn json_quote(s: String) -> String {
         else if c == '\n' { out += "\\n" }
         else if c == '\t' { out += "\\t" }
         else if c == '\r' { out += "\\r" }
+        else if c < ' ' {
+            // a raw control byte is not valid inside a JSON string; emit
+            // its \u00xx escape so every response stays parseable
+            out += format("\\u{:04x}", c as i64)
+        }
         else { out.push(c) }
     }
     out.push('"')
@@ -540,8 +579,7 @@ fn unescape_json(body: String, vs: i64, ve: i64) -> String {
             i += 2
             continue
         }
-        out.push(body[i])
-        i += 1
+        i = append_byte_at(&mut out, body, b, i)
     }
     out
 }
@@ -909,8 +947,7 @@ fn render_inline(escaped: String) -> String {
                 None => { out += "~~"; i += 2; continue }
             }
         }
-        out.push(src[i])
-        i += 1
+        i = append_byte_at(&mut out, src, b, i)
     }
     out
 }
@@ -1065,8 +1102,10 @@ fn render_markdown(src: String) -> String {
         if trimmed.starts_with("#") {
             let mut level = 0
             while level < trimmed.len() && trimmed[level] == '#' { level += 1 }
-            if level <= 6 && trimmed[level] == ' ' {
-                let text = sub(trimmed, level + 1, trimmed.len()).trim()
+            // level == trimmed.len() (a bare "##" line) must not index past
+            // the end: it is a paragraph, not a heading
+            if level <= 6 && level < trimmed.len() && trimmed[level] == ' ' {
+                let text = sub(trimmed, level + 1, trimmed.byte_len()).trim()
                 out += "<h" + level.to_string() + ">" + render_inline(escape_html(text))
                 out += "</h" + level.to_string() + ">\n"
                 i += 1
@@ -1078,7 +1117,7 @@ fn render_markdown(src: String) -> String {
             let mut inner = String::new()
             while i < n && lines[i].trim().starts_with(">") {
                 let l = lines[i].trim()
-                inner += sub(l, 1, l.len()).trim() + "\n"
+                inner += sub(l, 1, l.byte_len()).trim() + "\n"
                 i += 1
             }
             out += "<blockquote>\n" + render_markdown(inner) + "</blockquote>\n"
@@ -1090,7 +1129,7 @@ fn render_markdown(src: String) -> String {
             while i < n {
                 let t = lines[i].trim()
                 if !(t.starts_with("- ") || t.starts_with("* ")) { break }
-                out += "<li>" + render_inline(escape_html(sub(t, 2, t.len()))) + "</li>\n"
+                out += "<li>" + render_inline(escape_html(sub(t, 2, t.byte_len()))) + "</li>\n"
                 i += 1
             }
             out += "</ul>\n"
@@ -1135,14 +1174,19 @@ fn render_markdown(src: String) -> String {
             continue
         }
         // paragraph
+        // The first line is always consumed: every block form was already
+        // rejected above (e.g. "#foo" fails the heading check for lack of
+        // a space), so breaking on it without consuming would spin the
+        // outer loop forever on the same line.
         let mut para = String::new()
+        let mut started = false
         while i < n {
             let t = lines[i].trim()
             if t.len() == 0 { break }
-            if t.starts_with("#") || t.starts_with(">") || t.starts_with("- ")
+            if started && (t.starts_with("#") || t.starts_with(">") || t.starts_with("- ")
             || t.starts_with("* ") || t.starts_with("```")
-            || is_ordered_item(t) || t == "---" || t == "***" { break }
-            if para.len() > 0 {
+            || is_ordered_item(t) || t == "---" || t == "***") { break }
+            if started {
                 if t.ends_with("\\") {
                     para = sub(para, 0, para.len() - 1) + "<br>" + t
                 } else if lines[i - 1].ends_with("\\") {
@@ -1152,6 +1196,7 @@ fn render_markdown(src: String) -> String {
                 }
             } else {
                 para = t
+                started = true
             }
             i += 1
         }
@@ -1173,7 +1218,7 @@ fn after_list_marker(line: String) -> String {
     let b = line.bytes()
     let mut i = 0
     while i < b.len() && b[i] >= '0' as u8 && b[i] <= '9' as u8 { i += 1 }
-    sub(line, i + 2, line.len())
+    sub(line, i + 2, line.byte_len())
 }
 
 
@@ -1203,10 +1248,10 @@ fn split_row(line: String) -> Vec<String> {
         if b[i] == '|' as u8 {
             cells.push(cur)
             cur = String::new()
+            i += 1
         } else {
-            cur.push(line[i])
+            i = append_byte_at(&mut cur, line, b, i)
         }
-        i += 1
     }
     if cur.len() > 0 { cells.push(cur) }
     cells
@@ -1245,10 +1290,10 @@ fn split_byte(s: String, sep: u8) -> Vec<String> {
         if b[i] == sep {
             parts.push(cur)
             cur = String::new()
+            i += 1
         } else {
-            cur.push(s[i])
+            i = append_byte_at(&mut cur, s, b, i)
         }
-        i += 1
     }
     parts.push(cur)
     parts
@@ -1296,18 +1341,33 @@ fn handle_setup(app: App, req: http::Request) -> http::Response {
     let hash = hash_password(password)
     let id = insert_user_row(&mut eng, username, email, hash, "admin")
     if id <= 0 { return err_json(500, "storage error") }
+    // log the new admin straight in: the dashboard's setup flow calls
+    // /api/me immediately after this, and answering it 401 would show the
+    // new admin "not logged in" as an error on the very screen that just
+    // created their account
+    let now = now_ms()
+    let sess_token = new_token("s:" + now.to_string() + ":" + username)
+    let s = Session { token: sess_token, user_id: id, created_at: now, expires_at: now + 30 * 24 * 3600 * 1000 }
+    store.sessions.push(s)
+    exec_sql(&mut eng, "INSERT INTO sessions VALUES (" + sqlq(sess_token) + ", " + id.to_string()
+        + ", " + now.to_string() + ", " + s.expires_at.to_string() + ")")
     let u = User {
         id: id
         username: username
         email: email
         password: hash
         role: "admin"
-        created_at: now_ms()
+        created_at: now
     }
     if id + 1 > store.next_user_id { store.next_user_id = id + 1 }
     store.users.push(u)
     store.setup_token = ""
-    ok_json("{\"ok\":true}")
+    // The cookie must carry the session token, not the one-time setup
+    // token: the setup token authorizes exactly this call and is not a
+    // session, so sending it would leave the fresh admin logged out with
+    // a cookie that /api/me rightly rejects.
+    ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + sess_token
+        + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
 }
 
 
@@ -1413,6 +1473,48 @@ fn handle_create_user(app: App, req: http::Request) -> http::Response {
             if id + 1 > store.next_user_id { store.next_user_id = id + 1 }
             store.users.push(u)
             return ok_json(user_json(u))
+        }
+    }
+}
+
+
+// Any logged-in user maintains their own account: email and password here,
+// posts/about/media through the other endpoints. Username and role stay
+// fixed — a rename would break every published /<user>/... URL, and
+// granting roles is the admin's job (user creation above).
+
+fn handle_update_account(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let f = parse_body(req.body)
+            let mut email = field(f, "email")
+            if email.len() == 0 { email = me.email }
+            if email.len() > 254 { return err_json(400, "email too long (max 254)") }
+            let new_pw = field(f, "password")
+            let mut new_hash = ""
+            if new_pw.len() > 0 {
+                if !valid_password(new_pw) {
+                    return err_json(400, "password must be at least 10 chars with a digit and a non-alphanumeric")
+                }
+                new_hash = hash_password(new_pw)
+            }
+            let mut eng = open_eng(app)
+            if new_hash.len() > 0 {
+                exec_sql(&mut eng, "UPDATE users SET email = " + sqlq(email) + ", password = " + sqlq(new_hash)
+                    + " WHERE rowid = " + me.id.to_string())
+            } else {
+                exec_sql(&mut eng, "UPDATE users SET email = " + sqlq(email)
+                    + " WHERE rowid = " + me.id.to_string())
+            }
+            return ok_json(user_json(User {
+                id: me.id
+                username: me.username
+                email: email
+                password: new_hash
+                role: me.role
+                created_at: me.created_at
+            }))
         }
     }
 }
@@ -2007,7 +2109,7 @@ fn i18n_catalog() -> Vec<Vec<String>> {
         #["tag_sub", "Every published post with the tag \"{tag}\".", "Alle veröffentlichten Beiträge mit dem Tag \"{tag}\".", "Tous les articles publiés avec l'étiquette « {tag} ».", "Todas las publicaciones con la etiqueta \"{tag}\"."],
         #["about_title", "About", "Über", "À propos", "Acerca de"],
         #["about_default_1", "This site runs on postwisp, a small self-hosted blog.", "Diese Seite läuft auf postwisp, einem kleinen selbst gehosteten Blog.", "Ce site fonctionne avec postwisp, un petit blog auto-hébergé.", "Este sitio funciona con postwisp, un pequeño blog autoalojado."],
-        #["about_default_2", "Replace this text with whatever you want people to know about you or this site: log in to the admin dashboard and write your own About page.", "Ersetze diesen Text durch alles, was Besucher über dich oder diese Seite wissen sollen: melde dich im Admin-Dashboard an und schreibe deine eigene About-Seite.", "Remplacez ce texte par ce que vous voulez que les visiteurs sachent sur vous ou ce site : connectez-vous au tableau de bord d'administration et rédigez votre propre page « À propos ».", "Sustituye este texto por lo que quieras que los visitantes sepan de ti o de este sitio: inicia sesión en el panel de administración y escribe tu propia página «Acerca de»."],
+        #["about_default_2", "Replace this text with whatever you want people to know about you or this site: log in to the dashboard and write your own About page.", "Ersetze diesen Text durch alles, was Besucher über dich oder diese Seite wissen sollen: melde dich im Dashboard an und schreibe deine eigene About-Seite.", "Remplacez ce texte par ce que vous voulez que les visiteurs sachent sur vous ou ce site : connectez-vous au tableau de bord et rédigez votre propre page « À propos ».", "Sustituye este texto por lo que quieras que los visitantes sepan de ti o de este sitio: inicia sesión en el panel y escribe tu propia página «Acerca de»."],
         #["err_not_found", "That page does not exist.", "Diese Seite existiert nicht.", "Cette page n'existe pas.", "Esa página no existe."],
         #["back_home", "Back to the blog", "Zurück zum Blog", "Retour au blog", "Volver al blog"],
     ]
@@ -2260,7 +2362,7 @@ fn page_shell(title: String, body_html: String, feed_link: String) -> String {
     + "</head><body>"
     + "<header class=\"site-header\"><div class=\"wrap\">"
     + "<a class=\"brand\" href=\"/\">postwisp</a>"
-    + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/admin\">Admin</a></nav>"
+    + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/dashboard\">Dashboard</a></nav>"
     + "</div></header>"
     + "<main>" + body_html + "</main>"
     + "<footer class=\"site-footer\"><div class=\"wrap\"><a href=\"https://github.com/danpozmanter/postwisp\" target=\"_blank\" rel=\"noopener\">Powered by postwisp</a></div></footer>"
@@ -2759,27 +2861,53 @@ fn excerpt_of(source: String) -> String {
     let n = b.len()
     let mut i: i64 = 0
     while i < n {
-        let c = source[i]
-        if c == '!' && i + 1 < n && b[i + 1] == '[' as u8 {
+        // image references (the header/embed convention) are skipped whole
+        if b[i] == '!' as u8 && i + 1 < n && b[i + 1] == '[' as u8 {
             let end = find_sub(source, ")", i)
             if end > i {
                 i = end + 1
                 continue
             }
         }
-        let keep = c != '#' && c != '*' && c != '`' && c != '>' && c != '|' && c != '_' && c != '[' && c != ']'
+        let c = b[i]
+        let keep = c != '#' as u8 && c != '*' as u8 && c != '`' as u8 && c != '>' as u8
+            && c != '|' as u8 && c != '_' as u8 && c != '[' as u8 && c != ']' as u8
         if keep {
-            if c == '\n' || c == '\r' || c == ' ' {
+            if c == '\n' as u8 || c == '\r' as u8 || c == ' ' as u8 {
                 // whitespace collapses: no double spaces from dropped markup
                 if out.len() > 0 && out[out.len() - 1] != ' ' { out.push(' ') }
+                i += 1
+            } else {
+                // multi-byte text: append the whole UTF-8 sequence — s[i]
+                // is a CHAR read at a byte offset and panics past the
+                // char count, so any accented title would kill the handler
+                i = append_byte_at(&mut out, source, b, i)
             }
-            else { out.push(c) }
+        } else {
+            i += 1
         }
-        i += 1
     }
     let t = out.trim()
-    if t.len() > 200 { return sub(t, 0, 200) + "..." }
-    return t
+    if t.len() <= 200 { return t }
+    // Truncate at the 200-CHAR boundary so a multi-byte sequence is never
+    // cut in half (a cut sequence fails the slice, and the excerpt would
+    // collapse to "...").
+    let tb = t.bytes()
+    let mut j: i64 = 0
+    let mut cnt: i64 = 0
+    let mut cut = tb.len()
+    while j < tb.len() {
+        if cnt == 200 { cut = j; break }
+        if tb[j] < 0x80 {
+            j += 1
+        } else {
+            let mut k = j + 1
+            while k < tb.len() && (tb[k] & 0xC0) == 0x80 { k += 1 }
+            j = k
+        }
+        cnt += 1
+    }
+    sub(t, 0, cut) + "..."
 }
 
 
@@ -2853,7 +2981,8 @@ fn handle_theme_css(app: App, req: http::Request) -> http::Response {
 }
 
 // The dashboard, login and setup screens are one static page the binary serves
-// itself; no frontend build step, nothing to deploy beside the binary.
+// itself at /dashboard (the pre-rename /admin path redirects there); no
+// frontend build step, nothing to deploy beside the binary.
 
 fn handle_admin(app: App, req: http::Request) -> http::Response {
     match fs::read_to_string(app.web_dir + "/admin.html") {
@@ -2891,8 +3020,8 @@ fn push_u16le(buf: &mut Vec<u8>, n: i64) {
 fn push_u32le(buf: &mut Vec<u8>, n: i64) {
     buf.push((n & 0xFF) as u8)
     buf.push(((n / 256) & 0xFF) as u8)
-    buf.push(((n / 65536) & 0xFF) as u8)
-    buf.push(((n / 16777216) & 0xFF) as u8)
+    buf.push(((n / 65_536) & 0xFF) as u8)
+    buf.push(((n / 16_777_216) & 0xFF) as u8)
 }
 
 fn push_string_bytes(buf: &mut Vec<u8>, s: String) {
@@ -2938,9 +3067,11 @@ fn zip_bytes(entries: Vec<ZipEntry>) -> Vec<u8> {
         push_u16le(&mut out, e.dos_time)
         push_u16le(&mut out, e.dos_date)
         push_u32le(&mut out, e.crc)
-        push_u32le(&mut out, e.body.len())
-        push_u32le(&mut out, e.body.len())
-        push_u16le(&mut out, e.name.len())
+        // sizes are BYTE counts: len() counts chars, so a non-ASCII name or
+        // body would understate them and the archive would be corrupt
+        push_u32le(&mut out, e.body.byte_len())
+        push_u32le(&mut out, e.body.byte_len())
+        push_u16le(&mut out, e.name.byte_len())
         push_u16le(&mut out, 0) // extra len
         push_string_bytes(&mut out, e.name)
         push_string_bytes(&mut out, e.body)
@@ -2956,9 +3087,9 @@ fn zip_bytes(entries: Vec<ZipEntry>) -> Vec<u8> {
         push_u16le(&mut out, e.dos_time)
         push_u16le(&mut out, e.dos_date)
         push_u32le(&mut out, e.crc)
-        push_u32le(&mut out, e.body.len())
-        push_u32le(&mut out, e.body.len())
-        push_u16le(&mut out, e.name.len())
+        push_u32le(&mut out, e.body.byte_len())
+        push_u32le(&mut out, e.body.byte_len())
+        push_u16le(&mut out, e.name.byte_len())
         push_u16le(&mut out, 0) // extra len
         push_u16le(&mut out, 0) // comment len
         push_u16le(&mut out, 0) // disk start
@@ -3025,6 +3156,7 @@ fn router(app: App) -> router::Router {
         .post("/api/logout", fn(req: http::Request) -> http::Response { return handle_logout(app, req) })
         .get("/api/me", fn(req: http::Request) -> http::Response { return handle_me(app, req) })
         .post("/api/users", fn(req: http::Request) -> http::Response { return handle_create_user(app, req) })
+        .put("/api/account", fn(req: http::Request) -> http::Response { return handle_update_account(app, req) })
         .get("/api/posts", fn(req: http::Request) -> http::Response { return handle_list_posts(app, req) })
         .post("/api/posts", fn(req: http::Request) -> http::Response { return handle_create_post(app, req) })
         .get("/api/posts.zip", fn(req: http::Request) -> http::Response { return handle_posts_zip(app, req) })
@@ -3044,7 +3176,10 @@ fn router(app: App) -> router::Router {
         .get("/about", fn(req: http::Request) -> http::Response { return handle_about(app, req) })
         .get("/editor", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "editor.html") })
         .get("/settings", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "settings.html") })
-        .get("/admin", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "admin.html") })
+        // the dashboard page lives at /dashboard; /admin stays as a
+        // redirect so bookmarks and old links keep working
+        .get("/dashboard", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
+        .get("/admin", fn(req: http::Request) -> http::Response { return http::Response::text(302, "").with_header("Location", "/dashboard") })
         .get("/api/public/site", fn(req: http::Request) -> http::Response { return handle_public_site(app, req) })
         .get("/api/public/posts", fn(req: http::Request) -> http::Response { return handle_public_posts(app, req) })
         .get("/api/settings", fn(req: http::Request) -> http::Response { return handle_get_settings(app, req) })
@@ -3474,8 +3609,220 @@ fn sql_literals_are_escaped() {
 
 #[test]
 
+fn user_json_lists_account_fields() {
+    let u = User {
+        id: 7
+        username: "daniel"
+        email: "d@example.net"
+        password: "salt$digest"
+        role: "author"
+        created_at: 5
+    }
+    let want = "{\"id\":7,\"username\":\"daniel\""
+        + ",\"email\":\"d@example.net\",\"role\":\"author\"}"
+    assert_eq(user_json(u), want)
+}
+
+
+#[test]
+
 fn hex8_renders_eight_digits() {
     assert_eq(hex8(0), "00000000")
     assert_eq(hex8(255), "000000ff")
-    assert_eq(hex8(3735928559), "deadbeef")
+    assert_eq(hex8(3_735_928_559), "deadbeef")
 }
+
+// ---------- regression tests for the adversarial pass ----------
+//
+// Each test below pins a bug found in review: byte-walking loops that
+// indexed the string by CHAR (panicking past the char count on any
+// non-ASCII input), the bare-## heading panic, the #foo infinite loop,
+// and zip entry sizes recorded as char counts.
+
+#[test]
+
+fn markdown_survives_non_ascii_text() {
+    // accented letters, currency, emoji: render, don't panic, don't drop
+    let h = render_markdown("# Café ünïcödé\n\nEin Kaffee kostet 3€ — ça va 😊\n")
+    assert_eq(h.contains("<h1>Café ünïcödé</h1>"), true)
+    assert_eq(h.contains("3€"), true)
+    assert_eq(h.contains("ça va 😊"), true)
+    // a table with non-ascii cells (split_row walked bytes, read chars)
+    let t = render_markdown("| Wort | Preis |\n|---|---|\n| Kaffee | 3€ |\n| Crème | 4€ |\n")
+    assert_eq(t.contains("<td>Kaffee</td>"), true)
+    assert_eq(t.contains("<td>3€</td>"), true)
+    assert_eq(t.contains("<td>Crème</td>"), true)
+    // inline markup around multi-byte sequences
+    let i = render_markdown("*wichtig*: naïve **ça**\n")
+    assert_eq(i.contains("<em>wichtig</em>"), true)
+    assert_eq(i.contains("<strong>ça</strong>"), true)
+    // a JSON-escaped body with non-ascii survives the round trip
+    let f = parse_body("{\"source\":\"naïve café ☕ text\"}")
+    assert_eq(field(f, "source"), "naïve café ☕ text")
+}
+
+#[test]
+
+fn markdown_bare_hashes_are_paragraphs_not_panics() {
+    // a line of only hashes has no char at trimmed[level]: it used to
+    // panic the handler; it is a paragraph
+    let h = render_markdown("##\n")
+    assert_eq(h.contains("<p>##</p>"), true)
+    let h2 = render_markdown("#\n")
+    assert_eq(h2.contains("<p>#</p>"), true)
+    // seven hashes exceeds the deepest heading level: paragraph too
+    let h3 = render_markdown("####### spaced but too deep\n")
+    assert_eq(h3.contains("<h7>"), false)
+    assert_eq(h3.contains("<p>"), true)
+}
+
+#[test]
+
+fn markdown_hash_without_space_terminates() {
+    // "#foo" is not a heading (no space) and used to wedge the paragraph
+    // walker in an infinite loop: this test completing at all is the fix
+    let h = render_markdown("#foo\n\nsecond paragraph\n")
+    assert_eq(h.contains("<p>#foo</p>"), true)
+    assert_eq(h.contains("<p>second paragraph</p>"), true)
+    // the same shape mid-document, after a real heading
+    let h2 = render_markdown("# Title\n\n#bar\n\ntail\n")
+    assert_eq(h2.contains("<h1>Title</h1>"), true)
+    assert_eq(h2.contains("<p>#bar</p>"), true)
+    assert_eq(h2.contains("<p>tail</p>"), true)
+}
+
+#[test]
+
+fn excerpt_and_cover_handle_non_ascii() {
+    // excerpt_of walked bytes but read s[i] (chars): panic on é
+    let e = excerpt_of("Ein Café in Zürich ☕")
+    assert_eq(e, "Ein Café in Zürich ☕")
+    // the 200-CHAR cut never slices a multi-byte sequence in half
+    let mut s = String::new()
+    let mut k: i64 = 0
+    while k < 250 { s += "é"; k += 1 } // 250 chars, 500 bytes: past the cut
+    let t = excerpt_of(s)
+    assert_eq(t.len() > 0, true)
+    assert_eq(sub(t, t.byte_len() - 3, t.byte_len()), "...")
+    // the last complete char before the ellipsis is é, not a broken byte
+    let before = sub(t, 0, t.byte_len() - 3)
+    assert_eq(before.byte_len() % 2, 0, "cut must land on a char boundary")
+    assert_eq(before.contains("\u{FFFD}"), false)
+    // a cover with non-ascii alt text
+    assert_eq(cover_url_of("![Café](/a.png)"), "/a.png")
+}
+
+#[test]
+
+fn cookie_splitting_tolerates_non_ascii_values() {
+    // split_byte walked bytes but pushed s[i] (chars): a hostile or
+    // international Cookie header panicked cookie_of/current_user
+    let parts = split_byte("a=1; postwisp_session=tökën; b=2", ';' as u8)
+    assert_eq(parts.len(), 3)
+    assert_eq(parts[1].trim(), "postwisp_session=tökën")
+    let parts2 = split_byte("naïve; café", ';' as u8)
+    assert_eq(parts2.len(), 2)
+    assert_eq(parts2[0], "naïve")
+}
+
+#[test]
+
+fn zip_sizes_are_byte_counts_even_for_non_ascii() {
+    let stamp = post_stamp(codec::datetime::parse("2025-01-15T10:30:45Z").unwrap_or(0))
+    // "Café" is 5 bytes / 4 chars; the old writer recorded the char
+    // count, understating sizes and corrupting the archive
+    let body = "# Café ☕\n" // 11 bytes, 9 chars
+    let mut entries: Vec<ZipEntry> = #[]
+    entries.push(ZipEntry {
+        name: zip_name_for("Café", stamp)
+        body: body
+        crc: crc32::checksum_string(body) as i64
+        dos_time: stamp.dos_time
+        dos_date: stamp.dos_date
+        offset: 0
+    })
+    let z = zip_bytes(entries)
+    // local header: comp size at offset 18, uncomp at 22 — both BYTES
+    assert_eq(z[18] == body.byte_len() as u8, true, "compressed size must be the byte count")
+    assert_eq(z[22] == body.byte_len() as u8, true, "uncompressed size must be the byte count")
+    // name length is the byte count: "Café-2025-01-15-103045.md" = 27 bytes
+    let nl = z[26] as i64 + (z[27] as i64) * 256
+    assert_eq(nl, zip_name_for("Café", stamp).byte_len())
+    // the central directory agrees
+    let cd = 30 + nl + body.byte_len()
+    assert_eq(z[cd + 20] == body.byte_len() as u8, true)
+    // and the archive really is readable: the body's BYTES follow the name
+    let body_at = 30 + nl
+    let bb = body.bytes()
+    let mut k: i64 = 0
+    while k < bb.len() {
+        assert_eq(z[body_at + k], bb[k], "zip body byte " + k.to_string() + " must match the source")
+        k += 1
+    }
+}
+
+#[test]
+
+fn setup_login_persists_a_working_session() {
+    // Regression: handle_setup used to write the one-time setup token
+    // into the session cookie instead of the session it had just created,
+    // so the fresh admin's /api/me answered 401 and the dashboard greeted
+    // them with "not logged in" as an error on the screen that had just
+    // created their account.
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    let app = new_app()
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    let token = store.setup_token
+    assert_eq(token.len() > 0, true, "first boot must mint a setup token")
+
+    let body = "{\"token\":\"" + token + "\",\"username\":\"admin\","
+        + "\"email\":\"a@b.c\",\"password\":\"sup3rsecret1!\"}"
+    let req = http::Request {
+        method: "POST"
+        path: "/api/setup"
+        query: ""
+        query_pairs: #[]
+        headers: #[]
+        body: body
+        raw_body: #[]
+        peer_addr: "127.0.0.1:1"
+    }
+    let resp = handle_setup(app, req)
+    assert_eq(resp.status, 200, "setup must succeed")
+
+    // pull the session cookie out of the response
+    let mut cookie = ""
+    for (n, v) in resp.headers {
+        if n.to_lowercase() == "set-cookie" { cookie = v }
+    }
+    assert_eq(cookie.starts_with("postwisp_session="), true,
+        "setup must set a session cookie, got: " + cookie)
+    let rest = sub(cookie, "postwisp_session=".len(), cookie.len())
+    let cut = find_sub(rest, ";", 0)
+    let sess = if cut >= 0 { sub(rest, 0, cut) } else { rest }
+    assert_eq(sess == token, false,
+        "the cookie carried the one-time setup token, not a session")
+
+    // the cookie must be a real session: /api/me with it answers 200,
+    // never the 401 that used to read as "you are not logged in"
+    let me_req = http::Request {
+        method: "GET"
+        path: "/api/me"
+        query: ""
+        query_pairs: #[]
+        headers: #[("Cookie", "postwisp_session=" + sess)]
+        body: ""
+        raw_body: #[]
+        peer_addr: "127.0.0.1:1"
+    }
+    let me = handle_me(app, me_req)
+    assert_eq(me.status, 200,
+        "the session cookie set by setup must authenticate /api/me, got "
+        + me.status.to_string())
+}
+
+// ---------- end of tests ----------
+

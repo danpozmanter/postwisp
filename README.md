@@ -53,7 +53,7 @@ with terndb as the embedded storage engine.
 
 The about page is not a file you edit per se — it is a **singleton post**
 each author maintains, with the reserved slug `about`. Log in to
-`/admin`, press **About page**, and write it like any post (markdown,
+`/dashboard`, press **About page**, and write it like any post (markdown,
 live preview). It is then served at `/about` (the first user's — the
 admin's) and at `/<user>/about` for every author. About pages never
 appear in the post lists or feeds; `templates/about.html` only frames
@@ -62,11 +62,13 @@ them. Until someone writes one, a placeholder fills the frame.
 That's the whole deployment: one directory, one process (server + admin
 dashboard + JSON API + public pages), behind any reverse proxy for TLS.
 
-## Admin
+## Dashboard
 
-The admin dashboard is served by the binary itself at `/admin` (a built-in
-page, not one of the templates). Authors log in there to write posts in
-markdown, upload files, and manage drafts. The admin creates further
+The dashboard is served by the binary itself at `/dashboard` (a built-in
+page, not one of the templates; the old `/admin` link redirects there).
+Authors log in there to write posts in markdown, upload files, and manage
+drafts; every logged-in user can also edit their own email and password
+from the **Account** button. The admin creates further
 author accounts; there is no open registration by design. Failed logins
 are rate-limited (5 failures per username per 10 minutes).
 
@@ -113,7 +115,7 @@ video and iOS Safari play it at all.
 
 ## Cover photos & images (Unsplash)
 
-Both editors (the write page at `/editor` and the one inside `/admin`)
+Both editors (the write page at `/editor` and the one inside `/dashboard`)
 have an **Unsplash** button: a search modal in the Hashnode style — type a
 query, pick a photo, and it becomes the post's cover (or lands at the
 cursor in the body). The picked photo is written as the post's first
@@ -186,7 +188,7 @@ dates and the browser renders card dates in the same locale shape
 (en "March 5, 2024", de "5. März 2024"), so the two agree on a page.
 
 Your own content (post titles, tags, the about text, the tagline,
-footer, and everything on the admin dashboard) is yours and is never
+footer, and everything on the dashboard) is yours and is never
 translated or overridden. Adding a language is one row per message in
 the `i18n_catalog` in `src/main.gos` plus its month names; the test
 suite fails if a row or translation is missing or is an English copy.
