@@ -40,8 +40,14 @@ pw.esc = function (s) {
 
 pw.fmtDate = function (ms) {
     if (!ms) return '';
+    // The document's lang (set server-side from the visitor's language)
+    // picks the locale, so card dates and the server-rendered post dates
+    // agree: en "March 5, 2024", de "5. März 2024", fr "5 mars 2024",
+    // es "5 de marzo de 2024".
+    var tags = { en: 'en-US', de: 'de-DE', fr: 'fr-FR', es: 'es-ES' };
+    var tag = tags[pw.lang()] || undefined;
     try {
-        return new Date(ms).toLocaleDateString(undefined,
+        return new Date(ms).toLocaleDateString(tag,
             { year: 'numeric', month: 'long', day: 'numeric' });
     } catch (e) { return ''; }
 };
@@ -51,6 +57,25 @@ pw.toggleTheme = function () {
     var next = root.dataset.theme === 'dark' ? 'light' : 'dark';
     root.dataset.theme = next;
     try { localStorage.setItem('postwisp-theme', next); } catch (e) { /* ignore */ }
+};
+
+// ---- language ----
+// The active language: what the server put on <html lang>. The choice a
+// visitor makes is a cookie the server reads on every request, so public
+// pages, error pages and dates all follow it without any client catalog.
+
+pw.lang = function () {
+    var l = document.documentElement.lang || 'en';
+    return { en: 'en', de: 'de', fr: 'fr', es: 'es' }[l] || 'en';
+};
+
+pw.setLang = function (code) {
+    if (!/^(en|de|fr|es)$/.test(code)) return;
+    try {
+        document.cookie = 'postwisp-lang=' + code +
+            ';path=/;max-age=31536000;samesite=lax';
+    } catch (e) { /* ignore */ }
+    location.reload();
 };
 
 // ------------------------------------------------------------------ 3. cover
@@ -79,8 +104,10 @@ pw.setCover = function (source, alt, url) {
     return '![' + a + '](' + url + ')\n\n' + clean.replace(/^\s+/, '');
 };
 
-// The server-side excerpt leaks the cover markdown; cards use this to both
-// pull the cover URL out for a thumbnail and clean the text.
+// Older helper, kept for custom templates: pulls a leading image markdown
+// reference out of excerpt text. The server now sends the header image on
+// the summary's own "cover" field and keeps the excerpt clean, so the
+// built-in cards no longer need this.
 pw.coverFromExcerpt = function (excerpt) {
     var m = /^\s*!\[([^\]]*)\]\(\s*([^\s)]+)[^)]*\)\s*/.exec(String(excerpt == null ? '' : excerpt));
     if (!m) return { url: null, text: String(excerpt == null ? '' : excerpt).trim() };

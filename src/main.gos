@@ -844,12 +844,23 @@ fn render_inline(escaped: String) -> String {
             i += 1
             continue
         }
-        // image ![alt](url)
+        // image ![alt](url) — or an embedded player when the URL carries a
+        // video/audio hint or a media file extension
         if c == '!' as u8 && i + 1 < n && b[i + 1] == '[' as u8 {
             match match_link(b, i + 1, n) {
                 Some(m) => {
-                    out += "<img src=\"" + clean_url(sub(src, m.url_start, m.url_end))
-                    out += "\" alt=\"" + sub(src, m.text_start, m.text_end) + "\">"
+                    let url = clean_url(sub(src, m.url_start, m.url_end))
+                    let alt = sub(src, m.text_start, m.text_end)
+                    let mut hint = ""
+                    if m.hint_start >= 0 { hint = sub(src, m.hint_start, m.hint_end) }
+                    let kind = media_kind(url, hint)
+                    if kind == "video" {
+                        out += "<video controls preload=\"metadata\" src=\"" + url + "\"></video>"
+                    } else if kind == "audio" {
+                        out += "<audio controls preload=\"metadata\" src=\"" + url + "\">" + alt + "</audio>"
+                    } else {
+                        out += "<img src=\"" + url + "\" alt=\"" + alt + "\">"
+                    }
                     i = m.after
                     continue
                 }
@@ -909,6 +920,8 @@ struct LinkMatch {
     text_end: i64
     url_start: i64
     url_end: i64
+    hint_start: i64 // -1 when no " video"/" audio" embed hint follows the URL
+    hint_end: i64
     after: i64
 }
 
@@ -925,15 +938,39 @@ fn match_link(b: Vec<u8>, start: i64, n: i64) -> Option<LinkMatch> {
     if i + 1 >= n || b[i + 1] != '(' as u8 { return None }
     let mut j = i + 2
     while j < n && b[j] != ')' as u8 {
-        if b[j] == '\n' as u8 || b[j] == ' ' as u8 { return None }
+        if b[j] == '\n' as u8 { return None }
         j += 1
     }
     if j >= n { return None }
+    // One optional space inside the parens introduces an embed hint —
+    // "![alt](url video)". Any other space keeps the old verdict: not a
+    // link, the text renders literally.
+    let mut url_end = j
+    let mut hint_start: i64 = -1
+    let mut hint_end: i64 = -1
+    let mut k = i + 2
+    while k < j {
+        if b[k] == ' ' as u8 {
+            url_end = k
+            hint_start = k + 1
+            hint_end = j
+            break
+        }
+        k += 1
+    }
+    if hint_start >= 0 {
+        let width = hint_end - hint_start
+        let word = (bytes_word_at(b, hint_start, "video") && width == 5)
+            || (bytes_word_at(b, hint_start, "audio") && width == 5)
+        if !word { return None }
+    }
     Some(LinkMatch {
         text_start: start + 1
         text_end: text_end
         url_start: i + 2
-        url_end: j
+        url_end: url_end
+        hint_start: hint_start
+        hint_end: hint_end
         after: j + 1
     })
 }
@@ -961,6 +998,36 @@ fn clean_url(u: String) -> String {
     let lower = u.to_lowercase()
     if lower.starts_with("javascript:") || lower.starts_with("data:") { return "#" }
     u
+}
+
+// True when the bytes at `from` are exactly the word `w`.
+
+fn bytes_word_at(b: Vec<u8>, from: i64, w: String) -> bool {
+    let wb = w.bytes()
+    if from < 0 || from + wb.len() > b.len() { return false }
+    let mut t: i64 = 0
+    while t < wb.len() {
+        if b[from + t] != wb[t] { return false }
+        t += 1
+    }
+    true
+}
+
+// Decides how a markdown image reference is embedded. An explicit
+// " video" / " audio" hint wins (uploaded media URLs carry no extension);
+// otherwise the URL's own extension says; anything else stays an <img>.
+
+fn media_kind(url: String, hint: String) -> String {
+    if hint == "video" || hint == "audio" { return hint }
+    let u = url.to_lowercase()
+    if u.ends_with(".mp4") || u.ends_with(".webm") || u.ends_with(".mov") || u.ends_with(".m4v") {
+        return "video"
+    }
+    if u.ends_with(".mp3") || u.ends_with(".ogg") || u.ends_with(".oga")
+    || u.ends_with(".wav") || u.ends_with(".m4a") || u.ends_with(".flac") {
+        return "audio"
+    }
+    ""
 }
 
 // Render a full markdown document to sanitized HTML.
@@ -1609,24 +1676,70 @@ fn handle_delete_post(app: App, req: http::Request) -> http::Response {
 }
 
 
+const MAX_IMAGE_BYTES: i64 = 5 * 1024 * 1024
+const MAX_AV_BYTES: i64 = 50 * 1024 * 1024 // audio + video; images stay at 5MB
+
+
+fn is_video_ct(ct: String) -> bool {
+    ct == "video/mp4" || ct == "video/webm"
+}
+
+
+fn is_audio_ct(ct: String) -> bool {
+    ct == "audio/mpeg" || ct == "audio/ogg" || ct == "audio/wav" || ct == "audio/mp4"
+}
+
+
+fn max_media_bytes(ct: String) -> i64 {
+    if is_video_ct(ct) || is_audio_ct(ct) { return MAX_AV_BYTES }
+    MAX_IMAGE_BYTES
+}
+
+
+// Magic-byte sniffing: the client's Content-Type is never trusted; the
+// stored type is always what the bytes themselves say. An unknown
+// signature is rejected at upload, so everything later served as
+// image/*, video/*, or audio/* really is that — which is what makes the
+// nosniff serving header safe to send.
+
 fn sniff_content_type(data: Vec<u8>) -> Option<String> {
     let n = data.len()
     if n >= 8 && data[0] == 0x89 && data[1] == 'P' as u8 && data[2] == 'N' as u8 && data[3] == 'G' as u8 {
         return Some("image/png")
     }
     if n >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF { return Some("image/jpeg") }
-    if n >= 12 && data[0] == 'R' as u8 && data[1] == 'I' as u8 && data[2] == 'F' as u8 && data[3] == 'F' as u8
-    && data[8] == 'W' as u8 && data[9] == 'E' as u8 && data[10] == 'B' as u8 && data[11] == 'P' as u8 {
-        return Some("image/webp")
+    if n >= 12 && data[0] == 'R' as u8 && data[1] == 'I' as u8 && data[2] == 'F' as u8 && data[3] == 'F' as u8 {
+        if data[8] == 'W' as u8 && data[9] == 'A' as u8 && data[10] == 'V' as u8 && data[11] == 'E' as u8 {
+            return Some("audio/wav")
+        }
+        if data[8] == 'W' as u8 && data[9] == 'E' as u8 && data[10] == 'B' as u8 && data[11] == 'P' as u8 {
+            return Some("image/webp")
+        }
     }
     if n >= 6 && data[0] == 'G' as u8 && data[1] == 'I' as u8 && data[2] == 'F' as u8 && data[3] == '8' as u8 {
         return Some("image/gif")
     }
+    // ISO base-media container (mp4/m4a): size then "ftyp" then the brand
+    if n >= 12 && data[4] == 'f' as u8 && data[5] == 't' as u8 && data[6] == 'y' as u8 && data[7] == 'p' as u8 {
+        if data[8] == 'M' as u8 && data[9] == '4' as u8 && data[10] == 'A' as u8 && data[11] == ' ' as u8 {
+            return Some("audio/mp4")
+        }
+        return Some("video/mp4")
+    }
+    // EBML magic: matroska / webm
+    if n >= 4 && data[0] == 0x1A && data[1] == 0x45 && data[2] == 0xDF && data[3] == 0xA3 {
+        return Some("video/webm")
+    }
+    if n >= 4 && data[0] == 'O' as u8 && data[1] == 'g' as u8 && data[2] == 'g' as u8 && data[3] == 'S' as u8 {
+        return Some("audio/ogg")
+    }
+    // mp3: an ID3v2 tag or a bare MPEG audio frame sync
+    if n >= 3 && data[0] == 'I' as u8 && data[1] == 'D' as u8 && data[2] == '3' as u8 {
+        return Some("audio/mpeg")
+    }
+    if n >= 2 && data[0] == 0xFF && (data[1] & 0xE0) == 0xE0 { return Some("audio/mpeg") }
     None
 }
-
-// The upload is the raw image body: the content type is sniffed from the magic
-// bytes, so nothing the client claims is trusted.
 
 fn handle_upload_media(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
@@ -1634,11 +1747,12 @@ fn handle_upload_media(app: App, req: http::Request) -> http::Response {
         Ok(me) => {
             let data = req.raw_body
             if data.len() == 0 { return err_json(400, "empty body") }
-            if data.len() > 5 * 1024 * 1024 { return err_json(413, "too large (max 5MB)") }
+            if data.len() > MAX_AV_BYTES { return err_json(413, "too large (max 50MB)") }
             let ct = match sniff_content_type(data) {
                 Some(c) => c
-                None => return err_json(415, "not a jpg/png/webp/gif image")
+                None => return err_json(415, "not a supported file (jpg png webp gif mp4 webm mp3 ogg wav m4a)")
             }
+            if data.len() > max_media_bytes(ct) { return err_json(413, "too large (max 5MB for images)") }
             let mut eng = open_eng(app)
             let mut store = read_store(&mut eng)
             let id = new_token("m:" + now_ms().to_string() + ":" + store.media.len().to_string())
@@ -1657,21 +1771,388 @@ fn handle_upload_media(app: App, req: http::Request) -> http::Response {
 }
 
 
-fn err_page(code: String, msg: String) -> String {
-    return "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+// ---------- media serving ----------
+//
+// Every response carries the item's id as an ETag, X-Content-Type-Options:
+// nosniff (safe because the stored type always came from magic-byte
+// sniffing at upload), and immutable caching: a media id is never reused
+// and its bytes never change, so the URL is eternally revalidatable.
+// Range requests are answered with positional chunked reads, so a 50MB
+// video never lands whole in memory.
+
+const MEDIA_CHUNK: i64 = 256 * 1024
+
+fn etag_of(id: String) -> String { "\"" + id + "\"" }
+
+
+// Parses a single-range "Range: bytes=a-b" header. Returns None for a
+// missing, malformed, or non-bytes header (serve the whole file), and
+// Some(-1, -1) for a syntactically valid but unsatisfiable range (416).
+
+fn parse_range(h: String, len: i64) -> Option<(i64, i64)> {
+    if !h.to_lowercase().starts_with("bytes=") { return None }
+    let spec = sub(h, 6, h.len()).trim()
+    if spec.len() == 0 { return None }
+    // multi-range is not worth the multipart response; serve whole
+    if spec.contains(",") { return None }
+    let dash = find_sub(spec, "-", 0)
+    if dash < 0 { return None }
+    let a = sub(spec, 0, dash).trim()
+    let b = sub(spec, dash + 1, spec.len()).trim()
+    if a.len() == 0 {
+        // suffix range: last b bytes
+        match b.to_i64() {
+            None => return None
+            Some(n) => {
+                if n <= 0 { return Some((-1, -1)) }
+                let start = if n >= len { 0 } else { len - n }
+                return Some((start, len - 1))
+            }
+        }
+    }
+    let start = match a.to_i64() {
+        None => return None
+        Some(v) => v
+    }
+    if start < 0 || start >= len { return Some((-1, -1)) }
+    if b.len() == 0 { return Some((start, len - 1)) }
+    let end = match b.to_i64() {
+        None => return None
+        Some(v) => v
+    }
+    if end < start { return Some((-1, -1)) }
+    if end >= len { return Some((start, len - 1)) }
+    Some((start, end))
+}
+
+
+// One `If-Range` header answers "has the file changed since you cached
+// a range of it": only an exact ETag match (strong enough here — a media
+// file's bytes are immutable) re-authorizes the range; anything else
+// serves the whole file.
+
+fn if_range_allows(h: String, etag: String) -> bool {
+    let t = h.trim()
+    t.len() > 0 && t == etag
+}
+
+
+fn media_headers(resp: http::Response, id: String, len: i64) -> http::Response {
+    resp.with_header("ETag", etag_of(id))
+        .with_header("X-Content-Type-Options", "nosniff")
+        .with_header("Cache-Control", "public, max-age=31536000, immutable")
+        .with_header("Accept-Ranges", "bytes")
+        .with_header("Content-Length", len.to_string())
+}
+
+
+// Media library: the dashboard lists an author's uploads (admins see
+// all) and can delete one. Delete refuses when any post still embeds the
+// URL, so a published post can never silently lose its figure.
+
+fn media_in_use(store: Store, url: String) -> Option<String> {
+    for p in store.posts {
+        if p.source.contains(url) {
+            let mut t = p.title
+            if t.len() == 0 { t = p.slug }
+            return Some(t)
+        }
+    }
+    None
+}
+
+
+fn handle_list_media(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let mut eng = open_eng(app)
+            let store = read_store(&mut eng)
+            let mut out = String::new()
+            out += "["
+            let mut first = true
+            for m in store.media {
+                if me.role != "admin" && m.user_id != me.id { continue }
+                match find_user(store, m.user_id) {
+                    Some(u) => {
+                        if !first { out += "," }
+                        first = false
+                        out += "{\"id\":" + json_quote(m.id)
+                        + ",\"user_id\":" + m.user_id.to_string()
+                        + ",\"username\":" + json_quote(u.username)
+                        + ",\"content_type\":" + json_quote(m.content_type)
+                        + ",\"created_at\":" + m.created_at.to_string()
+                        + ",\"url\":" + json_quote("/" + u.username + "/media/" + m.id)
+                        + "}"
+                    }
+                    None => ()
+                }
+            }
+            out += "]"
+            return ok_json(out)
+        }
+    }
+}
+
+
+fn handle_delete_media(app: App, req: http::Request) -> http::Response {
+    match require_user(app, req) {
+        Err(r) => return r
+        Ok(me) => {
+            let id = req.path_value("id")
+            let mut eng = open_eng(app)
+            let mut store = read_store(&mut eng)
+            let mut found: Option<MediaItem> = None
+            for m in store.media {
+                if m.id == id { found = Some(m) }
+            }
+            let m = match found {
+                None => return err_json(404, "no such media")
+                Some(m) => m
+            }
+            if me.role != "admin" && m.user_id != me.id { return err_json(403, "not your media") }
+            let uname = match find_user(store, m.user_id) {
+                Some(u) => u.username
+                None => "unknown"
+            }
+            let url = "/" + uname + "/media/" + m.id
+            match media_in_use(store, url) {
+                Some(title) => return err_json(409, "still used by post \"" + title + "\"")
+                None => ()
+            }
+            let mut kept: Vec<MediaItem> = #[]
+            for x in store.media {
+                if x.id != id { kept.push(x) }
+            }
+            store.media = kept
+            exec_sql(&mut eng, "DELETE FROM media WHERE id = " + sqlq(id))
+            let _ = fs::remove_file(app.dir + "/media/" + id)
+            return ok_json("{\"ok\":true}")
+        }
+    }
+}
+
+
+// ---------- internationalization ----------
+//
+// The public site is multilingual: every reader-visible string lives in
+// the catalog below, and the active language is negotiated per request —
+// the visitor's own choice (the postwisp-lang cookie, set by the language
+// switcher on any public page) first, then the browser's Accept-Language,
+// then the site setting from the settings page, then English. The admin
+// dashboard and editors stay English: they are the owner's tools, and the
+// owner set the site up in whatever language they chose for it.
+//
+// Adding a language: add one ("code", "native name") tuple to i18n_langs,
+// one arm to month_names and fmt_date, one column to every i18n_catalog
+// row, and one <option> to the settings page's language select. The
+// catalog-completeness test fails until every row carries the new column.
+
+fn i18n_langs() -> Vec<(String, String)> {
+    #[("en", "English"), ("de", "Deutsch"), ("fr", "Français"), ("es", "Español")]
+}
+
+
+// Additional languages the site offers, from the comma-separated
+// "langs_csv" site setting (e.g. "de, fr"). Empty by default: the header
+// shows no language switcher until the owner names one, so a
+// single-language site stays clean. Entries must be codes i18n_langs
+// knows; "en" is always on and is not repeated here.
+
+fn additional_langs(f: Map<String, String>) -> Vec<String> {
+    let mut out: Vec<String> = #[]
+    for part in get_setting(f, "langs_csv", "").split(",") {
+        let c = part.trim().to_lowercase()
+        if c.len() > 0 && c != "en" && valid_lang(c) && !out.contains(c) { out.push(c) }
+    }
+    out
+}
+
+
+fn valid_lang(lang: String) -> bool {
+    for (code, _) in i18n_langs() {
+        if code == lang { return true }
+    }
+    false
+}
+
+
+// English is index 0; an unknown language falls back to it.
+
+fn lang_index(lang: String) -> i64 {
+    let mut i: i64 = 0
+    for (code, _) in i18n_langs() {
+        if code == lang { return i }
+        i += 1
+    }
+    0
+}
+
+
+// Rows are [key, en, de, fr, es]; {tag} marks where a tag name goes.
+
+fn i18n_catalog() -> Vec<Vec<String>> {
+    #[
+        #["nav_posts", "Posts", "Beiträge", "Articles", "Publicaciones"],
+        #["nav_about", "About", "Über", "À propos", "Acerca de"],
+        #["lang_label", "Language", "Sprache", "Langue", "Idioma"],
+        #["theme_toggle", "Toggle light or dark theme", "Helles oder dunkles Design umschalten", "Basculer entre le thème clair et sombre", "Alternar entre el tema claro y el oscuro"],
+        #["latest", "Latest posts", "Neueste Beiträge", "Derniers articles", "Últimas publicaciones"],
+        #["empty_home", "No posts yet. The first post will appear here.", "Noch keine Beiträge. Der erste Beitrag erscheint hier.", "Aucun article pour le moment. Le premier apparaîtra ici.", "Aún no hay publicaciones. La primera aparecerá aquí."],
+        #["empty_list", "No posts yet.", "Noch keine Beiträge.", "Aucun article pour le moment.", "Aún no hay publicaciones."],
+        #["no_tag_posts", "No posts with the tag \"{tag}\".", "Keine Beiträge mit dem Tag \"{tag}\".", "Aucun article avec l'étiquette « {tag} ».", "No hay publicaciones con la etiqueta \"{tag}\"."],
+        #["all_posts_title", "All posts", "Alle Beiträge", "Tous les articles", "Todas las publicaciones"],
+        #["all_posts_sub", "Everything published on this blog.", "Alles, was auf diesem Blog veröffentlicht ist.", "Tout ce qui est publié sur ce blog.", "Todo lo publicado en este blog."],
+        #["tag_title", "Posts tagged \"{tag}\"", "Beiträge mit dem Tag \"{tag}\"", "Articles étiquetés « {tag} »", "Publicaciones con la etiqueta \"{tag}\""],
+        #["tag_sub", "Every published post with the tag \"{tag}\".", "Alle veröffentlichten Beiträge mit dem Tag \"{tag}\".", "Tous les articles publiés avec l'étiquette « {tag} ».", "Todas las publicaciones con la etiqueta \"{tag}\"."],
+        #["about_title", "About", "Über", "À propos", "Acerca de"],
+        #["about_default_1", "This site runs on postwisp, a small self-hosted blog.", "Diese Seite läuft auf postwisp, einem kleinen selbst gehosteten Blog.", "Ce site fonctionne avec postwisp, un petit blog auto-hébergé.", "Este sitio funciona con postwisp, un pequeño blog autoalojado."],
+        #["about_default_2", "Replace this text with whatever you want people to know about you or this site: log in to the admin dashboard and write your own About page.", "Ersetze diesen Text durch alles, was Besucher über dich oder diese Seite wissen sollen: melde dich im Admin-Dashboard an und schreibe deine eigene About-Seite.", "Remplacez ce texte par ce que vous voulez que les visiteurs sachent sur vous ou ce site : connectez-vous au tableau de bord d'administration et rédigez votre propre page « À propos ».", "Sustituye este texto por lo que quieras que los visitantes sepan de ti o de este sitio: inicia sesión en el panel de administración y escribe tu propia página «Acerca de»."],
+        #["err_not_found", "That page does not exist.", "Diese Seite existiert nicht.", "Cette page n'existe pas.", "Esa página no existe."],
+        #["back_home", "Back to the blog", "Zurück zum Blog", "Retour au blog", "Volver al blog"],
+    ]
+}
+
+
+// Looks a key up in the active language. An unknown key renders as
+// itself (visible, so a missing entry is obvious at a glance); an
+// unknown language already fell back to English in lang_index.
+
+fn tr(lang: String, key: String) -> String {
+    let i = lang_index(lang) + 1
+    for row in i18n_catalog() {
+        if row[0] == key { return row[i] }
+    }
+    key
+}
+
+
+// A catalog string with its {tag} slot filled.
+
+fn tr_tag(lang: String, key: String, tag: String) -> String {
+    strings::replace(tr(lang, key), "{tag}", tag)
+}
+
+
+fn month_names(lang: String) -> Vec<String> {
+    if lang == "de" {
+        return #["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
+    }
+    if lang == "fr" {
+        return #["janvier", "février", "mars", "avril", "mai", "juin", "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    }
+    if lang == "es" {
+        return #["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    }
+    #["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+}
+
+
+// A localized long date, matching what the browser's Intl renders for
+// the same locale (en-US "March 5, 2024", de-DE "5. März 2024",
+// fr-FR "5 mars 2024", es-ES "5 de marzo de 2024") so card dates and
+// post dates agree whichever side rendered them.
+
+fn fmt_date(lang: String, ms: i64) -> String {
+    let y, mo, d = codec::datetime::civil_from_days(codec::datetime::floor_div(ms, 86_400_000))
+    let m = month_names(lang)[mo - 1]
+    let ds = d.to_string()
+    let ys = y.to_string()
+    if lang == "de" { return ds + ". " + m + " " + ys }
+    if lang == "fr" { return ds + " " + m + " " + ys }
+    if lang == "es" { return ds + " de " + m + " de " + ys }
+    m + " " + ds + ", " + ys
+}
+
+
+// Accept-Language: the first listed tag whose primary subtag is a
+// supported language wins; "" when the browser names none we speak.
+
+fn pick_accept_lang(header: String) -> String {
+    for part in split_byte(header, ',' as u8) {
+        let tag = part.split(";")[0].trim().to_lowercase()
+        let primary = tag.split("-")[0]
+        if valid_lang(primary) { return primary }
+    }
+    ""
+}
+
+
+// One named cookie from a Cookie header, "" when absent.
+
+fn cookie_of(req: http::Request, name: String) -> String {
+    let header = header_value(req, "Cookie")
+    let want = name + "="
+    for part in split_byte(header, ';' as u8) {
+        let p = part.trim()
+        if p.starts_with(want) { return sub(p, want.len(), p.len()) }
+    }
+    ""
+}
+
+
+// The active language for a request: the visitor's own choice, then
+// their browser, then the site setting, then English.
+
+fn lang_of(app: App, req: http::Request) -> String {
+    let c = cookie_of(req, "postwisp-lang")
+    if valid_lang(c) { return c }
+    let a = pick_accept_lang(header_value(req, "Accept-Language"))
+    if a.len() > 0 { return a }
+    let f = settings_map_for(app, -1)
+    let s = get_setting(f, "language", "en")
+    if valid_lang(s) { return s }
+    "en"
+}
+
+
+// The language switcher every public page shares — but only when the
+// owner has named additional languages: with none configured the header
+// carries no switcher at all. Options always show native names
+// ("Deutsch", "Español") whatever the active language is, so a visitor
+// can always find their own.
+
+fn lang_switch_html(app: App, lang: String) -> String {
+    let extra = additional_langs(settings_map_for(app, -1))
+    if extra.len() == 0 { return "" }
+    let mut langs: Vec<(String, String)> = #[("en", "English")]
+    for (code, name) in i18n_langs() {
+        if extra.contains(code) { langs.push((code, name)) }
+    }
+    let mut options = String::new()
+    for (code, name) in langs {
+        let sel = if code == lang { " selected" } else { "" }
+        options += "<option value=\"" + code + "\"" + sel + ">" + name + "</option>"
+    }
+    "<select class=\"lang-switch\" aria-label=\"" + escape_html(tr(lang, "lang_label"))
+    + "\" title=\"" + escape_html(tr(lang, "lang_label"))
+    + "\" onchange=\"pw.setLang(this.value)\">" + options + "</select>"
+}
+
+
+fn err_page(app: App, lang: String, code: String, msg: String) -> String {
+    // site-level page: the first account's title and footer settings apply
+    let f = settings_map_for(app, -1)
+    let title = get_setting(f, "title", "postwisp")
+    let footer = compose_footer_html(get_setting(f, "footer", ""), credit_on(f))
+    return "<!doctype html><html lang=\"" + lang + "\"><head><meta charset=\"utf-8\">"
     + "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
-    + "<title>" + code + " — postwisp</title>"
+    + "<title>" + code + " — " + escape_html(title) + "</title>"
     + "<link rel=\"stylesheet\" href=\"/theme.css\">"
     + "<link rel=\"stylesheet\" href=\"/app.css\">"
     + "<script src=\"/theme-boot.js\"></script>"
     + "</head><body><main class=\"error-page\">"
     + "<div class=\"error-code\">" + escape_html(code) + "</div>"
     + "<p class=\"error-msg\">" + escape_html(msg) + "</p>"
-    + "<p><a class=\"btn\" href=\"/\">Back to the blog</a></p>"
-    + "</main></body></html>"
+    + "<p class=\"error-actions\"><a class=\"btn\" href=\"/\">" + tr(lang, "back_home") + "</a>"
+    + lang_switch_html(app, lang) + "</p>"
+    + "</main>"
+    + "<footer class=\"site-footer\"><div class=\"wrap\">" + footer + "</div></footer>"
+    + "</body></html>"
 }
 
 fn handle_public_media(app: App, req: http::Request) -> http::Response {
+    let lang = lang_of(app, req)
     let user = req.path_value("user")
     let id = req.path_value("id")
     let mut eng = open_eng(app)
@@ -1680,28 +2161,89 @@ fn handle_public_media(app: App, req: http::Request) -> http::Response {
     for m in store.media {
         if m.id == id { found = Some(m) }
     }
-    match found {
-        None => return resp_html(404, err_page("404", "That page does not exist."))
-        Some(m) => {
-            match find_user(store, m.user_id) {
-                None => return resp_html(404, err_page("404", "That page does not exist."))
-                Some(u) => {
-                    if u.username != user { return resp_html(404, err_page("404", "That page does not exist.")) }
-                    match fs::read(app.dir + "/media/" + m.id) {
-                        Ok(bytes) => {
-                            // binary body: ResponseStream::write_bytes frames
-                            // raw bytes; Response::text UTF-8-encodes anything
-                            // pushed as chars and would corrupt images.
-                            let mut stream = http::ResponseStream::new()
-                            stream.write_bytes(bytes)
-                            stream.close()
-                            return http::Response::stream(200, m.content_type, stream)
-                                .with_header("Cache-Control", "public, max-age=86400")
-                        }
-                        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+    let m = match found {
+        None => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
+        Some(m) => m
+    }
+    let u = match find_user(store, m.user_id) {
+        None => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
+        Some(u) => u
+    }
+    if u.username != user { return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found"))) }
+    // conditional revalidation: an exact ETag match short-circuits to 304
+    let etag = etag_of(m.id)
+    let inm = header_value(req, "If-None-Match")
+    if inm.len() > 0 {
+        for t in split_byte(inm, ',' as u8) {
+            let cand = t.trim()
+            // clients may send a bare "*"; "*" matches anything
+            if cand == "*" || cand == etag { return media_headers(http::Response::text(304, ""), m.id, 0) }
+        }
+    }
+    let len = match fs::File::open(app.dir + "/media/" + m.id) {
+        Ok(f) => match f.len() {
+            Ok(n) => n
+            Err(m2) => return err_json(500, "cannot size media: " + m2.message())
+        }
+        Err(m2) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
+    }
+    // byte-range serving: only when If-Range is absent or an exact ETag
+    let range_hdr = header_value(req, "Range")
+    let mut rng: Option<(i64, i64)> = None
+    if range_hdr.len() > 0 {
+        if if_range_allows(header_value(req, "If-Range"), etag) || header_value(req, "If-Range").len() == 0 {
+            rng = parse_range(range_hdr, len)
+        }
+    }
+    match rng {
+        Some((a, b)) => {
+            if a < 0 { return err_json(416, "range not satisfiable").with_header("Content-Range", "bytes */" + len.to_string()) }
+            let mut f = match fs::File::open(app.dir + "/media/" + m.id) {
+                Ok(f) => f
+                Err(m2) => return err_json(500, "cannot read media: " + m2.message())
+            }
+            let mut stream = http::ResponseStream::new()
+            let mut pos = a
+            while pos <= b {
+                let want = if b - pos + 1 < MEDIA_CHUNK { b - pos + 1 } else { MEDIA_CHUNK }
+                // read_at(count, offset) — positional chunked read
+                match f.read_at(want, pos) {
+                    Ok(chunk) => {
+                        if chunk.len() == 0 { break }
+                        stream.write_bytes(chunk)
+                        pos += chunk.len()
                     }
+                    Err(m2) => return err_json(500, "cannot read media: " + m2.message())
                 }
             }
+            stream.close()
+            return media_headers(
+                http::Response::stream(206, m.content_type, stream)
+                    .with_header("Content-Range", "bytes " + a.to_string() + "-" + b.to_string() + "/" + len.to_string()),
+                m.id, b - a + 1)
+        }
+        _ => {
+            // whole-file: chunked positional reads, same as the range path,
+            // so a 50MB video never lands whole in memory either
+            let mut f = match fs::File::open(app.dir + "/media/" + m.id) {
+                Ok(f) => f
+                Err(m2) => return err_json(500, "cannot read media: " + m2.message())
+            }
+            let mut stream = http::ResponseStream::new()
+            let mut pos: i64 = 0
+            while pos < len {
+                let want = if len - pos < MEDIA_CHUNK { len - pos } else { MEDIA_CHUNK }
+                match f.read_at(want, pos) {
+                    Ok(chunk) => {
+                        if chunk.len() == 0 { break }
+                        stream.write_bytes(chunk)
+                        pos += chunk.len()
+                    }
+                    Err(m2) => return err_json(500, "cannot read media: " + m2.message())
+                }
+            }
+            stream.close()
+            return media_headers(http::Response::stream(200, m.content_type, stream), m.id, len)
         }
     }
 }
@@ -1721,7 +2263,7 @@ fn page_shell(title: String, body_html: String, feed_link: String) -> String {
     + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/admin\">Admin</a></nav>"
     + "</div></header>"
     + "<main>" + body_html + "</main>"
-    + "<footer class=\"site-footer\"><div class=\"wrap\">Powered by postwisp</div></footer>"
+    + "<footer class=\"site-footer\"><div class=\"wrap\"><a href=\"https://github.com/danpozmanter/postwisp\" target=\"_blank\" rel=\"noopener\">Powered by postwisp</a></div></footer>"
     + "</body></html>"
 }
 
@@ -1754,28 +2296,47 @@ fn tpl_fill(html: String, fields: Map<String, String>) -> String {
 
 
 // Defaults every public page shares: site title/tagline/footer plus the
-// site-wide theme on <html>. Page-specific fields override these.
+// site-wide theme and the active language's strings on <html>. The
+// per-page fields below override these.
 
-fn site_fields(app: App) -> Map<String, String> {
-    let f = parse_body(settings_json(app))
+fn site_fields(app: App, lang: String, owner: i64 = -1, owner_name: String = "") -> Map<String, String> {
+    let f = settings_map_for(app, owner)
     let mut m = Map::new()
-    let title = get_setting(f, "title", "postwisp")
+    // a fresh account's pages name their author; site-wide it is postwisp
+    let title_dflt = if owner_name.len() > 0 { owner_name } else { "postwisp" }
+    let title = get_setting(f, "title", title_dflt)
     let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
-    let footer = get_setting(f, "footer", "Powered by postwisp")
+    let footer = get_setting(f, "footer", "")
     let mut theme = get_setting(f, "theme", "dark")
     if theme != "light" && theme != "dark" { theme = "dark" }
     m.insert("title", escape_html(title))
     m.insert("site_title", escape_html(title))
     m.insert("tagline", escape_html(tagline))
-    m.insert("footer", escape_html(footer))
+    m.insert("footer", compose_footer_html(footer, credit_on(f)))
+    m.insert("footer_html", compose_footer_html(footer, credit_on(f)))
+    m.insert("lang_attr", " lang=\"" + lang + "\"")
+    m.insert("nav_posts", tr(lang, "nav_posts"))
+    m.insert("nav_about", tr(lang, "nav_about"))
+    m.insert("theme_toggle", escape_html(tr(lang, "theme_toggle")))
+    m.insert("lang_switch", lang_switch_html(app, lang))
+    m.insert("latest", tr(lang, "latest"))
+    m.insert("empty_home", tr(lang, "empty_home"))
+    m.insert("empty_list", tr(lang, "empty_list"))
+    m.insert("all_posts_title", tr(lang, "all_posts_title"))
+    m.insert("all_posts_sub", tr(lang, "all_posts_sub"))
+    m.insert("about_title", tr(lang, "about_title"))
+    // attribute-escaped copies: the list page's client script fills the
+    // {tag} slot from the active chip, so these arrive via data-* attrs
+    m.insert("no_tag_posts_attr", escape_html(tr(lang, "no_tag_posts")))
+    m.insert("tag_sub_attr", escape_html(tr(lang, "tag_sub")))
     if theme == "light" { m.insert("theme_attr", " data-theme=\"light\"") }
     else { m.insert("theme_attr", "") }
     return m
 }
 
 
-fn render_page(app: App, name: String, fields: Map<String, String>) -> String {
-    let mut all = site_fields(app)
+fn render_page(app: App, lang: String, name: String, fields: Map<String, String>, owner: i64 = -1, owner_name: String = "") -> String {
+    let mut all = site_fields(app, lang, owner, owner_name)
     for (k, v) in fields.iter() {
         all.insert(k, v)
     }
@@ -1783,8 +2344,8 @@ fn render_page(app: App, name: String, fields: Map<String, String>) -> String {
 }
 
 
-fn serve_template(app: App, name: String, fields: Map<String, String>) -> http::Response {
-    let html = render_page(app, name, fields)
+fn serve_template(app: App, lang: String, name: String, fields: Map<String, String>, owner: i64 = -1, owner_name: String = "") -> http::Response {
+    let html = render_page(app, lang, name, fields, owner, owner_name)
     if html.len() == 0 {
         return resp_html(500, "<h1>templates/" + name + " is missing</h1>")
     }
@@ -1793,24 +2354,25 @@ fn serve_template(app: App, name: String, fields: Map<String, String>) -> http::
 
 
 fn handle_home(app: App, req: http::Request) -> http::Response {
-    return serve_template(app, "index.html", Map::new())
+    return serve_template(app, lang_of(app, req), "index.html", Map::new())
 }
 
 
 fn handle_list(app: App, req: http::Request) -> http::Response {
+    let lang = lang_of(app, req)
     let tag = query_value(req, "tag")
     let mut fields = Map::new()
     if tag.len() > 0 {
-        let t = "Posts tagged \"" + tag + "\""
+        let t = tr_tag(lang, "tag_title", escape_html(tag))
         fields.insert("title", escape_html(t))
         fields.insert("page_title", escape_html(t))
-        fields.insert("page_sub", "Every published post with the tag \"" + escape_html(tag) + "\".")
+        fields.insert("page_sub", escape_html(tr_tag(lang, "tag_sub", escape_html(tag))))
     } else {
-        fields.insert("title", "Posts")
-        fields.insert("page_title", "All posts")
-        fields.insert("page_sub", "Everything published on this blog.")
+        fields.insert("title", tr(lang, "all_posts_title"))
+        fields.insert("page_title", tr(lang, "all_posts_title"))
+        fields.insert("page_sub", tr(lang, "all_posts_sub"))
     }
-    return serve_template(app, "list.html", fields)
+    return serve_template(app, lang, "list.html", fields)
 }
 
 
@@ -1828,20 +2390,19 @@ fn find_about_post(store: Store, user_id: i64) -> Option<Post> {
 }
 
 
-fn about_fallback_html() -> String {
-    "<p>This site runs on postwisp, a small self-hosted blog.</p>\n"
-    + "<p>Replace this with whatever you want people to know about you or "
-    + "this site: log in to the admin dashboard and press the About page "
-    + "button.</p>"
+fn about_fallback_html(lang: String) -> String {
+    "<p>" + tr(lang, "about_default_1") + "</p>\n"
+    + "<p>" + tr(lang, "about_default_2") + "</p>"
 }
 
 
 fn handle_about(app: App, req: http::Request) -> http::Response {
+    let lang = lang_of(app, req)
     let mut eng = open_eng(app)
     let store = read_store(&mut eng)
     let mut fields = Map::new()
-    fields.insert("title", "About")
-    fields.insert("content", about_fallback_html())
+    fields.insert("title", tr(lang, "about_title"))
+    fields.insert("content", about_fallback_html(lang))
     if store.users.len() > 0 {
         match find_about_post(store, store.users[0].id) {
             Some(p) => {
@@ -1853,17 +2414,18 @@ fn handle_about(app: App, req: http::Request) -> http::Response {
             None => ()
         }
     }
-    return serve_template(app, "about.html", fields)
+    return serve_template(app, lang, "about.html", fields)
 }
 
 
 fn handle_public_post(app: App, req: http::Request) -> http::Response {
+    let lang = lang_of(app, req)
     let user = req.path_value("user")
     let slug = req.path_value("slug")
     let mut eng = open_eng(app)
     let store = read_store(&mut eng)
     match find_user_by_name(store, user) {
-        None => return resp_html(404, err_page("404", "That page does not exist."))
+        None => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
         Some(u) => {
             for p in store.posts {
                 if p.user_id == u.id && p.slug == slug && p.status == "published" {
@@ -1876,14 +2438,14 @@ fn handle_public_post(app: App, req: http::Request) -> http::Response {
                     let mut fields = Map::new()
                     fields.insert("title", escape_html(p.title))
                     fields.insert("content", p.content)
-                    fields.insert("date", codec::datetime::render(p.published_at))
+                    fields.insert("date", fmt_date(lang, p.published_at))
                     fields.insert("author_part", " &middot; " + escape_html(u.username))
                     fields.insert("tags_part", " " + tags_html)
                     fields.insert("feed_url", "/" + escape_html(u.username) + "/feed.xml")
-                    return serve_template(app, "post.html", fields)
+                    return serve_template(app, lang, "post.html", fields, u.id, u.username)
                 }
             }
-            return resp_html(404, err_page("404", "That page does not exist."))
+            return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
         }
     }
 }
@@ -1896,11 +2458,12 @@ fn pub_cmp(a: Post, b: Post) -> i64 {
 
 
 fn handle_feed(app: App, req: http::Request) -> http::Response {
+    let lang = lang_of(app, req)
     let user = req.path_value("user")
     let mut eng = open_eng(app)
     let store = read_store(&mut eng)
     match find_user_by_name(store, user) {
-        None => return resp_html(404, err_page("404", "That page does not exist."))
+        None => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
         Some(u) => {
             let mut mine: Vec<Post> = #[]
             for p in store.posts {
@@ -1909,10 +2472,11 @@ fn handle_feed(app: App, req: http::Request) -> http::Response {
             mine.sort_by(|a, b| pub_cmp(a, b))
             if mine.len() > 20 { mine.truncate(20) }
             let base = "/" + u.username
+            let f = settings_map_for(app, u.id)
             let mut xml = String::new()
             xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
             xml += "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
-            xml += "<title>" + escape_html(u.username) + " — postwisp</title>\n"
+            xml += "<title>" + escape_html(get_setting(f, "title", u.username)) + "</title>\n"
             xml += "<link href=\"" + base + "/feed.xml\" rel=\"self\"/>\n"
             xml += "<updated>" + (if mine.len() > 0 { codec::datetime::render(mine[0].published_at) } else { codec::datetime::render(now_ms()) }) + "</updated>\n"
             for p in mine {
@@ -1938,26 +2502,29 @@ fn handle_feed(app: App, req: http::Request) -> http::Response {
 // pages are static files under web/ styled by /theme.css + /app.css; the
 // server-rendered post pages share the same stylesheets.
 
-fn serve_web_file(app: App, name: String) -> http::Response {
+fn serve_web_file(app: App, req: http::Request, name: String) -> http::Response {
+    let lang = lang_of(app, req)
     match fs::read_to_string(app.web_dir + "/" + name) {
         Ok(html) => return resp_html(200, html)
-        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+        Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
     }
 }
 
 
-fn serve_web_css(app: App, name: String) -> http::Response {
+fn serve_web_css(app: App, req: http::Request, name: String) -> http::Response {
+    let lang = lang_of(app, req)
     match fs::read_to_string(app.web_dir + "/" + name) {
         Ok(css) => return http::Response::text(200, css).with_header("Content-Type", "text/css; charset=utf-8")
-        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+        Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
     }
 }
 
 
-fn serve_web_js(app: App, name: String) -> http::Response {
+fn serve_web_js(app: App, req: http::Request, name: String) -> http::Response {
+    let lang = lang_of(app, req)
     match fs::read_to_string(app.web_dir + "/" + name) {
         Ok(js) => return http::Response::text(200, js).with_header("Content-Type", "text/javascript; charset=utf-8")
-        Err(_) => return resp_html(404, err_page("404", "That page does not exist."))
+        Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
     }
 }
 
@@ -1969,42 +2536,133 @@ fn get_setting(m: Map<String, String>, key: String, dflt: String) -> String {
 }
 
 
-fn settings_json(app: App) -> String {
-    let mut raw = "{}"
+// Settings are per user: each account owns one row under
+// "postwisp/settings/<id>". A row written before this split (the global
+// "postwisp/settings" key) still counts, so an upgrade never resets
+// anyone's title. Site-level pages (/, /posts, /about, error pages) read
+// the FIRST account's row — the same owner the site-wide /about page
+// shows — and an author's own pages (/<user>/<slug>, /<user>/feed.xml)
+// read that author's row.
+
+fn settings_raw(app: App, owner: i64) -> String {
+    let mut key = "postwisp/settings"
+    if owner >= 0 { key = "postwisp/settings/" + owner.to_string() }
     let mut eng = open_eng(app)
-    match eng.store.get("postwisp/settings") {
+    let mut raw = "{}"
+    match eng.store.get(key) {
         kv::Read::Value(b) => match String::from_utf8(b) {
             Ok(s) => { raw = s }
             Err(_) => ()
         }
-        kv::Read::Absent => ()
+        kv::Read::Absent => {
+            // an account with no row of its own inherits the global one
+            if owner >= 0 {
+                match eng.store.get("postwisp/settings") {
+                    kv::Read::Value(b) => match String::from_utf8(b) {
+                        Ok(s) => { raw = s }
+                        Err(_) => ()
+                    }
+                    kv::Read::Absent => ()
+                    kv::Read::Fault(_) => ()
+                }
+            }
+        }
         kv::Read::Fault(_) => ()
     }
-    let f = parse_body(raw)
-    let store = read_store(&mut eng)
-    let mut sp = "false"
-    if store.users.len() == 0 { sp = "true" }
-    let title = get_setting(f, "title", "postwisp")
+    raw
+}
+
+fn settings_map_for(app: App, owner: i64) -> Map<String, String> {
+    let mut id = owner
+    if id < 0 {
+        let mut eng = open_eng(app)
+        let store = read_store(&mut eng)
+        if store.users.len() > 0 { id = store.users[0].id }
+    }
+    parse_body(settings_raw(app, id))
+}
+
+// The footer credit: on by default, one toggle in settings. A legacy
+// row whose footer text already IS the credit is not doubled.
+
+fn credit_on(f: Map<String, String>) -> bool {
+    return get_setting(f, "show_credit", "true") != "false"
+}
+
+fn compose_footer(footer: String, credit: bool) -> String {
+    let mark = "Powered by postwisp"
+    if !credit { return footer }
+    if strings::contains(footer, mark) { return footer }
+    if footer.len() == 0 { return mark }
+    return footer + " · " + mark
+}
+
+
+// The footer as public pages show it: the credit is a link to the
+// postwisp repository. Mirrors compose_footer, but builds HTML — the
+// owner's own text is escaped while the credit anchor goes in raw.
+
+fn compose_footer_html(footer: String, credit: bool) -> String {
+    let link = "<a href=\"https://github.com/danpozmanter/postwisp\" target=\"_blank\" rel=\"noopener\">Powered by postwisp</a>"
+    let mark = "Powered by postwisp"
+    if !credit { return escape_html(footer) }
+    // the credit is ALWAYS a link: even when the owner's own footer text
+    // already says it, the phrase is linkified in place.
+    let esc = escape_html(footer)
+    if strings::contains(esc, mark) { return strings::replace(esc, mark, link) }
+    if footer.len() == 0 { return link }
+    esc + " · " + link
+}
+
+// The defaults-filled JSON for one owner's settings. `footer` is the
+// editable text; `footer_html` is what pages show (text plus credit).
+// A fresh account's title defaults to the account's own name.
+
+fn settings_json_for(app: App, owner: i64, owner_name: String = "", tail: String = "") -> String {
+    let f = settings_map_for(app, owner)
+    let title_dflt = if owner_name.len() > 0 { owner_name } else { "postwisp" }
+    let title = get_setting(f, "title", title_dflt)
     let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
     let description = get_setting(f, "description", "")
-    let footer = get_setting(f, "footer", "Powered by postwisp")
+    let footer = get_setting(f, "footer", "")
     let mut theme = get_setting(f, "theme", "dark")
     if theme != "light" && theme != "dark" { theme = "dark" }
-    let json = "{\"title\":" + json_quote(title)
+    let mut language = get_setting(f, "language", "en")
+    if !valid_lang(language) { language = "en" }
+    let credit = if credit_on(f) { "true" } else { "false" }
+    return "{\"title\":" + json_quote(title)
     + ",\"tagline\":" + json_quote(tagline)
     + ",\"description\":" + json_quote(description)
     + ",\"footer\":" + json_quote(footer)
+    + ",\"footer_html\":" + json_quote(compose_footer_html(footer, credit == "true"))
+    + ",\"show_credit\":\"" + credit + "\""
     + ",\"theme\":" + json_quote(theme)
-    + ",\"setup_pending\":" + sp
+    + ",\"language\":" + json_quote(language)
+    + tail
     + "}"
-    json
+}
+
+fn settings_json(app: App) -> String {
+    // The site-level view /api/public/site serves: the first account's
+    // row plus setup_pending for the admin boot screen.
+    let mut eng = open_eng(app)
+    let store = read_store(&mut eng)
+    let mut sp = "true"
+    let mut id: i64 = -1
+    let mut name = ""
+    if store.users.len() > 0 {
+        sp = "false"
+        id = store.users[0].id
+        name = store.users[0].username
+    }
+    return settings_json_for(app, id, name, ",\"setup_pending\":" + sp)
 }
 
 
 fn handle_get_settings(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
-        Ok(_) => return ok_json(settings_json(app))
+        Ok(u) => return ok_json(settings_json_for(app, u.id, u.username))
     }
 }
 
@@ -2012,15 +2670,21 @@ fn handle_get_settings(app: App, req: http::Request) -> http::Response {
 fn handle_put_settings(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
-        Ok(_) => {
+        Ok(u) => {
             let f = parse_body(req.body)
-            let cur = parse_body(settings_json(app))
-            let title = get_setting(f, "title", get_setting(cur, "title", "postwisp"))
+            let cur = settings_map_for(app, u.id)
+            let title = get_setting(f, "title", get_setting(cur, "title", u.username))
             let tagline = get_setting(f, "tagline", get_setting(cur, "tagline", "Notes from a small self-hosted blog"))
             let description = get_setting(f, "description", get_setting(cur, "description", ""))
-            let footer = get_setting(f, "footer", get_setting(cur, "footer", "Powered by postwisp"))
+            let footer = get_setting(f, "footer", get_setting(cur, "footer", ""))
+            let mut credit = get_setting(f, "show_credit", get_setting(cur, "show_credit", "true"))
+            if credit != "true" && credit != "false" {
+                return err_json(400, "show_credit must be true or false")
+            }
             let mut theme = get_setting(f, "theme", get_setting(cur, "theme", "dark"))
             if theme != "light" && theme != "dark" { return err_json(400, "theme must be light or dark") }
+            let mut language = get_setting(f, "language", get_setting(cur, "language", "en"))
+            if !valid_lang(language) { return err_json(400, "language must be one of en, de, fr, es") }
             if title.len() == 0 || title.len() > 100 { return err_json(400, "title required (max 100)") }
             if tagline.len() > 200 { return err_json(400, "tagline too long (max 200)") }
             if description.len() > 500 { return err_json(400, "description too long (max 500)") }
@@ -2029,10 +2693,13 @@ fn handle_put_settings(app: App, req: http::Request) -> http::Response {
             + ",\"tagline\":" + json_quote(tagline)
             + ",\"description\":" + json_quote(description)
             + ",\"footer\":" + json_quote(footer)
+            + ",\"show_credit\":" + json_quote(credit)
             + ",\"theme\":" + json_quote(theme)
+            + ",\"language\":" + json_quote(language)
             + "}"
             let mut eng = open_eng(app)
-            let _ = eng.store.put("postwisp/settings", json.as_bytes())
+            let key = "postwisp/settings/" + u.id.to_string()
+            let _ = eng.store.put(key, json.as_bytes())
             return ok_json(json)
         }
     }
@@ -2044,14 +2711,71 @@ fn handle_public_site(app: App, req: http::Request) -> http::Response {
 }
 
 
+// The header image of a post is the URL of its FIRST markdown image —
+// the line the editors manage (the Header image row / pw.setCover).
+// "" when there is none, so the home page and post lists can omit the
+// header entirely instead of rendering an empty frame.
+
+fn cover_url_of(source: String) -> String {
+    let b = source.bytes()
+    let n = b.len()
+    let mut i: i64 = 0
+    while i < n {
+        if b[i] == '!' as u8 && i + 1 < n && b[i + 1] == '[' as u8 {
+            match find_delim(b, i + 2, n, "]") {
+                Some(br) => {
+                    if br + 1 < n && b[br + 1] == '(' as u8 {
+                        let mut j = br + 2
+                        if j < n && b[j] == '<' as u8 {
+                            // angle-bracketed url: it ends at '>'
+                            match find_delim(b, j, n, ">") {
+                                Some(gt) => {
+                                    if gt + 1 < n && b[gt + 1] == ')' as u8 { return sub(source, j + 1, gt) }
+                                }
+                                None => ()
+                            }
+                        }
+                        // the url ends at ')' or at the first space (an
+                        // embed hint like " video" is not part of it)
+                        while j < n && b[j] != ')' as u8 && b[j] != ' ' as u8 { j += 1 }
+                        if j > br + 2 { return sub(source, br + 2, j) }
+                    }
+                }
+                None => ()
+            }
+        }
+        i += 1
+    }
+    ""
+}
+
+// Card text: the source minus markup. Image references (the header/embed
+// convention) are skipped whole so a card never leads with "!alt(url)";
+// the header image itself travels separately in the summary's "cover".
+
 fn excerpt_of(source: String) -> String {
     let mut out = String::new()
-    for c in source {
+    let b = source.bytes()
+    let n = b.len()
+    let mut i: i64 = 0
+    while i < n {
+        let c = source[i]
+        if c == '!' && i + 1 < n && b[i + 1] == '[' as u8 {
+            let end = find_sub(source, ")", i)
+            if end > i {
+                i = end + 1
+                continue
+            }
+        }
         let keep = c != '#' && c != '*' && c != '`' && c != '>' && c != '|' && c != '_' && c != '[' && c != ']'
         if keep {
-            if c == '\n' || c == '\r' { out.push(' ') }
+            if c == '\n' || c == '\r' || c == ' ' {
+                // whitespace collapses: no double spaces from dropped markup
+                if out.len() > 0 && out[out.len() - 1] != ' ' { out.push(' ') }
+            }
             else { out.push(c) }
         }
+        i += 1
     }
     let t = out.trim()
     if t.len() > 200 { return sub(t, 0, 200) + "..." }
@@ -2066,6 +2790,9 @@ fn post_summary_json(p: Post, username: String) -> String {
     + ",\"username\":" + json_quote(username)
     + ",\"tags\":" + json_quote(p.tags)
     + ",\"published_at\":" + p.published_at.to_string()
+    // the header image travels on its own field so a card shows it when
+    // it exists and nothing at all when it does not
+    + ",\"cover\":" + json_quote(cover_url_of(p.source))
     + ",\"excerpt\":" + json_quote(excerpt_of(p.source))
     + "}"
 }
@@ -2307,15 +3034,17 @@ fn router(app: App) -> router::Router {
         .get("/api/slug-check", fn(req: http::Request) -> http::Response { return handle_slug_check(app, req) })
         .post("/api/preview", fn(req: http::Request) -> http::Response { return handle_preview(app, req) })
         .post("/api/media", fn(req: http::Request) -> http::Response { return handle_upload_media(app, req) })
+        .get("/api/media", fn(req: http::Request) -> http::Response { return handle_list_media(app, req) })
+        .delete("/api/media/{id}", fn(req: http::Request) -> http::Response { return handle_delete_media(app, req) })
         .get("/theme.css", fn(req: http::Request) -> http::Response { return handle_theme_css(app, req) })
-        .get("/app.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, "app.css") })
-        .get("/theme-boot.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, "theme-boot.js") })
+        .get("/app.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, req, "app.css") })
+        .get("/theme-boot.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "theme-boot.js") })
         .get("/", fn(req: http::Request) -> http::Response { return handle_home(app, req) })
         .get("/posts", fn(req: http::Request) -> http::Response { return handle_list(app, req) })
         .get("/about", fn(req: http::Request) -> http::Response { return handle_about(app, req) })
-        .get("/editor", fn(req: http::Request) -> http::Response { return serve_web_file(app, "editor.html") })
-        .get("/settings", fn(req: http::Request) -> http::Response { return serve_web_file(app, "settings.html") })
-        .get("/admin", fn(req: http::Request) -> http::Response { return serve_web_file(app, "admin.html") })
+        .get("/editor", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "editor.html") })
+        .get("/settings", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "settings.html") })
+        .get("/admin", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "admin.html") })
         .get("/api/public/site", fn(req: http::Request) -> http::Response { return handle_public_site(app, req) })
         .get("/api/public/posts", fn(req: http::Request) -> http::Response { return handle_public_posts(app, req) })
         .get("/api/settings", fn(req: http::Request) -> http::Response { return handle_get_settings(app, req) })
@@ -2338,6 +3067,188 @@ fn main() {
 
 // ---------- tests ----------
 
+
+#[test]
+
+fn sniff_recognizes_av_containers_and_keeps_images() {
+    // images unchanged
+    assert_eq(sniff_content_type(#[0x89u8, 'P' as u8, 'N' as u8, 'G' as u8, 0, 0, 0, 0]), Some("image/png"))
+    assert_eq(sniff_content_type(#[0xFFu8, 0xD8, 0xFF, 0xE0]), Some("image/jpeg"))
+    // RIFF disambiguated: WEBP vs WAV
+    let webp = #['R' as u8, 'I' as u8, 'F' as u8, 'F' as u8, 0, 0, 0, 0, 'W' as u8, 'E' as u8, 'B' as u8, 'P' as u8]
+    assert_eq(sniff_content_type(webp), Some("image/webp"))
+    let wav = #['R' as u8, 'I' as u8, 'F' as u8, 'F' as u8, 0, 0, 0, 0, 'W' as u8, 'A' as u8, 'V' as u8, 'E' as u8]
+    assert_eq(sniff_content_type(wav), Some("audio/wav"))
+    // ISO container: M4A brand -> audio, anything else -> video/mp4
+    let m4a = #[0u8, 0, 0, 0, 'f' as u8, 't' as u8, 'y' as u8, 'p' as u8, 'M' as u8, '4' as u8, 'A' as u8, ' ' as u8]
+    assert_eq(sniff_content_type(m4a), Some("audio/mp4"))
+    let mp4 = #[0u8, 0, 0, 0, 'f' as u8, 't' as u8, 'y' as u8, 'p' as u8, 'i' as u8, 's' as u8, 'o' as u8, 'm' as u8]
+    assert_eq(sniff_content_type(mp4), Some("video/mp4"))
+    // EBML -> webm, OggS -> ogg, ID3/mp3 sync -> mpeg
+    assert_eq(sniff_content_type(#[0x1Au8, 0x45, 0xDF, 0xA3, 0, 0]), Some("video/webm"))
+    assert_eq(sniff_content_type(#[0x4Fu8, 'g' as u8, 'g' as u8, 'S' as u8]), Some("audio/ogg"))
+    assert_eq(sniff_content_type(#[0x49u8, 'D' as u8, '3' as u8, 4]), Some("audio/mpeg"))
+    assert_eq(sniff_content_type(#[0xFFu8, 0xFB, 0x90, 0x00]), Some("audio/mpeg"))
+    // unknown bytes are refused, not guessed
+    assert_eq(sniff_content_type(#[0u8, 1, 2, 3, 4, 5]), None)
+    assert_eq(max_media_bytes("image/png"), MAX_IMAGE_BYTES)
+    assert_eq(max_media_bytes("video/mp4"), MAX_AV_BYTES)
+    assert_eq(max_media_bytes("audio/mpeg"), MAX_AV_BYTES)
+}
+
+#[test]
+
+fn media_kind_hint_and_extension() {
+    // the explicit hint wins (uploaded URLs carry no extension)
+    assert_eq(media_kind("/u/media/abc", "video"), "video")
+    assert_eq(media_kind("/u/media/abc", "audio"), "audio")
+    // no hint: the extension says
+    assert_eq(media_kind("https://e.com/x.mp4", ""), "video")
+    assert_eq(media_kind("https://e.com/x.MP4", ""), "video")
+    assert_eq(media_kind("https://e.com/x.webm", ""), "video")
+    assert_eq(media_kind("https://e.com/x.mp3", ""), "audio")
+    assert_eq(media_kind("https://e.com/x.wav", ""), "audio")
+    // anything else stays an image
+    assert_eq(media_kind("https://e.com/x.png", ""), "")
+    assert_eq(media_kind("/u/media/abc", ""), "")
+    // a malformed hint is not a link at all, so kind never sees it
+    assert_eq(media_kind("u", "wrong"), "")
+}
+
+#[test]
+
+fn markdown_embeds_video_and_audio_players() {
+    // hinted embeds (uploaded media URLs have no extension)
+    let h = render_markdown("![clip](/u/media/abc video)\n\n![song](/u/media/def audio)\n")
+    assert_eq(h.contains("<video controls preload=\"metadata\" src=\"/u/media/abc\"></video>"), true)
+    assert_eq(h.contains("<audio controls preload=\"metadata\" src=\"/u/media/def\">song</audio>"), true)
+    assert_eq(h.contains("<img"), false)
+    // extension-based embeds
+    let h2 = render_markdown("![clip](https://e.com/x.mp4)\n")
+    assert_eq(h2.contains("<video controls"), true)
+    let h3 = render_markdown("![song](https://e.com/x.ogg)\n")
+    assert_eq(h3.contains("<audio controls"), true)
+    // a plain image is untouched
+    let h4 = render_markdown("![pic](/u/media/img1)\n")
+    assert_eq(h4.contains("<img src=\"/u/media/img1\""), true)
+    // a bogus hint word degrades to literal text, never a player
+    let h5 = render_markdown("![x](https://e.com/a.png bogus)\n")
+    assert_eq(h5.contains("<video"), false)
+    assert_eq(h5.contains("<audio"), false)
+    assert_eq(h5.contains("![x]"), true)
+    // the javascript: block still applies to player sources
+    let h6 = render_markdown("![x](javascript:alert(1) video)\n")
+    assert_eq(h6.contains("src=\"#\""), true)
+}
+
+#[test]
+
+fn range_header_parsing() {
+    let len = 1000
+    // a plain closed range
+    assert_eq(parse_range("bytes=0-99", len), Some((0, 99)))
+    // open end clamps to len-1
+    assert_eq(parse_range("bytes=500-", len), Some((500, 999)))
+    // end beyond len clamps
+    assert_eq(parse_range("bytes=0-9999", len), Some((0, 999)))
+    // suffix range: last 100 bytes; a suffix longer than the file starts at 0
+    assert_eq(parse_range("bytes=-100", len), Some((900, 999)))
+    assert_eq(parse_range("bytes=-5000", len), Some((0, 999)))
+    // unsatisfiable: start at/after len, or end before start
+    assert_eq(parse_range("bytes=1000-", len), Some((-1, -1)))
+    assert_eq(parse_range("bytes=900-800", len), Some((-1, -1)))
+    assert_eq(parse_range("bytes=-0", len), Some((-1, -1)))
+    // not a range we serve: whole file
+    assert_eq(parse_range("", len), None)
+    assert_eq(parse_range("bytes=0-99,200-299", len), None)
+    assert_eq(parse_range("items=0-99", len), None)
+    assert_eq(parse_range("bytes=x-y", len), None)
+    assert_eq(parse_range("bytes=", len), None)
+    // If-Range only re-authorizes on an exact ETag match
+    assert_eq(if_range_allows("\"abc\"", "\"abc\""), true)
+    assert_eq(if_range_allows("\"xyz\"", "\"abc\""), false)
+    assert_eq(if_range_allows("", "\"abc\""), false)
+}
+
+// ---------- i18n tests ----------
+
+#[test]
+
+fn i18n_catalog_is_complete_and_languages_line_up() {
+    // every row: key + one column per supported language, none empty
+    let langs = i18n_langs()
+    assert_eq(langs.len(), 4)
+    assert_eq(langs[0], ("en", "English"))
+    assert_eq(langs[1], ("de", "Deutsch"))
+    for row in i18n_catalog() {
+        assert_eq(row.len(), langs.len() + 1, "row " + row[0] + " must have a column per language")
+        for col in row {
+            assert_eq(col.len() > 0, true, "empty translation for " + row[0])
+        }
+    }
+    // codes in i18n_langs are exactly what valid_lang accepts
+    for (code, _) in langs {
+        assert_eq(valid_lang(code), true, code + " should be valid")
+    }
+    assert_eq(valid_lang("xx"), false)
+    assert_eq(valid_lang(""), false)
+    assert_eq(valid_lang("EN"), false, "codes are lowercase; headers are lowered before this")
+}
+
+#[test]
+
+fn tr_translates_falls_back_and_renders_unknown_keys_as_themselves() {
+    // a spot check per language: the German column really is German etc.
+    assert_eq(tr("en", "nav_posts"), "Posts")
+    assert_eq(tr("de", "nav_posts"), "Beiträge")
+    assert_eq(tr("fr", "nav_posts"), "Articles")
+    assert_eq(tr("es", "nav_posts"), "Publicaciones")
+    // an unsupported language falls back to English, never to the key
+    assert_eq(tr("xx", "nav_posts"), "Posts")
+    // an unknown key renders as itself: visible, so a missing entry is obvious
+    assert_eq(tr("de", "no_such_key"), "no_such_key")
+    // every non-English column differs from English for every key
+    // (column 0 is the key, column 1 is English)
+    for row in i18n_catalog() {
+        for i in 2..5 {
+            assert_eq(row[i] == row[1], false, row[0] + " column " + i.to_string() + " is a copy of English")
+        }
+    }
+    // the {tag} slot fills
+    assert_eq(tr_tag("de", "tag_title", "linux"), "Beiträge mit dem Tag \"linux\"")
+    assert_eq(tr_tag("en", "no_tag_posts", "x"), "No posts with the tag \"x\".")
+}
+
+#[test]
+
+fn dates_render_in_each_language() {
+    // 2024-03-05, midnight UTC; the formats match what Intl renders for the
+    // same locale, so card dates (client) and post dates (server) agree
+    let ms = codec::datetime::days_from_civil(2024, 3, 5) * 86_400_000
+    assert_eq(fmt_date("en", ms), "March 5, 2024")
+    assert_eq(fmt_date("de", ms), "5. März 2024")
+    assert_eq(fmt_date("fr", ms), "5 mars 2024")
+    assert_eq(fmt_date("es", ms), "5 de marzo de 2024")
+    // an unsupported language uses the English shape
+    assert_eq(fmt_date("xx", ms), "March 5, 2024")
+    // a day late in the year that needs no padding either way
+    let ms2 = codec::datetime::days_from_civil(2023, 12, 31) * 86_400_000
+    assert_eq(fmt_date("de", ms2), "31. Dezember 2023")
+}
+
+#[test]
+
+fn accept_language_picks_the_first_supported_primary_subtag() {
+    assert_eq(pick_accept_lang("de-DE,de;q=0.9,en;q=0.8"), "de")
+    assert_eq(pick_accept_lang("fr-CA,fr;q=0.9"), "fr")
+    assert_eq(pick_accept_lang("es-419,es;q=0.8,en;q=0.5"), "es")
+    assert_eq(pick_accept_lang("en-US,en;q=0.9"), "en")
+    // nothing we speak: fall through to the site setting
+    assert_eq(pick_accept_lang("zh-CN,zh;q=0.9,ja;q=0.8"), "")
+    assert_eq(pick_accept_lang(""), "")
+    // case and whitespace are tolerated
+    assert_eq(pick_accept_lang(" DE ; q=0.9 "), "de")
+}
 
 #[test]
 
@@ -2390,6 +3301,46 @@ fn zip_bytes_lays_out_valid_archive() {
     let z2 = zip_bytes(empty)
     assert_eq(z2.len(), 22)
     assert_eq(z2[0] == 80u8, true)
+}
+
+#[test]
+
+fn header_image_url_is_first_markdown_image() {
+    // a post with a cover: the first image's URL travels on its own
+    let with = "![Photo by Jane on Unsplash](https://images.unsplash.com/a?w=1600)\n\nFirst paragraph."
+    assert_eq(cover_url_of(with), "https://images.unsplash.com/a?w=1600")
+    // an embed hint after the url is not part of it
+    assert_eq(cover_url_of("![clip](/u/media/abc video)\n\ntext"), "/u/media/abc")
+    // the SECOND image is not a cover; the first wins wherever it sits
+    assert_eq(cover_url_of("# T\n\n![one](/a.png)\n\ntext\n\n![two](/b.png)"), "/a.png")
+    // angle-bracketed urls shed the brackets
+    assert_eq(cover_url_of("![x](<https://e.com/a b.png>)"), "https://e.com/a b.png")
+    // no image: empty, so cards and the post page omit the header entirely
+    assert_eq(cover_url_of("just text\n\nmore"), "")
+    assert_eq(cover_url_of(""), "")
+    // a bare ! or a broken reference is not an image
+    assert_eq(cover_url_of("wow! [not an image](u)"), "")
+    assert_eq(cover_url_of("![alt]( )"), "")
+}
+
+#[test]
+
+fn excerpt_skips_images_and_strips_markup() {
+    // the header image never leaks into card text
+    let e = excerpt_of("![Photo by Jane on Unsplash](https://x/a?w=1)\n\nSome **bold** words.")
+    assert_eq(e, "Some bold words.")
+    // embed hints are skipped with their image
+    assert_eq(excerpt_of("![clip](/u/media/abc video)\n\nBody text."), "Body text.")
+    // headings, emphasis, code markers dropped; newlines become spaces
+    assert_eq(excerpt_of("# Title\n\na *b* `c` [d](u)\n\ne"), "Title a b c d(u) e")
+    // long text truncates at 200 chars with an ellipsis
+    let mut long = String::new()
+    let mut k: i64 = 0
+    while k < 210 { long += "x"; k += 1 }
+    let t = excerpt_of(long)
+    assert_eq(t.len(), 203)
+    assert_eq(sub(t, 200, 203), "...")
+    assert_eq(excerpt_of(""), "")
 }
 
 #[test]

@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en"{{theme_attr}}>
+<html{{lang_attr}}{{theme_attr}}>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -10,14 +10,14 @@
 /* Inline theme — edit freely. Same tokens as /app.css (the admin design
    system), inlined so a public page is one request with no stylesheet
    dependency. Type: Inter (UI) · Source Serif 4 (prose) · JetBrains Mono. */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400;1,700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap');
 
 :root {
     --bg: #101318; --bg-raised: #161b22; --bg-overlay: #1a2029;
     --fg: #e8eaee; --fg-muted: #a2abbd; --fg-faint: #6c7689;
     --accent: #4fc3a7; --accent-strong: #66d9bb;
     --line: #27303c; --line-soft: #1f2732;
-    --font-ui: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-ui: 'Atkinson Hyperlegible', system-ui, -apple-system, 'Segoe UI', sans-serif;
     --font-serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
     --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
     --step--1: clamp(0.78rem, 0.74rem + 0.2vw, 0.84rem);
@@ -115,6 +115,8 @@ article h2 { font-size: var(--step-2); } article h3 { font-size: var(--step-1); 
 article p { margin: 0.9em 0; }
 article a { text-decoration: underline; text-underline-offset: 3px; }
 article img { max-width: 100%; border-radius: var(--radius-sm); }
+article video { max-width: 100%; border-radius: var(--radius-sm); display: block; }
+article audio { width: 100%; margin: 0.4em 0; }
 article code {
     font-family: var(--font-mono); font-size: 0.88em;
     background: color-mix(in srgb, var(--fg) 8%, transparent); border-radius: 5px; padding: 0.12em 0.35em;
@@ -146,9 +148,10 @@ footer.site-footer {
 <header class="site-header"><div class="wrap">
   <a class="brand" href="/">{{site_title}}</a>
   <nav class="site-nav">
-    <a href="/posts">Posts</a>
-    <a href="/about">About</a>
-    <button class="theme-toggle" type="button" onclick="pw.toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">&#9702;</button>
+    <a href="/posts">{{nav_posts}}</a>
+    <a href="/about">{{nav_about}}</a>
+    <button class="theme-toggle" type="button" onclick="pw.toggleTheme()" aria-label="{{theme_toggle}}" title="{{theme_toggle}}">&#9702;</button>
+    {{lang_switch}}
   </nav>
 </div></header>
 

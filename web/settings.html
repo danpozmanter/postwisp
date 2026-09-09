@@ -33,6 +33,10 @@
     <div class="field">
       <label for="title">Site title</label>
       <input id="title" maxlength="100" placeholder="My Blog">
+      <p class="hint">Your own title for your pages — the brand on your
+        posts and list pages, the feed title, and the tab title. Each
+        account has its own; a fresh one starts as the account name.
+        The landing page shows the first account's title.</p>
     </div>
     <div class="field">
       <label for="tagline">Tagline</label>
@@ -45,7 +49,18 @@
     </div>
     <div class="field">
       <label for="footer">Footer text</label>
-      <input id="footer" maxlength="300" placeholder="Powered by postwisp">
+      <input id="footer" maxlength="300" placeholder="A closing line, or leave empty">
+      <p class="hint">Shown at the bottom of your pages. When the credit
+        below is on and this text does not already mention postwisp,
+        "&middot;&nbsp;Powered by postwisp" is appended to it.</p>
+    </div>
+    <div class="field checkbox-field">
+      <label for="show_credit" class="checkbox-label">
+        <input type="checkbox" id="show_credit">
+        Show "Powered by postwisp" in the footer
+      </label>
+      <p class="hint">Off removes the credit from your pages entirely
+        (footer text, if any, still shows).</p>
     </div>
     <div class="field">
       <label for="theme">Site theme</label>
@@ -53,6 +68,19 @@
         <option value="dark">Dark (default)</option>
         <option value="light">Light</option>
       </select>
+    </div>
+    <div class="field">
+      <label for="language">Site language</label>
+      <select id="language">
+        <option value="en">English</option>
+        <option value="de">Deutsch</option>
+        <option value="fr">Français</option>
+        <option value="es">Español</option>
+      </select>
+      <p class="hint">The default language for visitors who have not picked
+        one. A visitor's own choice (the switcher in the site header) and
+        their browser's Accept-Language header both override it. Labels are
+        each language's native name.</p>
     </div>
     <div class="field">
       <label for="ukey">Unsplash access key (cover photos &amp; image search)</label>
@@ -68,7 +96,7 @@
   </div>
 </div>
 
-<footer class="site-footer"><div class="wrap">Powered by postwisp</div></footer>
+<footer class="site-footer"><div class="wrap"><a href="https://github.com/danpozmanter/postwisp" target="_blank" rel="noopener">Powered by postwisp</a></div></footer>
 
 <script>
 // theme applied pre-paint by /theme-boot.js (localStorage choice first,
@@ -105,7 +133,9 @@ $('save').onclick = async () => {
                 tagline: $('tagline').value.trim(),
                 description: $('description').value.trim(),
                 footer: $('footer').value.trim(),
-                theme: $('theme').value
+                show_credit: $('show_credit').checked ? 'true' : 'false',
+                theme: $('theme').value,
+                language: $('language').value
             })
         });
         flash('Saved.');
@@ -134,7 +164,9 @@ $('save').onclick = async () => {
     $('tagline').value = s.tagline || '';
     $('description').value = s.description || '';
     $('footer').value = s.footer || '';
+    $('show_credit').checked = (s.show_credit !== 'false');
     $('theme').value = (s.theme === 'light') ? 'light' : 'dark';
+    $('language').value = ['en', 'de', 'fr', 'es'].indexOf(s.language) >= 0 ? s.language : 'en';
 })();
 </script>
 </body>

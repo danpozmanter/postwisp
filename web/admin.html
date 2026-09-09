@@ -9,6 +9,12 @@
 /* admin-specific bits not in the shared design system */
 main form.auth { margin-top: 2.5rem; }
 .item .m code { font-family: var(--font-mono); font-size: 0.85em; }
+#media-panel .item.media-item { display: flex; gap: 0.75rem; align-items: center; }
+.media-thumb { flex: none; width: 72px; height: 54px; display: flex; align-items: center;
+  justify-content: center; overflow: hidden; border-radius: var(--radius-sm, 6px);
+  background: rgba(127,127,127,.15); }
+.media-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.media-glyph { font-size: 1.3rem; opacity: .7; }
 </style>
 <script src="/theme-boot.js"></script>
 <script>
@@ -95,6 +101,7 @@ function renderBar() {
          <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
          <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
          ${me.role === 'admin' ? '<button class="ghost" id="users-btn" onclick="toggleUsers()">Users</button>' : ''}
+         <button class="ghost" id="media-btn" title="Browse, copy and delete your uploaded files">Media</button>
          <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
          <button class="ghost" onclick="doLogout()">Log out</button>` : '';
 }
@@ -213,6 +220,68 @@ async function delPost(id) {
     document.getElementById('dash-err').textContent = e.message; return;
   }
   await loadDashboard();
+}
+
+// ---- media library panel ----
+let allMedia = null;
+async function toggleMedia() {
+  const panel = document.getElementById('media-panel');
+  if (!panel.classList.contains('hidden')) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  const list = document.getElementById('media-list');
+  list.innerHTML = '<div class="m" style="color:var(--muted)">Loading…</div>';
+  try {
+    allMedia = await api('GET', '/api/media');
+    renderMedia();
+  } catch (e) {
+    list.innerHTML = `<div class="err">Could not load media: ${esc(e.message)}</div>`;
+  }
+}
+function renderMedia() {
+  const list = document.getElementById('media-list');
+  if (!allMedia) return;
+  if (!allMedia.length) {
+    list.innerHTML = '<div class="m" style="color:var(--muted)">No uploads yet. Use the image button in the editor to upload a photo, video, or audio file.</div>';
+    return;
+  }
+  list.innerHTML = allMedia.map(m => {
+    const kind = m.content_type.split('/')[0];
+    const thumb = kind === 'image'
+      ? `<img src="${esc(m.url)}" alt="" loading="lazy">`
+      : `<span class="media-glyph">${kind === 'video' ? '&#9654;' : '&#9835;'}</span>`;
+    return `
+    <div class="item media-item">
+      <a class="media-thumb" href="${esc(m.url)}" target="_blank" rel="noopener">${thumb}</a>
+      <div style="min-width:0">
+        <div class="m">${esc(m.content_type)} · uploaded ${fmtDate(m.created_at)}${m.username !== (me && me.username) ? ' · ' + esc(m.username) : ''}</div>
+        <div class="m"><code>${esc(m.url)}</code></div>
+      </div>
+      <div class="row">
+        <button class="ghost" onclick="copyMedia('${esc(m.url)}')">copy link</button>
+        <button class="danger" onclick="delMedia('${esc(m.id)}')">delete</button>
+      </div>
+    </div>`;
+  }).join('');
+}
+function copyMedia(url) {
+  // transient input: clipboard needs a selected element in some browsers
+  const ta = document.createElement('textarea');
+  ta.value = url;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); } catch (e) {}
+  document.body.removeChild(ta);
+}
+async function delMedia(id) {
+  if (!confirm('Delete this file? Any post still embedding it keeps its text but loses the file.')) return;
+  try { await api('DELETE', '/api/media/' + id, {}); }
+  catch (e) {
+    document.getElementById('media-list').innerHTML =
+      `<div class="err">${esc(e.message)}</div><button class="ghost" onclick="toggleMedia();toggleMedia()">back</button>`;
+    return;
+  }
+  allMedia = allMedia.filter(m => m.id !== id);
+  renderMedia();
 }
 
 // ---- admin users panel ----
@@ -337,8 +406,20 @@ function insertAtCursor(text) {
   ta.focus();
 }
 
+// Embed hint for an uploaded file: " video" / " audio" when the markdown
+// needs a player element, "" when a plain image suffices. The URL a media
+// upload returns carries no extension, so the hint is the only signal the
+// renderer gets.
+function embedHint(file) {
+  if (file.type.startsWith('video/')) return ' video';
+  if (file.type.startsWith('audio/')) return ' audio';
+  return '';
+}
+
 async function uploadImage(file) {
   const el = document.getElementById('editor-err');
+  const hint = embedHint(file);
+  const cap = hint ? '50MB' : '5MB';
   try {
     const r = await fetch('/api/media', {
       method: 'POST',
@@ -350,14 +431,14 @@ async function uploadImage(file) {
       if (!resp.ok) throw new Error(d.error || 'upload failed');
       return d;
     });
-    insertAtCursor(`![${file.name}](${r.url})`);
-  } catch (e) { el.textContent = e.message; }
+    insertAtCursor(`![${file.name}](${r.url}${hint})`);
+  } catch (e) { el.textContent = e.message + (e.message.includes('too large') ? ` (max ${cap})` : ''); }
 }
 
 function pickImage() {
   const inp = document.createElement('input');
   inp.type = 'file';
-  inp.accept = 'image/png,image/jpeg,image/webp,image/gif';
+  inp.accept = 'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/ogg,audio/wav,audio/mp4';
   inp.onchange = () => { if (inp.files[0]) uploadImage(inp.files[0]); };
   inp.click();
 }
@@ -387,8 +468,10 @@ onReady(function () {
     document.getElementById('editor-slug').addEventListener('input', onSlugInput);
     document.getElementById('editor-source').addEventListener('drop', ev => {
       const f = ev.dataTransfer.files[0];
-      if (f && f.type.startsWith('image/')) { ev.preventDefault(); uploadImage(f); }
+      if (f && /^(image|video|audio)\//.test(f.type)) { ev.preventDefault(); uploadImage(f); }
     });
+    document.getElementById('media-panel').classList.add('hidden');
+    document.getElementById('media-btn').addEventListener('click', toggleMedia);
     boot();
   } catch (e) {
     showFatal(e && e.message ? e.message : String(e));
@@ -474,6 +557,11 @@ window.addEventListener('unhandledrejection', function (ev) {
       <div class="err" id="users-err"></div>
     </form>
     <div id="users-list"></div>
+  </div>
+  <div id="media-panel" class="hidden">
+    <h2>Media library</h2>
+    <p class="m" style="color:var(--muted)">Your uploaded photos, videos and audio. Copy a link to embed it in a post; delete removes it for good (blocked while a post still uses it).</p>
+    <div id="media-list"></div>
   </div>
 </section>
 

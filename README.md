@@ -36,7 +36,7 @@ with terndb as the embedded storage engine.
 
    | Template | Serves | Notes |
    |---|---|---|
-   | `templates/index.html` | `/` | home page; lists the latest posts |
+   | `templates/index.html` | `/` | home page; the **3 most recent** posts |
    | `templates/post.html` | `/<user>/<slug>` | one published post |
    | `templates/list.html` | `/posts` | all posts, and `/posts?tag=NAME` for one tag |
    | `templates/about.html` | `/about` | the frame around the about post (see below) |
@@ -66,9 +66,50 @@ dashboard + JSON API + public pages), behind any reverse proxy for TLS.
 
 The admin dashboard is served by the binary itself at `/admin` (a built-in
 page, not one of the templates). Authors log in there to write posts in
-markdown, upload images, and manage drafts. The admin creates further
+markdown, upload files, and manage drafts. The admin creates further
 author accounts; there is no open registration by design. Failed logins
 are rate-limited (5 failures per username per 10 minutes).
+
+## File uploads (photos, video, audio)
+
+The **Upload** button in both editors (and drag-and-drop onto the source
+pane) uploads a file to your own media library and inserts a reference at
+the cursor:
+
+- **Photos** — `![alt](/<user>/media/<id>)`, rendered as `<img>`; the
+  first image in a post is its cover.
+- **Video** — `![alt](/<user>/media/<id> video)`, rendered as a
+  `<video controls>` player.
+- **Audio** — `![alt](/<user>/media/<id> audio)`, rendered as an
+  `<audio controls>` player.
+
+A reference to any external URL ending in `.mp4` `.webm` `.mov` `.m4v`
+(or `.mp3` `.ogg` `.oga` `.wav` `.m4a` `.flac`) embeds a player too; the
+` video` / ` audio` hint is only needed for extensionless URLs like the
+media library's own. Supported uploads: jpg, png, webp, gif (max 5 MB);
+mp4, webm, mp3, ogg, wav, m4a (max 50 MB).
+
+Security posture, by design:
+
+- The **content type is sniffed from the file's magic bytes** at upload —
+  what the browser claims is never trusted — and anything that is not a
+  known signature is refused. Only `image/*`, `video/*`, and `audio/*`
+  types are ever served, with `X-Content-Type-Options: nosniff`, so an
+  upload can never become stored HTML/JS on your origin.
+- Markdown rendering is sanitized as before: raw HTML in source is
+  escaped, `javascript:` and `data:` URLs are blocked, links carry
+  `rel="noopener"` — including player sources.
+- Media ids are random 128-bit values; only the owning author (or an
+  admin) can list or delete them from the dashboard's **Media** panel,
+  and delete is refused with the post's title while any post still
+  embeds the file.
+
+Efficiency: media files are served with `Cache-Control: immutable` and a
+strong `ETag` (exact revalidation answers `304`), and every response —
+whole or partial — streams from disk in 256 KB chunks, so a 50 MB video
+never lands whole in memory. `Range` requests (with `If-Range`) are
+served as `206` partial content, which is what lets browsers seek in a
+video and iOS Safari play it at all.
 
 ## Cover photos & images (Unsplash)
 
@@ -91,13 +132,27 @@ The key is stored in your browser only (`localStorage`), never on the
 server — each author supplies their own. Without a key, everything else
 works; the button just asks for one.
 
+A post's header image is the first markdown image of its source, and it
+is the only image that gets special treatment: the post page hoists it
+into a header figure, and the home page / post list cards show it as a
+thumbnail. **A post with no header image shows no image frame anywhere**
+— not on its page, not in a card, just the text. The editor also accepts
+an uploaded image as the header: upload any image in the editor, move
+its reference to the top of the markdown (or just make it the first
+image), and it becomes the header.
+
 ## Look & feel
 
 The design system is shared by the public templates and the built-in
 admin pages, in both light and dark mode:
 
-- **Type**: Inter for UI, Source Serif 4 for prose, JetBrains Mono for
-  code — fluid `clamp()`-based sizes so text scales with the viewport.
+- **Type**: Atkinson Hyperlegible for UI, Source Serif 4 for prose,
+  JetBrains Mono for code — fluid `clamp()`-based sizes so text scales
+  with the viewport. Atkinson Hyperlegible (Braille Institute, free for
+  any use) is a legibility-first design — unambiguous letterforms
+  (Il1, O0), open counters, distinct pairs — and the best-supported
+  "easier to read" default available on Google Fonts; it falls back to
+  the system UI stack when offline.
 - **Theme**: dark by default; the site-wide choice is set on the Settings
   page, and each visitor's own toggle (in the header) takes precedence
   and persists. No flash of the wrong theme — it is applied pre-paint.
@@ -109,6 +164,32 @@ admin pages, in both light and dark mode:
 The public templates inline the same token set the admin stylesheet
 (`/app.css`) uses, so a page is one request with no stylesheet
 dependency — the tokens at the top of each file are the theming surface.
+
+## Internationalization
+
+The public pages (home, posts list, post, about, and the error pages)
+are translated into **English, German, French, and Spanish** — labels,
+headings, empty states, and the error-page text. Which language a
+visitor sees is decided in this order:
+
+1. **Their own choice** — the language switcher in the site header sets
+   a `postwisp-lang` cookie for a year.
+2. **Their browser** — the first supported primary subtag of
+   `Accept-Language`.
+3. **The site default** — the Site language selector on the Settings
+   page (English until someone changes it).
+
+The switcher's options always show each language's native name
+("Deutsch", "Español"), so a visitor can find their own whatever the
+current language is. Dates are localized too — the server renders post
+dates and the browser renders card dates in the same locale shape
+(en "March 5, 2024", de "5. März 2024"), so the two agree on a page.
+
+Your own content (post titles, tags, the about text, the tagline,
+footer, and everything on the admin dashboard) is yours and is never
+translated or overridden. Adding a language is one row per message in
+the `i18n_catalog` in `src/main.gos` plus its month names; the test
+suite fails if a row or translation is missing or is an English copy.
 
 ## HTTPS
 

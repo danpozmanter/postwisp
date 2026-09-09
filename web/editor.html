@@ -73,6 +73,7 @@
       <button type="button" class="btn" data-before="> " data-after="">Quote</button>
       <button type="button" class="btn" id="linkbtn">Link</button>
       <button type="button" class="btn" id="imgbtn">Image</button>
+      <button type="button" class="btn" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
     </div>
 
     <div class="editor-grid">
@@ -95,7 +96,7 @@
   </div>
 </div>
 
-<footer class="site-footer"><div class="wrap">Powered by postwisp</div></footer>
+<footer class="site-footer"><div class="wrap"><a href="https://github.com/danpozmanter/postwisp" target="_blank" rel="noopener">Powered by postwisp</a></div></footer>
 
 <script>
 // theme applied pre-paint by /theme-boot.js (localStorage choice first,
@@ -241,6 +242,43 @@ $('imgbtn').onclick = () => {
         syncCover();
     });
 };
+
+// ---- upload a local photo/video/audio file, then embed it ----
+async function uploadFile(file) {
+    const hint = file.type.startsWith('video/') ? ' video'
+        : file.type.startsWith('audio/') ? ' audio' : '';
+    const cap = hint ? '50MB' : '5MB';
+    try {
+        const r = await fetch('/api/media', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': file.type },
+            body: file,
+        }).then(async resp => {
+            const d = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(d.error || 'upload failed');
+            return d;
+        });
+        wrapSel('![' + file.name + '](' + r.url + hint + ')', '\n\n');
+        syncCover();
+    } catch (e) {
+        flash(e.message + (e.message.indexOf('too large') >= 0 ? ' (max ' + cap + ')' : ''), true);
+    }
+}
+$('uploadbtn').onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/ogg,audio/wav,audio/mp4';
+    inp.onchange = () => { if (inp.files[0]) uploadFile(inp.files[0]); };
+    inp.click();
+};
+$('source').addEventListener('drop', ev => {
+    const f = ev.dataTransfer.files[0];
+    if (f && /^(image|video|audio)\//.test(f.type)) {
+        ev.preventDefault();
+        uploadFile(f);
+    }
+});
 
 $('source').addEventListener('input', () => { updateWc(); previewSoon(); syncCover(); });
 $('save').onclick = () => save($('status').value);
