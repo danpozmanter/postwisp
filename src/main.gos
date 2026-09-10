@@ -17,6 +17,8 @@ use std::strings
 use std::hash::crc32
 use std::crypto::rand
 use std::env
+use std::net::smtp
+use std::sync
 
 use engine
 use codec
@@ -1426,6 +1428,233 @@ fn handle_logout(app: App, req: http::Request) -> http::Response {
     ok_json("{\"ok\":true}").with_header("Set-Cookie", "postwisp_session=; Path=/; Max-Age=0")
 }
 
+// ---------- account recovery over email ----------
+//
+// One flow covers both a lost username and a lost password: the login
+// screen takes an email address, and the account it belongs to (the first
+// one, if several share an address) receives a mail carrying the username
+// plus a single-use link that sets a new password. SMTP is env-configured
+// — a self-hosted blog keeps secrets out of the data directory and out of
+// the settings API:
+//
+//   PW_SMTP_HOST   server hostname; recovery answers 503 while unset
+//   PW_SMTP_PORT   port (default 587; 465 speaks TLS from the first byte)
+//   PW_SMTP_USER   username; empty = one unauthenticated message
+//   PW_SMTP_PASS   password for the username above
+//   PW_SMTP_FROM   envelope sender (default "postwisp@<host>")
+
+const RESET_TTL_MS: i64 = 60 * 60 * 1000  // a recovery link lives one hour
+const RECOVER_MAX_SENDS: i64 = 5          // one source, per login window
+const SMTP_TIMEOUT_MS: i64 = 8000         // a stuck SMTP talk never holds the router
+
+struct SmtpCfg {
+    host: String
+    port: i64
+    user: String
+    pass: String
+    from: String
+}
+
+
+fn smtp_config() -> SmtpCfg {
+    let host = env::var("PW_SMTP_HOST").unwrap_or("")
+    let port = env::var("PW_SMTP_PORT").unwrap_or("587").to_i64().unwrap_or(587)
+    let user = env::var("PW_SMTP_USER").unwrap_or("")
+    let pass = env::var("PW_SMTP_PASS").unwrap_or("")
+    let mut from = env::var("PW_SMTP_FROM").unwrap_or("")
+    if from.len() == 0 && host.len() > 0 { from = "postwisp@" + host }
+    return SmtpCfg { host: host, port: port, user: user, pass: pass, from: from }
+}
+
+
+fn smtp_addr(c: SmtpCfg) -> String {
+    c.host + ":" + c.port.to_string()
+}
+
+
+// One message, one call, under a deadline: the send runs as a cohort child
+// so a relay that never answers cannot hold the single-threaded router.
+
+fn send_recovery_mail(c: SmtpCfg, to: String, username: String, link: String) -> bool {
+    let subject = "Your postwisp account recovery"
+    let body = "Hello,\n\n"
+        + "Someone asked to recover access to a postwisp account registered"
+        + " with this email address.\n\n"
+        + "Your username: " + username + "\n\n"
+        + "To set a new password, open this link within 60 minutes:\n"
+        + link + "\n\n"
+        + "If you did not ask for this, ignore the mail - the link expires"
+        + " on its own and nothing else changes.\n"
+    let sent = sync::with_timeout(|| {
+        if c.user.len() > 0 {
+            return smtp::send_auth(smtp_addr(c), c.from, to, subject, body, c.user, c.pass)
+        }
+        return smtp::send(smtp_addr(c), c.from, to, subject, body)
+    }, SMTP_TIMEOUT_MS)
+    match sent {
+        Ok(Ok(())) => return true
+        Ok(Err(e)) => {
+            eprintln("postwisp: recovery mail to " + to + " failed: " + e.to_string())
+            return false
+        }
+        Err(e) => {
+            eprintln("postwisp: recovery mail to " + to + " timed out: " + e.to_string())
+            return false
+        }
+    }
+}
+
+
+// Reset tokens live in the kv half of the engine (no schema change), as
+// "postwisp/reset/<token>" -> "<user id>|<expires at ms>". take both
+// validates and consumes: a token that answers Some(uid) is already
+// deleted, so a replayed link is just another invalid one.
+
+fn put_reset_token(eng: &mut engine::Engine, token: String, user_id: i64, expires_at: i64) {
+    let _ = eng.store.put("postwisp/reset/" + token,
+        (user_id.to_string() + "|" + expires_at.to_string()).as_bytes())
+}
+
+
+fn take_reset_token(eng: &mut engine::Engine, token: String) -> Option<i64> {
+    let key = "postwisp/reset/" + token
+    match eng.store.get(key) {
+        kv::Read::Value(b) => {
+            // consumed on read: valid, expired or malformed, the row is dead
+            let _ = eng.store.delete(key)
+            match String::from_utf8(b) {
+                Ok(s) => {
+                    let bar = find_sub(s, "|", 0)
+                    if bar <= 0 { return None }
+                    let uid = sub(s, 0, bar).to_i64().unwrap_or(-1)
+                    let exp = sub(s, bar + 1, s.len()).to_i64().unwrap_or(0)
+                    if uid >= 0 && exp > now_ms() { return Some(uid) }
+                    return None
+                }
+                Err(_) => return None
+            }
+        }
+        // Absent and Fault are the same answer here: no token to use
+        _ => return None
+    }
+}
+
+
+// Recovery sends are capped per source, reusing the login-attempt rows: a
+// row under the reserved username "recover" is one attempted mail. The
+// shared window keeps the table self-pruning, and login_locked's per-source
+// budget simply counts these rows like any other attempt.
+
+fn recover_sends_capped(eng: &mut engine::Engine, ip: String) -> bool {
+    let now = now_ms()
+    let mut n: i64 = 0
+    match eng.exec("SELECT * FROM login_attempts") {
+        Ok(res) => {
+            for row in res.rows {
+                if row.vals[0].s == ip && row.vals[1].s == "recover" && now - row.vals[2].i < LOGIN_WINDOW_MS { n += 1 }
+            }
+        }
+        Err(_) => ()
+    }
+    n >= RECOVER_MAX_SENDS
+}
+
+
+// The link's origin: the request's own Host header, https only when a
+// proxy says so. X-Forwarded-Proto is trusted here because the worst a lie
+// can do is render a link with the wrong scheme, never a wrong host.
+
+fn base_url_of(req: http::Request) -> String {
+    let mut host = header_value(req, "Host")
+    if host.len() == 0 { host = "127.0.0.1:8080" }
+    let mut scheme = "http"
+    if header_value(req, "X-Forwarded-Proto").to_lowercase() == "https" { scheme = "https" }
+    return scheme + "://" + host
+}
+
+
+// The login screen's "forgot username or password" endpoint. One generic
+// answer for every address: an unknown address and a sent mail answer
+// alike, so the endpoint cannot be used to discover which addresses have
+// accounts. A mail that could not be sent is named on the console and
+// still answers ok — the operator reads the log, an attacker reads
+// nothing.
+
+fn handle_recover(app: App, req: http::Request) -> http::Response {
+    let f = parse_body(req.body)
+    let email = field(f, "email").trim().to_lowercase()
+    if email.len() == 0 || email.len() > 254 || !strings::contains(email, "@") {
+        return err_json(400, "a valid email address is required")
+    }
+    let cfg = smtp_config()
+    if cfg.host.len() == 0 {
+        return err_json(503, "recovery is not configured on this server (set PW_SMTP_HOST)")
+    }
+    let ip = peer_key(req)
+    let mut eng = open_eng(app)
+    if recover_sends_capped(&mut eng, ip) {
+        return err_json(429, "too many recovery mails requested, try again later")
+    }
+    let store = read_store(&mut eng)
+    let mut found: Option<User> = None
+    for u in store.users {
+        if u.email.to_lowercase() == email { found = Some(u); break }
+    }
+    match found {
+        Some(u) => {
+            let now = now_ms()
+            let token = new_token("r:" + now.to_string() + ":" + u.username)
+            put_reset_token(&mut eng, token, u.id, now + RESET_TTL_MS)
+            // the attempt is counted before the send, so a failing relay
+            // cannot be retried into a mail flood
+            exec_sql(&mut eng, "INSERT INTO login_attempts VALUES (" + sqlq(ip) + ", 'recover', " + now.to_string() + ")")
+            exec_sql(&mut eng, "DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string() + ")")
+            let link = base_url_of(req) + "/dashboard?recover=" + token
+            let _ = send_recovery_mail(cfg, u.email, u.username, link)
+        }
+        None => ()
+    }
+    return ok_json("{\"ok\":true}")
+}
+
+
+// The far end of the mail link: one token, one password. The token is
+// consumed only after the password passes policy, so a typo does not burn
+// the link; using it drops every session the account had, so a link that
+// reached the wrong inbox leaves nothing standing, and the caller is
+// logged straight into the dashboard with the new password.
+
+fn handle_reset(app: App, req: http::Request) -> http::Response {
+    let f = parse_body(req.body)
+    let token = field(f, "token")
+    let password = field(f, "password")
+    if token.len() == 0 { return err_json(400, "a recovery token is required") }
+    if !valid_password(password) {
+        return err_json(400, "password must be at least 10 chars with a digit and a non-alphanumeric")
+    }
+    let mut eng = open_eng(app)
+    match take_reset_token(&mut eng, token) {
+        None => return err_json(400, "this recovery link is invalid or has expired — request a new one from the login screen")
+        Some(uid) => {
+            let store = read_store(&mut eng)
+            match find_user(store, uid) {
+                None => return err_json(400, "the account no longer exists")
+                Some(u) => {
+                    exec_sql(&mut eng, "UPDATE users SET password = " + sqlq(hash_password(password))
+                        + " WHERE rowid = " + uid.to_string())
+                    exec_sql(&mut eng, "DELETE FROM sessions WHERE user_id = " + uid.to_string())
+                    let now = now_ms()
+                    let sess = new_token("s:" + now.to_string() + ":" + u.username)
+                    exec_sql(&mut eng, "INSERT INTO sessions VALUES (" + sqlq(sess) + ", " + uid.to_string()
+                        + ", " + now.to_string() + ", " + (now + 30 * 24 * 3600 * 1000).to_string() + ")")
+                    return ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + sess
+                        + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                }
+            }
+        }
+    }
+}
+
 
 fn user_json(u: User) -> String {
     "{\"id\":" + u.id.to_string() + ",\"username\":" + json_quote(u.username)
@@ -2103,8 +2332,6 @@ fn i18n_catalog() -> Vec<Vec<String>> {
         #["empty_home", "No posts yet. The first post will appear here.", "Noch keine Beiträge. Der erste Beitrag erscheint hier.", "Aucun article pour le moment. Le premier apparaîtra ici.", "Aún no hay publicaciones. La primera aparecerá aquí."],
         #["empty_list", "No posts yet.", "Noch keine Beiträge.", "Aucun article pour le moment.", "Aún no hay publicaciones."],
         #["no_tag_posts", "No posts with the tag \"{tag}\".", "Keine Beiträge mit dem Tag \"{tag}\".", "Aucun article avec l'étiquette « {tag} ».", "No hay publicaciones con la etiqueta \"{tag}\"."],
-        #["all_posts_title", "All posts", "Alle Beiträge", "Tous les articles", "Todas las publicaciones"],
-        #["all_posts_sub", "Everything published on this blog.", "Alles, was auf diesem Blog veröffentlicht ist.", "Tout ce qui est publié sur ce blog.", "Todo lo publicado en este blog."],
         #["tag_title", "Posts tagged \"{tag}\"", "Beiträge mit dem Tag \"{tag}\"", "Articles étiquetés « {tag} »", "Publicaciones con la etiqueta \"{tag}\""],
         #["tag_sub", "Every published post with the tag \"{tag}\".", "Alle veröffentlichten Beiträge mit dem Tag \"{tag}\".", "Tous les articles publiés avec l'étiquette « {tag} ».", "Todas las publicaciones con la etiqueta \"{tag}\"."],
         #["about_title", "About", "Über", "À propos", "Acerca de"],
@@ -2424,12 +2651,11 @@ fn site_fields(app: App, lang: String, owner: i64 = -1, owner_name: String = "")
     m.insert("latest", tr(lang, "latest"))
     m.insert("empty_home", tr(lang, "empty_home"))
     m.insert("empty_list", tr(lang, "empty_list"))
-    m.insert("all_posts_title", tr(lang, "all_posts_title"))
-    m.insert("all_posts_sub", tr(lang, "all_posts_sub"))
     m.insert("about_title", tr(lang, "about_title"))
     // attribute-escaped copies: the list page's client script fills the
     // {tag} slot from the active chip, so these arrive via data-* attrs
     m.insert("no_tag_posts_attr", escape_html(tr(lang, "no_tag_posts")))
+    m.insert("tag_title_attr", escape_html(tr(lang, "tag_title")))
     m.insert("tag_sub_attr", escape_html(tr(lang, "tag_sub")))
     if theme == "light" { m.insert("theme_attr", " data-theme=\"light\"") }
     else { m.insert("theme_attr", "") }
@@ -2464,15 +2690,13 @@ fn handle_list(app: App, req: http::Request) -> http::Response {
     let lang = lang_of(app, req)
     let tag = query_value(req, "tag")
     let mut fields = Map::new()
+    // The list page carries no heading of its own: the cards speak for
+    // themselves. A tag filter still titles the tab; the on-page heading
+    // pair is filled client-side from data-* attrs.
     if tag.len() > 0 {
-        let t = tr_tag(lang, "tag_title", escape_html(tag))
-        fields.insert("title", escape_html(t))
-        fields.insert("page_title", escape_html(t))
-        fields.insert("page_sub", escape_html(tr_tag(lang, "tag_sub", escape_html(tag))))
+        fields.insert("title", escape_html(tr_tag(lang, "tag_title", escape_html(tag))))
     } else {
-        fields.insert("title", tr(lang, "all_posts_title"))
-        fields.insert("page_title", tr(lang, "all_posts_title"))
-        fields.insert("page_sub", tr(lang, "all_posts_sub"))
+        fields.insert("title", escape_html(tr(lang, "nav_posts")))
     }
     return serve_template(app, lang, "list.html", fields)
 }
@@ -3153,6 +3377,8 @@ fn router(app: App) -> router::Router {
         .get("/setup", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
         .post("/api/setup", fn(req: http::Request) -> http::Response { return handle_setup(app, req) })
         .post("/api/login", fn(req: http::Request) -> http::Response { return handle_login(app, req) })
+        .post("/api/recover", fn(req: http::Request) -> http::Response { return handle_recover(app, req) })
+        .post("/api/reset", fn(req: http::Request) -> http::Response { return handle_reset(app, req) })
         .post("/api/logout", fn(req: http::Request) -> http::Response { return handle_logout(app, req) })
         .get("/api/me", fn(req: http::Request) -> http::Response { return handle_me(app, req) })
         .post("/api/users", fn(req: http::Request) -> http::Response { return handle_create_user(app, req) })
@@ -3822,6 +4048,143 @@ fn setup_login_persists_a_working_session() {
     assert_eq(me.status, 200,
         "the session cookie set by setup must authenticate /api/me, got "
         + me.status.to_string())
+}
+
+// ---------- account recovery tests ----------
+//
+// The SMTP side is exercised against a port nothing listens on: the send
+// fails fast, which is exactly the path a misconfigured relay takes.
+
+fn treq(path: String, body: String) -> http::Request {
+    http::Request {
+        method: "POST"
+        path: path
+        query: ""
+        query_pairs: #[]
+        headers: #[]
+        body: body
+        raw_body: #[]
+        peer_addr: "127.0.0.1:1"
+    }
+}
+
+#[test]
+
+fn reset_tokens_are_single_use_and_expire() {
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    let app = new_app()
+    let mut eng = open_eng(app)
+    // a fresh token answers once, then never again
+    put_reset_token(&mut eng, "tok-alice", 7, now_ms() + RESET_TTL_MS)
+    assert_eq(take_reset_token(&mut eng, "tok-alice"), Some(7))
+    assert_eq(take_reset_token(&mut eng, "tok-alice"), None)
+    // an expired token is consumed but answers nothing
+    put_reset_token(&mut eng, "tok-old", 8, now_ms() - 1)
+    assert_eq(take_reset_token(&mut eng, "tok-old"), None)
+    // an unknown token and a malformed row are both just invalid
+    assert_eq(take_reset_token(&mut eng, "tok-nope"), None)
+    let _ = eng.store.put("postwisp/reset/tok-bad", "junk".as_bytes())
+    assert_eq(take_reset_token(&mut eng, "tok-bad"), None)
+}
+
+#[test]
+
+fn recover_answers_are_generic_and_capped() {
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    env::set_var("PW_SMTP_HOST", "")
+    let app = new_app()
+    let mut eng = open_eng(app)
+    let hash = hash_password("first password1!")
+    let uid = insert_user_row(&mut eng, "alice", "alice@example.net", hash, "author")
+    assert_eq(uid > 0, true, "the user row must exist")
+
+    // unconfigured server: a named 503, never a fake "check your mail"
+    let r_off = handle_recover(app, treq("/api/recover", "{\"email\":\"alice@example.net\"}"))
+    assert_eq(r_off.status, 503)
+
+    // configured relay (a port nothing listens on): a known address and an
+    // unknown one answer EXACTLY alike — same status, same body
+    env::set_var("PW_SMTP_HOST", "127.0.0.1")
+    env::set_var("PW_SMTP_PORT", "1")
+    let r_known = handle_recover(app, treq("/api/recover", "{\"email\":\"alice@example.net\"}"))
+    let r_unknown = handle_recover(app, treq("/api/recover", "{\"email\":\"nobody@example.net\"}"))
+    assert_eq(r_known.status, 200)
+    assert_eq(r_unknown.status, 200, "an unknown address must answer the same status")
+    assert_eq(r_known.body, r_unknown.body, "an unknown address must answer the same body")
+
+    // the send was counted: one row is under the cap, the limit trips at
+    // RECOVER_MAX_SENDS, and past it the endpoint answers 429
+    let mut eng2 = open_eng(app)
+    assert_eq(recover_sends_capped(&mut eng2, "127.0.0.1"), false, "one send is under the cap")
+    let mut k: i64 = 1
+    while k < RECOVER_MAX_SENDS {
+        let _ = handle_recover(app, treq("/api/recover", "{\"email\":\"alice@example.net\"}"))
+        k += 1
+    }
+    let mut eng3 = open_eng(app)
+    assert_eq(recover_sends_capped(&mut eng3, "127.0.0.1"), true, "the cap must trip at the limit")
+    let r_capped = handle_recover(app, treq("/api/recover", "{\"email\":\"alice@example.net\"}"))
+    assert_eq(r_capped.status, 429)
+
+    // leave the process environment clean for the tests that follow
+    env::set_var("PW_SMTP_HOST", "")
+    env::set_var("PW_SMTP_PORT", "")
+}
+
+#[test]
+
+fn reset_sets_password_logs_in_and_kills_old_sessions() {
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    let app = new_app()
+    let mut eng = open_eng(app)
+    let hash = hash_password("first password1!")
+    let uid = insert_user_row(&mut eng, "alice", "alice@example.net", hash, "author")
+    assert_eq(uid > 0, true, "the user row must exist")
+    // a session that must not survive the reset
+    exec_sql(&mut eng, "INSERT INTO sessions VALUES ('oldsess', " + uid.to_string() + ", 1, 2)")
+    put_reset_token(&mut eng, "tok-reset", uid, now_ms() + RESET_TTL_MS)
+
+    // a weak password is refused WITHOUT burning the link
+    let r_weak = handle_reset(app, treq("/api/reset", "{\"token\":\"tok-reset\",\"password\":\"short1!\"}"))
+    assert_eq(r_weak.status, 400)
+
+    // the real reset: 200, a fresh session cookie, and the caller logged in
+    let r = handle_reset(app, treq("/api/reset", "{\"token\":\"tok-reset\",\"password\":\"second password2!\"}"))
+    assert_eq(r.status, 200)
+    let mut cookie = ""
+    for (n, v) in r.headers {
+        if n.to_lowercase() == "set-cookie" { cookie = v }
+    }
+    assert_eq(cookie.starts_with("postwisp_session="), true, "reset must log the user in")
+
+    // the new password verifies, the old one does not
+    let mut eng2 = open_eng(app)
+    let store = read_store(&mut eng2)
+    match find_user_by_name(store, "alice") {
+        Some(u) => {
+            assert_eq(verify_password(u.password, "second password2!"), true)
+            assert_eq(verify_password(u.password, "first password1!"), false)
+        }
+        None => assert(false, "alice must still exist after the reset")
+    }
+    // the pre-reset session is gone; exactly the fresh one remains
+    let mut old_alive = false
+    let mut live: i64 = 0
+    for s in store.sessions {
+        if s.token == "oldsess" { old_alive = true }
+        if s.user_id == uid { live += 1 }
+    }
+    assert_eq(old_alive, false, "the pre-reset session must be gone")
+    assert_eq(live, 1, "exactly the fresh session remains")
+    // a replayed token is just another invalid one
+    let r_replay = handle_reset(app, treq("/api/reset", "{\"token\":\"tok-reset\",\"password\":\"third password3!\"}"))
+    assert_eq(r_replay.status, 400)
 }
 
 // ---------- end of tests ----------

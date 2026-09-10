@@ -59,6 +59,7 @@ function toggleTheme() {
 let me = null;
 let editing = null;        // post being edited, or null for a new one
 let slugTouched = false;   // stop auto-following once the user edits the slug field
+let recoverToken = null;   // one-time token from a ?recover= link, consumed by /api/reset
 
 // ---- views ----
 // Populated in onReady(): this script runs in <head>, before the DOM exists.
@@ -66,12 +67,12 @@ let slugTouched = false;   // stop auto-following once the user edits the slug f
 // never through show(), so it does not need a section of its own.
 const views = {};
 function initViews() {
-  for (const id of ['view-setup', 'view-login', 'view-dashboard', 'view-editor', 'view-account'])
+  for (const id of ['view-setup', 'view-login', 'view-recover', 'view-reset', 'view-dashboard', 'view-editor', 'view-account'])
     views[id] = document.getElementById(id);
 }
 function show(id) {
   for (const k in views) views[k].classList.toggle('hidden', k !== id);
-  document.getElementById('bar').classList.toggle('hidden', id === 'view-setup' || id === 'view-login');
+  document.getElementById('bar').classList.toggle('hidden', id === 'view-setup' || id === 'view-login' || id === 'view-recover' || id === 'view-reset');
 }
 
 // ---- boot ----
@@ -88,6 +89,13 @@ async function boot() {
     if (e.status !== 401) netErr = e.message;
   }
   if (netErr) showFatal('Could not reach the postwisp server: ' + netErr);
+  // a recovery link from email (?recover=<token>) goes straight to the
+  // password form whatever the session state — the token is the authority
+  if (params.get('recover')) {
+    recoverToken = params.get('recover');
+    show('view-reset');
+    return;
+  }
   if (me) { renderBar(); await loadDashboard(); return; }
   const site = await api('GET', '/api/public/site').catch(() => null);
   const setupPending = !!(site && site.setup_pending);
@@ -181,6 +189,41 @@ async function doLogout() {
   try { await api('POST', '/api/logout', {}); } catch (e) {}
   me = null;
   show('view-login');
+}
+
+// ---- account recovery ----
+// One flow for both a lost username and a lost password: the mail carries
+// the username plus a single-use link. The server's answers are generic by
+// design, so the UI never claims the address is or is not registered.
+async function doRecover(ev) {
+  ev.preventDefault();
+  const err = document.getElementById('recover-err');
+  const sent = document.getElementById('recover-sent');
+  err.textContent = '';
+  sent.hidden = true;
+  const email = document.getElementById('recover-email').value.trim();
+  try {
+    await api('POST', '/api/recover', { email: email });
+    sent.textContent = 'If that address belongs to an account here, a recovery mail is on its way. It may take a minute or two.';
+    sent.hidden = false;
+  } catch (e) { err.textContent = e.message; }
+}
+
+async function doReset(ev) {
+  ev.preventDefault();
+  const err = document.getElementById('reset-err');
+  err.textContent = '';
+  const pw = document.getElementById('reset-password').value;
+  const pw2 = document.getElementById('reset-password2').value;
+  if (pw !== pw2) { err.textContent = 'The two passwords do not match.'; return; }
+  try {
+    // the answer carries a fresh session cookie, so /api/me logs straight in
+    await api('POST', '/api/reset', { token: recoverToken, password: pw });
+    me = await api('GET', '/api/me');
+    renderBar();
+    history.replaceState(null, '', '/dashboard');
+    await loadDashboard();
+  } catch (e) { err.textContent = e.message; }
 }
 
 // ---- dashboard ----
@@ -526,6 +569,11 @@ onReady(function () {
     initViews();
     document.getElementById('setup-form').addEventListener('submit', doSetup);
     document.getElementById('login-form').addEventListener('submit', doLogin);
+    document.getElementById('login-recover').addEventListener('click', () => show('view-recover'));
+    document.getElementById('recover-form').addEventListener('submit', doRecover);
+    document.getElementById('recover-back').addEventListener('click', () => show('view-login'));
+    document.getElementById('reset-form').addEventListener('submit', doReset);
+    document.getElementById('reset-back').addEventListener('click', () => { recoverToken = null; show('view-recover'); });
     document.getElementById('users-form').addEventListener('submit', createUser);
     document.getElementById('account-form').addEventListener('submit', saveAccount);
     document.getElementById('search').addEventListener('input', renderDashboard);
@@ -604,6 +652,38 @@ window.addEventListener('unhandledrejection', function (ev) {
     <input type="password" id="login-password" required autocomplete="current-password">
     <div class="err" id="login-err"></div>
     <button type="submit">Log in</button>
+    <button type="button" class="ghost" id="login-recover" style="margin-top:.5rem">Lost username or password?</button>
+  </form>
+</section>
+
+<section id="view-recover" class="hidden">
+  <form id="recover-form" class="auth">
+    <h1>Recover your account</h1>
+    <p class="m" style="color:var(--muted)">Enter the email address you signed up
+      with. If it belongs to an account on this server, a mail arrives with the
+      username and a link to set a new password.</p>
+    <label>Email address</label>
+    <input type="email" id="recover-email" required autocomplete="email">
+    <div class="err" id="recover-err"></div>
+    <p class="m" id="recover-sent" style="color:var(--muted)" hidden></p>
+    <button type="submit">Send recovery mail</button>
+    <button type="button" class="ghost" id="recover-back" style="margin-top:.5rem">Back to log in</button>
+  </form>
+</section>
+
+<section id="view-reset" class="hidden">
+  <form id="reset-form" class="auth">
+    <h1>Set a new password</h1>
+    <p class="m" style="color:var(--muted)">You followed a recovery link. Choose a
+      new password (min 10 chars, a digit, a non-alphanumeric); you are logged
+      in with it right away.</p>
+    <label>New password</label>
+    <input type="password" id="reset-password" required autocomplete="new-password">
+    <label>Repeat new password</label>
+    <input type="password" id="reset-password2" required autocomplete="new-password">
+    <div class="err" id="reset-err"></div>
+    <button type="submit">Set password and log in</button>
+    <button type="button" class="ghost" id="reset-back" style="margin-top:.5rem">Request a new recovery mail</button>
   </form>
 </section>
 

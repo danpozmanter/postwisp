@@ -43,7 +43,7 @@ with terndb as the embedded storage engine.
 
    Placeholders `{{title}}`, `{{site_title}}`, `{{tagline}}`, `{{footer}}`,
    `{{content}}`, `{{date}}`, `{{author_part}}`, `{{tags_part}}`,
-   `{{page_title}}`, `{{page_sub}}`, `{{theme_attr}}`, `{{feed_url}}` are
+   `{{theme_attr}}`, `{{feed_url}}` are
    filled per page; everything else is yours.
 
    Note there is no `landing.html` or `post-list.html` to find: the home
@@ -211,6 +211,35 @@ still only sends it over the proxied HTTPS origin.
 Storage is append-only files under `data/`. With the server stopped (or
 from a filesystem snapshot), copy the `data/` directory verbatim.
 
+## Account recovery over email
+
+A user who loses their username or password can recover both from the
+login screen: **Lost username or password?** takes the email address they
+signed up with, and the account it belongs to receives one mail carrying
+the username plus a single-use link (valid one hour) that sets a new
+password and logs straight in. The mail names the username, so one flow
+covers both cases.
+
+Recovery needs an SMTP relay, configured through the environment (never
+stored in the data directory or reachable from the settings API):
+
+    PW_SMTP_HOST   mail server hostname; recovery answers 503 while unset
+    PW_SMTP_PORT   port (default 587)
+    PW_SMTP_USER   SMTP username; leave empty for an unauthenticated relay
+    PW_SMTP_PASS   password for PW_SMTP_USER
+    PW_SMTP_FROM   envelope sender (default "postwisp@<host>")
+
+Behaviour worth knowing:
+
+- The answer to a recovery request is always the same generic "on its
+  way", whether or not the address belongs to an account — the endpoint
+  never confirms or denies an address.
+- Requests are capped per source (5 per 10 minutes, shared with the
+  login-attempt window), a stuck relay times out after 8 seconds instead
+  of holding the server, and a used or expired link is dead: a replayed
+  one answers "invalid or expired, request a new one".
+- Setting a new password revokes every session the account had open.
+
 ## Development
 
 - `gos run .` — run from source (templates then load from `./templates/`)
@@ -218,7 +247,8 @@ from a filesystem snapshot), copy the `data/` directory verbatim.
 - `gos build` — debug binary
 - Environment overrides: `PW_DATA` (data dir, default `data/`),
   `PW_TEMPLATES` (public templates, default `templates/`),
-  `PW_WEB` (built-in admin/editor pages, default `web/`)
+  `PW_WEB` (built-in admin/editor pages, default `web/`), and the
+  `PW_SMTP_*` set for account recovery (see above)
 
 ## Password hashing note
 
