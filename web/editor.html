@@ -5,7 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Editor — postwisp</title>
 <link rel="stylesheet" href="/app.css">
+<link rel="stylesheet" href="/milkdown.css">
 <script src="/theme-boot.js"></script>
+<script src="/milkdown.js"></script>
 </head>
 <body>
 <header class="site-header"><div class="wrap">
@@ -28,18 +30,17 @@
 
   <div id="neterr" hidden class="err"></div>
 
+  <div id="restore" hidden class="notice">
+    This browser has unsaved edits to this post from an earlier session.
+    <button type="button" class="btn" id="restore-yes">Restore</button>
+    <button type="button" class="btn ghost" id="restore-no">Discard</button>
+  </div>
+
   <div id="editor" hidden>
     <div class="meta-row">
       <div class="field">
         <label for="title">Title</label>
         <input id="title" maxlength="200" placeholder="Post title">
-      </div>
-      <div class="field">
-        <label for="status">Status</label>
-        <select id="status">
-          <option value="draft">Draft</option>
-          <option value="published">Published</option>
-        </select>
       </div>
     </div>
     <div class="meta-row">
@@ -66,21 +67,14 @@
     </div>
 
     <div class="toolbar">
-      <button type="button" class="btn" data-before="**" data-after="**"><b>B</b></button>
-      <button type="button" class="btn" data-before="*" data-after="*"><i>I</i></button>
-      <button type="button" class="btn" data-before="## " data-after="">H2</button>
-      <button type="button" class="btn" data-before="### " data-after="">H3</button>
-      <button type="button" class="btn" data-before="`" data-after="`">Code</button>
-      <button type="button" class="btn" data-before="- " data-after="">List</button>
-      <button type="button" class="btn" data-before="> " data-after="">Quote</button>
-      <button type="button" class="btn" id="linkbtn">Link</button>
-      <button type="button" class="btn" id="imgbtn">Image</button>
+      <button type="button" class="btn" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash image</button>
       <button type="button" class="btn" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
+      <span class="muted" style="align-self:center;margin-left:.4rem">bold, headings, lists &amp; links: select text or type&nbsp;/ &mdash; the editor has its own toolbar</span>
     </div>
 
     <div class="editor-grid">
       <div class="pane">
-        <textarea id="source" placeholder="# Heading&#10;&#10;Write your post in markdown&hellip;"></textarea>
+        <div id="source" class="md-editor"></div>
         <div class="statusline"><span id="wc">0 words</span> &middot; <span id="slugline"></span></div>
       </div>
       <div class="pane prose" id="preview">
@@ -90,7 +84,7 @@
 
     <div class="actions">
       <button type="button" class="btn btn-primary" id="save">Save</button>
-      <button type="button" class="btn" id="publish">Publish now</button>
+      <button type="button" class="btn" id="publish" title="Make this post live at its public URL">publish</button>
       <a class="btn" id="viewlink" hidden>View post</a>
       <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
       <span id="msg" class="flash" hidden></span>
@@ -106,7 +100,12 @@
 
 const $ = id => document.getElementById(id);
 let postId = null;
+let postStatus = 'draft';   // live status of the post being edited
 let slugTouched = false;
+let md = null;              // the Milkdown editor behind #source
+
+function getSrc() { return md ? md.getMarkdown() : ''; }
+function setSrc(s) { if (md) md.setMarkdown(s); }
 
 async function jfetch(u, opts) {
     const r = await fetch(u, Object.assign({
@@ -133,7 +132,7 @@ function slugify(s) {
 }
 
 function updateWc() {
-    const n = ($('source').value.trim().match(/\S+/g) || []).length;
+    const n = (getSrc().trim().match(/\S+/g) || []).length;
     $('wc').textContent = n + (n === 1 ? ' word' : ' words');
 }
 
@@ -144,7 +143,7 @@ function previewSoon() {
 }
 
 async function renderPreview() {
-    const src = $('source').value;
+    const src = getSrc();
     if (!src.trim()) {
         $('preview').innerHTML = '<p class="muted">Preview appears here as you type.</p>';
         return;
@@ -167,15 +166,107 @@ function flash(msg, isErr) {
     flash._t = setTimeout(() => { m.hidden = true; }, 2600);
 }
 
-function wrapSel(before, after) {
-    const ta = $('source');
-    const s = ta.selectionStart, e = ta.selectionEnd, v = ta.value;
-    ta.value = v.slice(0, s) + before + v.slice(s, e) + after + v.slice(e);
-    ta.selectionStart = s + before.length;
-    ta.selectionEnd = e + before.length;
-    ta.focus();
+// ---- unsaved-work guard ----
+// Every edit lands in localStorage (debounced) under a key per post, so a
+// crash, a closed tab, or a dropped session never eats a draft silently:
+// reopening the post offers the snapshot, and leaving with unsaved edits
+// warns first. A save clears the snapshot; the server copy is the truth.
+const DRAFT_PREFIX = 'postwisp-draft-';
+let dirty = false;
+let snapTimer = null;
+let pendingDraft = null;
+function draftKey() { return DRAFT_PREFIX + (postId || 'new'); }
+function markDirty() {
+    dirty = true;
+    if (snapTimer) clearTimeout(snapTimer);
+    snapTimer = setTimeout(saveDraft, 600);
+}
+function saveDraft() {
+    if (!dirty) return;
+    try {
+        localStorage.setItem(draftKey(), JSON.stringify({
+            title: $('title').value, slug: $('slug').value,
+            tags: $('tags').value, source: getSrc(), ts: Date.now()
+        }));
+    } catch (e) { /* storage full or blocked: the leaving-warning still covers it */ }
+}
+function clearDrafts(id) {
+    dirty = false;
+    try {
+        localStorage.removeItem(DRAFT_PREFIX + 'new');
+        localStorage.removeItem(DRAFT_PREFIX + id);
+    } catch (e) { /* nothing to clean up */ }
+}
+// Offer the snapshot only when it differs from what the page holds now.
+function checkDraft() {
+    let snap = null;
+    try { snap = JSON.parse(localStorage.getItem(draftKey()) || 'null'); } catch (e) { return; }
+    if (!snap || typeof snap.source !== 'string') return;
+    if (snap.source === getSrc() && snap.title === $('title').value &&
+        snap.slug === $('slug').value && snap.tags === $('tags').value) return;
+    pendingDraft = snap;
+    $('restore').hidden = false;
+}
+$('restore-yes').onclick = () => {
+    const snap = pendingDraft;
+    pendingDraft = null;
+    $('restore').hidden = true;
+    if (!snap) return;
+    $('title').value = snap.title || '';
+    $('slug').value = snap.slug || '';
+    $('tags').value = snap.tags || '';
+    slugTouched = !!snap.slug;
+    setSrc(snap.source || '');
+    dirty = true;
+    updateWc(); previewSoon(); syncCover();
+};
+$('restore-no').onclick = () => {
+    pendingDraft = null;
+    $('restore').hidden = true;
+    try { localStorage.removeItem(draftKey()); } catch (e) { /* already gone */ }
+};
+window.addEventListener('beforeunload', e => {
+    if (dirty) { e.preventDefault(); e.returnValue = ''; }
+});
+
+// Every keystroke in the Milkdown editor lands here: word count, the
+// debounced server preview, and cover sync.
+function onSourceChange() {
+    markDirty();
     updateWc();
     previewSoon();
+    syncCover();
+}
+
+// Upload a local file; the answer is the markdown-ready URL. A media URL
+// carries no extension, so video/audio ride on an ?embed= query the
+// renderer turns into a player (it round-trips through the editor
+// untouched, unlike a title-attribute hint).
+async function uploadFile(file) {
+    const r = await fetch('/api/media', {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': file.type },
+        body: file,
+    }).then(async resp => {
+        const d = await resp.json().catch(() => ({}));
+        if (!resp.ok) throw new Error(d.error || 'upload failed');
+        return d;
+    });
+    const hint = file.type.startsWith('video/') ? '?embed=video'
+        : file.type.startsWith('audio/') ? '?embed=audio' : '';
+    return r.url + hint;
+}
+
+// The publish button shows the transition the post cannot make yet: a
+// draft offers "publish", a published post offers "unpublish".
+function syncPublishBtn() {
+    const pub = postStatus === 'published';
+    $('publish').textContent = pub ? 'unpublish' : 'publish';
+    $('publish').title = pub ? 'Move this post back to drafts'
+                             : 'Make this post live at its public URL';
+    // the destructive direction gets the same danger styling as delete
+    $('publish').classList.toggle('btn-danger', pub);
 }
 
 async function save(status) {
@@ -186,16 +277,16 @@ async function save(status) {
     const body = JSON.stringify({
         title: title,
         slug: slug,
-        source: $('source').value,
+        source: getSrc(),
         tags: $('tags').value,
-        status: status
+        status: status || postStatus
     });
     try {
         const p = postId
             ? await jfetch('/api/posts/' + postId, { method: 'PUT', body: body })
             : await jfetch('/api/posts', { method: 'POST', body: body });
         postId = p.id;
-        $('status').value = p.status;
+        postStatus = p.status;
         $('slug').value = p.slug;
         $('slugline').textContent = '/' + p.username + '/' + p.slug;
         $('delete').hidden = false;
@@ -205,6 +296,8 @@ async function save(status) {
         }
         history.replaceState(null, '', '/editor?id=' + p.id);
         $('heading').textContent = 'Edit post';
+        syncPublishBtn();
+        clearDrafts(p.id);
         flash(p.status === 'published' ? 'Saved &middot; published.' : 'Saved &middot; draft.');
     } catch (e) {
         flash(e.message, true);
@@ -213,13 +306,15 @@ async function save(status) {
 
 $('title').addEventListener('input', () => {
     if (!slugTouched && !postId) $('slug').value = slugify($('title').value);
+    markDirty();
 });
-$('slug').addEventListener('input', () => { slugTouched = true; });
+$('slug').addEventListener('input', () => { slugTouched = true; markDirty(); });
+$('tags').addEventListener('input', markDirty);
 
 // ---- cover image (first markdown image = the post header) ----
 function syncCover() {
     if (typeof pw === 'undefined' || !pw.coverFrom) return;
-    const c = pw.coverFrom($('source').value);
+    const c = pw.coverFrom(getSrc());
     const thumb = $('cover-thumb');
     if (c && c.url) {
         thumb.textContent = '';
@@ -233,77 +328,68 @@ function syncCover() {
 }
 $('cover-pick').onclick = () => {
     pw.pickUnsplash({ defaultQuery: $('title').value.trim() }, d => {
-        $('source').value = pw.setCover($('source').value,
-            'Photo by ' + d.credit + ' on Unsplash', d.url);
+        setSrc(pw.setCover(getSrc(), 'Photo by ' + d.credit + ' on Unsplash', d.url));
         syncCover(); updateWc(); previewSoon();
     });
 };
 $('cover-remove').onclick = () => {
-    $('source').value = pw.removeCover($('source').value);
+    setSrc(pw.removeCover(getSrc()));
     syncCover(); updateWc(); previewSoon();
 };
 
 // ---- insert an Unsplash image at the cursor ----
+// The credit goes in the image title — the slot Milkdown preserves when
+// it round-trips a post (the alt slot is rewritten to a size ratio).
 $('imgbtn').onclick = () => {
     pw.pickUnsplash({}, d => {
-        wrapSel('![' + 'Photo by ' + d.credit + ' on Unsplash' + '](' + d.url + ')', '\n\n');
+        md.insert('![](' + d.url + ' "Photo by ' + d.credit.replace(/["'()[\]]/g, '') + ' on Unsplash")');
         syncCover();
     });
 };
 
 // ---- upload a local photo/video/audio file, then embed it ----
-async function uploadFile(file) {
-    const hint = file.type.startsWith('video/') ? ' video'
-        : file.type.startsWith('audio/') ? ' audio' : '';
-    const cap = hint ? '50MB' : '5MB';
+// insertUploaded drives the Upload button and the drop handler; the
+// editor's own image handling (its upload button, pasted and dropped
+// pictures) calls uploadFile directly through onUpload.
+async function insertUploaded(file) {
+    const av = file.type.startsWith('video/') || file.type.startsWith('audio/');
+    // the file name rides in the image title — the slot Milkdown keeps
+    // when it round-trips a post (the alt slot becomes a size ratio)
+    const name = file.name.replace(/["'()[\]]/g, '');
     try {
-        const r = await fetch('/api/media', {
-            method: 'POST',
-            credentials: 'same-origin',
-            headers: { 'Content-Type': file.type },
-            body: file,
-        }).then(async resp => {
-            const d = await resp.json().catch(() => ({}));
-            if (!resp.ok) throw new Error(d.error || 'upload failed');
-            return d;
-        });
-        wrapSel('![' + file.name + '](' + r.url + hint + ')', '\n\n');
-        syncCover();
+        md.insert('![](' + await uploadFile(file) + (name ? ' "' + name + '"' : '') + ')');
     } catch (e) {
-        flash(e.message + (e.message.indexOf('too large') >= 0 ? ' (max ' + cap + ')' : ''), true);
+        flash(e.message + (e.message.indexOf('too large') >= 0 ? ' (max ' + (av ? '50MB' : '5MB') + ')' : ''), true);
     }
 }
 $('uploadbtn').onclick = () => {
     const inp = document.createElement('input');
     inp.type = 'file';
     inp.accept = 'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/ogg,audio/wav,audio/mp4';
-    inp.onchange = () => { if (inp.files[0]) uploadFile(inp.files[0]); };
+    inp.onchange = () => { if (inp.files[0]) insertUploaded(inp.files[0]); };
     inp.click();
 };
+// files dropped into the editor: Milkdown has no drop-to-upload of its
+// own, so the page handles every media kind here. Capture phase, before
+// the ProseMirror view's own drop handling can swallow the event.
 $('source').addEventListener('drop', ev => {
     const f = ev.dataTransfer.files[0];
     if (f && /^(image|video|audio)\//.test(f.type)) {
         ev.preventDefault();
-        uploadFile(f);
+        ev.stopPropagation();
+        insertUploaded(f);
     }
-});
+}, true);
 
-$('source').addEventListener('input', () => { updateWc(); previewSoon(); syncCover(); });
-$('save').onclick = () => save($('status').value);
-$('publish').onclick = () => save('published');
+$('save').onclick = () => save();
+$('publish').onclick = () => save(postStatus === 'published' ? 'draft' : 'published');
 $('delete').onclick = async () => {
     if (!postId || !confirm('Delete this post permanently?')) return;
     try {
         await jfetch('/api/posts/' + postId, { method: 'DELETE' });
+        clearDrafts(postId);
         location.href = '/dashboard';
     } catch (e) { flash(e.message, true); }
-};
-document.querySelectorAll('.toolbar [data-before]').forEach(b => {
-    b.onclick = () => wrapSel(b.dataset.before, b.dataset.after || '');
-});
-$('linkbtn').onclick = () => {
-    const url = prompt('Link URL:', 'https://');
-    if (url) wrapSel('[', '](' + url + ')');
 };
 
 (async () => {
@@ -319,7 +405,15 @@ $('linkbtn').onclick = () => {
     }
     $('editor').hidden = false;
 
+    // a server-side Unsplash key (setup.sh or the settings page) wins
+    // over the per-browser one in the picker
+    try {
+        const s = await jfetch('/api/settings');
+        if (s.unsplash_key) pw._serverUnsplashKey = s.unsplash_key;
+    } catch (e) { /* optional: fall back to the browser key */ }
+
     const id = new URLSearchParams(location.search).get('id');
+    let initial = '';
     if (id) {
         try {
             const p = await jfetch('/api/posts/' + id);
@@ -327,22 +421,30 @@ $('linkbtn').onclick = () => {
             $('heading').textContent = 'Edit post';
             $('title').value = p.title;
             $('slug').value = p.slug;
-            $('source').value = p.source;
+            initial = p.source;
             $('tags').value = p.tags;
-            $('status').value = p.status;
+            postStatus = p.status;
             $('slugline').textContent = '/' + p.username + '/' + p.slug;
             $('delete').hidden = false;
             $('viewlink').hidden = p.status !== 'published';
             if (p.status === 'published') {
                 $('viewlink').href = '/' + encodeURIComponent(p.username) + '/' + encodeURIComponent(p.slug);
             }
-            renderPreview();
+            syncPublishBtn();
         } catch (e) {
             flash(e.message, true);
         }
     }
+    md = await pwMilkdown.create($('source'), {
+        defaultValue: initial,
+        placeholder: 'Write your post in markdown…',
+        onChange: onSourceChange,
+        onUpload: uploadFile,
+    });
     updateWc();
     syncCover();
+    checkDraft();
+    if (initial) renderPreview();
 })();
 </script>
 </body>

@@ -99,9 +99,10 @@ pw.removeCover = function (source) {
 
 pw.setCover = function (source, alt, url) {
     var clean = pw.removeCover(source);
-    // keep alt safe for markdown: no brackets, parens or newlines
-    var a = String(alt == null ? '' : alt).replace(/[[\]()]/g, '').replace(/\s+/g, ' ').trim();
-    return '![' + a + '](' + url + ')\n\n' + clean.replace(/^\s+/, '');
+    // the label rides in the image title — the slot Milkdown keeps when
+    // it round-trips a post (the alt slot is rewritten to a size ratio)
+    var a = String(alt == null ? '' : alt).replace(/["'()[\]]/g, '').replace(/\s+/g, ' ').trim();
+    return '![](' + url + (a ? ' "' + a + '"' : '') + ')\n\n' + clean.replace(/^\s+/, '');
 };
 
 // Older helper, kept for custom templates: pulls a leading image markdown
@@ -130,11 +131,18 @@ pw.unsplashKey = function (k) {
     try { return localStorage.getItem('postwisp-unsplash-key') || ''; } catch (e) { return ''; }
 };
 
+// A key saved on the server (setup.sh or the settings page) wins over the
+// per-browser one: the editors set _serverUnsplashKey after loading
+// /api/settings, and the picker reads it through here.
+pw.unsplashApiKey = function () {
+    return pw._serverUnsplashKey || pw.unsplashKey();
+};
+
 // pick({ defaultQuery }, onPick) — onPick receives
 // { url, thumb, alt, credit, creditUrl } for the chosen photo.
 pw.pickUnsplash = function (opts, onPick) {
     opts = opts || {};
-    var key = pw.unsplashKey();
+    var key = pw.unsplashApiKey();
     var modal = ensureModal();
     var state = modal._state;
 
@@ -146,9 +154,10 @@ pw.pickUnsplash = function (opts, onPick) {
 
     if (!key) { showKeyRow(); return; }
     hideKeyRow();
-    state.search.value = state.query;
-    if (state.query) doSearch(); else { state.grid.innerHTML = ''; setStatus('Type a word or two and press Enter — try “mountains”, “desk setup”, “abstract”.'); }
-    setTimeout(function () { state.search.focus(); }, 30);
+    // the search input lives on the modal object, not on _state
+    modal.search.value = state.query;
+    if (state.query) doSearch(); else { modal.grid.innerHTML = ''; setStatus('Type a word or two and press Enter — try “mountains”, “desk setup”, “abstract”.'); }
+    setTimeout(function () { modal.search.focus(); }, 30);
 
     function ensureModal() {
         var root = document.getElementById('pw-modal');
@@ -240,11 +249,11 @@ pw.pickUnsplash = function (opts, onPick) {
         if (state.busy) return;
         var q = state.query;
         if (!q) { setStatus('Type something to search for first.'); return; }
-        if (!pw.unsplashKey()) { showKeyRow(); return; }
+        if (!pw.unsplashApiKey()) { showKeyRow(); return; }
         state.busy = true;
         setStatus('Searching Unsplash for “' + q + '”…');
         if (state.page === 1) modal.grid.innerHTML = '';
-        var url = 'https://api.unsplash.com/search/photos?client_id=' + encodeURIComponent(pw.unsplashKey()) +
+        var url = 'https://api.unsplash.com/search/photos?client_id=' + encodeURIComponent(pw.unsplashApiKey()) +
             '&query=' + encodeURIComponent(q) +
             '&page=' + state.page + '&per_page=12&content_filter=high&orientation=landscape';
         fetch(url).then(function (r) {

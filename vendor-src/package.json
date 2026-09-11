@@ -1,0 +1,20 @@
+{
+  "name": "vendor-src",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@milkdown/crepe": "^7.22.1",
+    "esbuild": "^0.28.2"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

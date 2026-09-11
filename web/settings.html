@@ -87,8 +87,9 @@
     <div class="field">
       <label for="ukey">Unsplash access key (cover photos &amp; image search)</label>
       <input id="ukey" placeholder="Paste a free key from unsplash.com/oauth/applications">
-      <p class="hint" id="ukey-hint">The key is stored in this browser only, never on the
-        server. Without it, the Unsplash button in the editor asks for one when first used.</p>
+      <p class="hint" id="ukey-hint">Stored on the server with your other settings, so
+        every browser you log in from shares it. Without a key, the Unsplash button in the
+        editor asks for one when first used.</p>
     </div>
     <div class="actions">
       <button type="button" class="btn btn-primary" id="save">Save settings</button>
@@ -143,23 +144,19 @@ $('save').onclick = async () => {
                 footer: $('footer').value.trim(),
                 show_credit: $('show_credit').checked ? 'true' : 'false',
                 theme: $('theme').value,
-                language: $('language').value
+                language: $('language').value,
+                unsplash_key: $('ukey').value.trim()
             })
         });
         flash('Saved.');
-        const key = $('ukey').value.trim();
-        if (key) {
-            // stored per-browser; the server-side settings API has no slot for it
-            try { localStorage.setItem('postwisp-unsplash-key', key); } catch (e) { /* private mode */ }
-            $('ukey-hint').textContent = 'Key saved in this browser — the Unsplash picker will use it.';
-        }
     } catch (e) {
         flash(e.message, true);
     }
 };
 
 (function () {
-    $('ukey-hint').dataset.default = $('ukey-hint').textContent;
+    // pre-fill from the browser's old per-browser slot, if any; the
+    // server-side value (loaded below) wins once it arrives
     try { $('ukey').value = localStorage.getItem('postwisp-unsplash-key') || ''; } catch (e) { /* ignore */ }
 })();
 
@@ -183,6 +180,7 @@ $('save').onclick = async () => {
     $('show_credit').checked = (s.show_credit !== 'false');
     $('theme').value = (s.theme === 'light') ? 'light' : 'dark';
     $('language').value = ['en', 'de', 'fr', 'es'].indexOf(s.language) >= 0 ? s.language : 'en';
+    if (s.unsplash_key) $('ukey').value = s.unsplash_key;
 })();
 </script>
 </body>

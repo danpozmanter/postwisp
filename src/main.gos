@@ -15,6 +15,7 @@ use std::time
 use std::fs
 use std::strings
 use std::hash::crc32
+use std::crypto::hmac
 use std::crypto::rand
 use std::env
 use std::net::smtp
@@ -138,7 +139,7 @@ fn record_failed_login(app: App, ip: String, username: String) {
     let now = now_ms()
     let mut eng = open_eng(app)
     let _ = eng.exec("INSERT INTO login_attempts VALUES (" + sqlq(ip) + ", " + sqlq(username) + ", " + now.to_string() + ")")
-    let _ = eng.exec("DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string() + ")")
+    let _ = eng.exec("DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string())
 }
 
 
@@ -892,14 +893,18 @@ fn render_inline(escaped: String) -> String {
                     let url = clean_url(sub(src, m.url_start, m.url_end))
                     let alt = sub(src, m.text_start, m.text_end)
                     let mut hint = ""
-                    if m.hint_start >= 0 { hint = sub(src, m.hint_start, m.hint_end) }
+                    if m.hint_start >= 0 { hint = normalize_media_hint(sub(src, m.hint_start, m.hint_end)) }
                     let kind = media_kind(url, hint)
                     if kind == "video" {
                         out += "<video controls preload=\"metadata\" src=\"" + url + "\"></video>"
                     } else if kind == "audio" {
                         out += "<audio controls preload=\"metadata\" src=\"" + url + "\">" + alt + "</audio>"
                     } else {
-                        out += "<img src=\"" + url + "\" alt=\"" + alt + "\">"
+                        // a quoted title is an image caption (the form
+                        // Milkdown serializes); it rides on the img
+                        out += "<img src=\"" + url + "\" alt=\"" + alt + "\""
+                        if hint.len() > 0 { out += " title=\"" + hint + "\"" }
+                        out += ">"
                     }
                     i = m.after
                     continue
@@ -998,10 +1003,29 @@ fn match_link(b: Vec<u8>, start: i64, n: i64) -> Option<LinkMatch> {
         k += 1
     }
     if hint_start >= 0 {
-        let width = hint_end - hint_start
-        let word = (bytes_word_at(b, hint_start, "video") && width == 5)
-            || (bytes_word_at(b, hint_start, "audio") && width == 5)
-        if !word { return None }
+        // A quote pair around the word is what markdown serializers
+        // (Milkdown among them) write for an image title. Apostrophes
+        // survive escaping untouched; double quotes arrive as &quot;
+        // because escape_html has already run over the source text.
+        let mut hs = hint_start
+        let mut he = hint_end
+        let mut quoted = false
+        if he - hs >= 2 && (b[hs] == '"' as u8 || b[hs] == '\'' as u8) && b[hs] == b[he - 1] {
+            hs += 1
+            he -= 1
+            quoted = true
+        } else if he - hs >= 12 && bytes_word_at(b, hs, "&quot;") && bytes_word_at(b, he - 6, "&quot;") {
+            hs += 6
+            he -= 6
+            quoted = true
+        }
+        let width = he - hs
+        let word = (bytes_word_at(b, hs, "video") && width == 5)
+            || (bytes_word_at(b, hs, "audio") && width == 5)
+        // An unquoted non-hint word is still not a link (a bare space in
+        // the parens was never valid here). A quoted one is an image
+        // title — a caption — and is accepted: the image renders with it.
+        if !word && !quoted { return None }
     }
     Some(LinkMatch {
         text_start: start + 1
@@ -1059,6 +1083,11 @@ fn bytes_word_at(b: Vec<u8>, from: i64, w: String) -> bool {
 fn media_kind(url: String, hint: String) -> String {
     if hint == "video" || hint == "audio" { return hint }
     let u = url.to_lowercase()
+    // an embed= query is how the Milkdown uploader marks an extension-less
+    // media URL: "![clip](/u/media/xyz?embed=video)" round-trips through
+    // the editor untouched, unlike a title-attr hint
+    if strings::contains(u, "embed=video") { return "video" }
+    if strings::contains(u, "embed=audio") { return "audio" }
     if u.ends_with(".mp4") || u.ends_with(".webm") || u.ends_with(".mov") || u.ends_with(".m4v") {
         return "video"
     }
@@ -1067,6 +1096,25 @@ fn media_kind(url: String, hint: String) -> String {
         return "audio"
     }
     ""
+}
+
+// A media embed hint may arrive quoted: "![clip](url \"video\")" is what
+// markdown serializers (Milkdown among them) write for an image title,
+// and the editor round-trips every saved post through one. The quotes are
+// stripped before the hint is judged, so a hint written either way embeds
+// a player.
+
+fn normalize_media_hint(h: String) -> String {
+    let t = h.trim()
+    // quotes arrive as they survived escape_html: ' raw, " as &quot;
+    if t.len() >= 2 && (t.byte_at(0) == b'"' || t.byte_at(0) == b'\'')
+    && t.byte_at(0) == t.byte_at(t.byte_len() - 1) {
+        return t.substring(1, t.byte_len() - 1)
+    }
+    if t.len() >= 12 && t.starts_with("&quot;") && t.ends_with("&quot;") {
+        return t.substring(6, t.byte_len() - 6)
+    }
+    t
 }
 
 // Render a full markdown document to sanitized HTML.
@@ -1280,6 +1328,20 @@ fn header_value(req: http::Request, name: String) -> String {
     ""
 }
 
+
+// Conditional-request check shared by media and the built-in assets: does
+// this request's If-None-Match list name the given strong ETag (or "*")?
+
+fn etag_match(req: http::Request, etag: String) -> bool {
+    let inm = header_value(req, "If-None-Match")
+    if inm.len() == 0 { return false }
+    for t in split_byte(inm, ',' as u8) {
+        let cand = t.trim()
+        if cand == "*" || cand == etag { return true }
+    }
+    false
+}
+
 // Splits a string on a single-byte separator; byte-walker because the
 // std surface has no string split.
 
@@ -1368,7 +1430,7 @@ fn handle_setup(app: App, req: http::Request) -> http::Response {
     // token: the setup token authorizes exactly this call and is not a
     // session, so sending it would leave the fresh admin logged out with
     // a cookie that /api/me rightly rejects.
-    ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + sess_token
+    ok_json(user_json(u, false)).with_header("Set-Cookie", "postwisp_session=" + sess_token
         + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
 }
 
@@ -1394,6 +1456,11 @@ fn handle_login(app: App, req: http::Request) -> http::Response {
                 return err_json(401, "bad credentials")
             }
             clear_failed_logins(app, ip, username)
+            // A two-factor account stops here: the password was right, but
+            // the session exists only after the mailed code comes back.
+            if two_factor_on(&mut eng, u.id) {
+                return start_two_factor(&mut eng, u, ip)
+            }
             let now = now_ms()
             let token = new_token("s:" + now.to_string() + ":" + username + ":" + store.sessions.len().to_string())
             let s = Session { token: token, user_id: u.id, created_at: now, expires_at: now + 30 * 24 * 3600 * 1000 }
@@ -1402,7 +1469,7 @@ fn handle_login(app: App, req: http::Request) -> http::Response {
                 + ", " + now.to_string() + ", " + s.expires_at.to_string() + ")")
             // expired sessions are dead rows; drop them while we are here
             exec_sql(&mut eng, "DELETE FROM sessions WHERE expires_at < " + now.to_string())
-            return ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + token
+            return ok_json(user_json(u, false)).with_header("Set-Cookie", "postwisp_session=" + token
                 + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
         }
     }
@@ -1446,6 +1513,10 @@ fn handle_logout(app: App, req: http::Request) -> http::Response {
 const RESET_TTL_MS: i64 = 60 * 60 * 1000  // a recovery link lives one hour
 const RECOVER_MAX_SENDS: i64 = 5          // one source, per login window
 const SMTP_TIMEOUT_MS: i64 = 8000         // a stuck SMTP talk never holds the router
+const TOTP_STEP_MS: i64 = 30 * 1000       // one code per half minute
+const TWOFACTOR_VALIDITY_MS: i64 = 5 * 60 * 1000  // a challenge lives five minutes
+const TWOFACTOR_MAX_ATTEMPTS: i64 = 3     // wrong codes per challenge
+const TWOFACTOR_MAX_CODES: i64 = 5        // mailed codes per source, per login window
 
 struct SmtpCfg {
     host: String
@@ -1608,7 +1679,7 @@ fn handle_recover(app: App, req: http::Request) -> http::Response {
             // the attempt is counted before the send, so a failing relay
             // cannot be retried into a mail flood
             exec_sql(&mut eng, "INSERT INTO login_attempts VALUES (" + sqlq(ip) + ", 'recover', " + now.to_string() + ")")
-            exec_sql(&mut eng, "DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string() + ")")
+            exec_sql(&mut eng, "DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string())
             let link = base_url_of(req) + "/dashboard?recover=" + token
             let _ = send_recovery_mail(cfg, u.email, u.username, link)
         }
@@ -1647,7 +1718,7 @@ fn handle_reset(app: App, req: http::Request) -> http::Response {
                     let sess = new_token("s:" + now.to_string() + ":" + u.username)
                     exec_sql(&mut eng, "INSERT INTO sessions VALUES (" + sqlq(sess) + ", " + uid.to_string()
                         + ", " + now.to_string() + ", " + (now + 30 * 24 * 3600 * 1000).to_string() + ")")
-                    return ok_json(user_json(u)).with_header("Set-Cookie", "postwisp_session=" + sess
+                    return ok_json(user_json(u, two_factor_on(&mut eng, uid))).with_header("Set-Cookie", "postwisp_session=" + sess
                         + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
                 }
             }
@@ -1656,16 +1727,292 @@ fn handle_reset(app: App, req: http::Request) -> http::Response {
 }
 
 
-fn user_json(u: User) -> String {
-    "{\"id\":" + u.id.to_string() + ",\"username\":" + json_quote(u.username)
-    + ",\"email\":" + json_quote(u.email) + ",\"role\":" + json_quote(u.role) + "}"
+// ---------- two-factor login over email ----------
+//
+// An opt-in second step for accounts with an email address: after a
+// correct password, the login answers with a challenge instead of a
+// session, and a 6-digit code derived from a per-account secret and the
+// current 30-second step (TOTP shape) is mailed to the address on file.
+// The challenge lives in the kv store, works once, expires after five
+// minutes, and tolerates three wrong codes; the code itself is accepted
+// from the current or the previous step, so a code mailed right at a step
+// boundary is not dead on arrival. How many codes one source may ask for
+// is capped through the login-attempt rows, exactly like recovery mails.
+
+struct TwoFactorChallenge {
+    uid: i64
+    expires_at: i64
+    attempts: i64
+}
+
+
+fn totp_step(now: i64) -> i64 { now / TOTP_STEP_MS }
+
+
+fn hex_val(b: i64) -> i64 {
+    if b >= b'0' as i64 && b <= b'9' as i64 { return b - (b'0' as i64) }
+    if b >= b'a' as i64 && b <= b'f' as i64 { return b - (b'a' as i64) + 10 }
+    return -1
+}
+
+
+// HMAC-SHA-256(secret, "postwisp/totp/<step>"), low bits folded down to
+// six decimal digits. The secret never leaves the server's store, so the
+// code cannot be recomputed by anyone who cannot read that store.
+
+fn totp_code(secret: String, step: i64) -> String {
+    let mac = hmac::sha256_hex(secret, "postwisp/totp/" + step.to_string())
+    let mut v: i64 = 0
+    let mut i = mac.byte_len() - 8
+    while i < mac.byte_len() {
+        v = (v * 16 + hex_val(mac.byte_at(i))) % 1000000
+        i += 1
+    }
+    return format("{:06}", v)
+}
+
+
+// a mailed code stays answerable across one step boundary
+fn code_matches(secret: String, code: String, now: i64) -> bool {
+    let s = totp_step(now)
+    return totp_code(secret, s) == code || totp_code(secret, s - 1) == code
+}
+
+
+fn six_digits(code: String) -> bool {
+    if code.len() != 6 { return false }
+    let mut i: i64 = 0
+    while i < 6 {
+        if code.byte_at(i) < b'0' || code.byte_at(i) > b'9' { return false }
+        i += 1
+    }
+    return true
+}
+
+
+fn two_factor_on(eng: &mut engine::Engine, uid: i64) -> bool {
+    match eng.store.get("postwisp/2fa/enabled/" + uid.to_string()) {
+        kv::Read::Value(b) => {
+            match String::from_utf8(b) {
+                Ok(s) => return s == "1"
+                Err(_) => return false
+            }
+        }
+        _ => return false
+    }
+}
+
+
+fn set_two_factor(eng: &mut engine::Engine, uid: i64, on: bool) {
+    let mut v = "0"
+    if on { v = "1" }
+    let _ = eng.store.put("postwisp/2fa/enabled/" + uid.to_string(), v.as_bytes())
+}
+
+
+fn two_factor_secret(eng: &mut engine::Engine, uid: i64) -> String {
+    let key = "postwisp/2fa/secret/" + uid.to_string()
+    match eng.store.get(key) {
+        kv::Read::Value(b) => {
+            match String::from_utf8(b) {
+                Ok(s) => { if s.len() >= 32 { return s } }
+                Err(_) => ()
+            }
+        }
+        _ => ()
+    }
+    let s = new_token("2fa:" + uid.to_string())
+    let _ = eng.store.put(key, s.as_bytes())
+    return s
+}
+
+
+fn put_2fa_challenge(eng: &mut engine::Engine, token: String, uid: i64, expires_at: i64, attempts: i64) {
+    let _ = eng.store.put("postwisp/2fa/chal/" + token,
+        (uid.to_string() + "|" + expires_at.to_string() + "|" + attempts.to_string()).as_bytes())
+}
+
+
+fn del_2fa_challenge(eng: &mut engine::Engine, token: String) {
+    let _ = eng.store.delete("postwisp/2fa/chal/" + token)
+}
+
+
+// Read validates but does not consume: a wrong code must stay retryable
+// inside the attempt budget. Expired or malformed rows are removed on
+// sight, so an old challenge is just another invalid one.
+
+fn get_2fa_challenge(eng: &mut engine::Engine, token: String) -> Option<TwoFactorChallenge> {
+    let key = "postwisp/2fa/chal/" + token
+    match eng.store.get(key) {
+        kv::Read::Value(b) => {
+            match String::from_utf8(b) {
+                Ok(s) => {
+                    let b1 = find_sub(s, "|", 0)
+                    let b2 = if b1 <= 0 { -1 } else { find_sub(s, "|", b1 + 1) }
+                    if b1 <= 0 || b2 <= b1 {
+                        let _ = eng.store.delete(key)
+                        return None
+                    }
+                    let uid = sub(s, 0, b1).to_i64().unwrap_or(-1)
+                    let exp = sub(s, b1 + 1, b2).to_i64().unwrap_or(0)
+                    let att = sub(s, b2 + 1, s.len()).to_i64().unwrap_or(0)
+                    if uid <= 0 || exp <= now_ms() {
+                        let _ = eng.store.delete(key)
+                        return None
+                    }
+                    return Some(TwoFactorChallenge { uid: uid, expires_at: exp, attempts: att })
+                }
+                Err(_) => {
+                    let _ = eng.store.delete(key)
+                    return None
+                }
+            }
+        }
+        _ => return None
+    }
+}
+
+
+fn bump_2fa_attempts(eng: &mut engine::Engine, token: String) {
+    match get_2fa_challenge(eng, token) {
+        Some(ch) => put_2fa_challenge(eng, token, ch.uid, ch.expires_at, ch.attempts + 1)
+        None => ()
+    }
+}
+
+
+fn twofactor_sends_capped(eng: &mut engine::Engine, ip: String) -> bool {
+    let now = now_ms()
+    let mut n: i64 = 0
+    match eng.exec("SELECT * FROM login_attempts") {
+        Ok(res) => {
+            for row in res.rows {
+                if row.vals[0].s == ip && row.vals[1].s == "2facode" && now - row.vals[2].i < LOGIN_WINDOW_MS { n += 1 }
+            }
+        }
+        Err(_) => ()
+    }
+    n >= TWOFACTOR_MAX_CODES
+}
+
+
+fn send_login_code_mail(c: SmtpCfg, to: String, username: String, code: String) -> bool {
+    let subject = "Your postwisp login code"
+    let body = "Hello,\n\n"
+        + "A login was just started for the postwisp account " + username + "\n"
+        + "registered with this email address.\n\n"
+        + "Your login code: " + code + "\n\n"
+        + "It works once and stays valid for five minutes. If this was not\n"
+        + "you, ignore the mail - the code expires on its own and the login\n"
+        + "does not complete without it.\n"
+    let sent = sync::with_timeout(|| {
+        if c.user.len() > 0 {
+            return smtp::send_auth(smtp_addr(c), c.from, to, subject, body, c.user, c.pass)
+        }
+        return smtp::send(smtp_addr(c), c.from, to, subject, body)
+    }, SMTP_TIMEOUT_MS)
+    match sent {
+        Ok(Ok(())) => return true
+        Ok(Err(e)) => {
+            eprintln("postwisp: login code to " + to + " failed: " + e.to_string())
+            return false
+        }
+        Err(e) => {
+            eprintln("postwisp: login code to " + to + " timed out: " + e.to_string())
+            return false
+        }
+    }
+}
+
+
+// The password was right and the account asked for a second step: mail a
+// code, hand back the challenge token, and open no session. The send is
+// counted before it happens so a failing relay cannot be retried into a
+// mail flood, exactly like a recovery mail.
+
+fn start_two_factor(eng: &mut engine::Engine, u: User, ip: String) -> http::Response {
+    let cfg = smtp_config()
+    if cfg.host.len() == 0 {
+        return err_json(503, "two-factor login is not configured on this server (set PW_SMTP_HOST)")
+    }
+    if twofactor_sends_capped(eng, ip) {
+        return err_json(429, "too many login codes requested, try again later")
+    }
+    let now = now_ms()
+    let token = new_token("t:" + now.to_string() + ":" + u.username)
+    let code = totp_code(two_factor_secret(eng, u.id), totp_step(now))
+    put_2fa_challenge(eng, token, u.id, now + TWOFACTOR_VALIDITY_MS, 0)
+    exec_sql(eng, "INSERT INTO login_attempts VALUES (" + sqlq(ip) + ", '2facode', " + now.to_string() + ")")
+    exec_sql(eng, "DELETE FROM login_attempts WHERE at < " + (now - LOGIN_WINDOW_MS).to_string())
+    let _ = send_login_code_mail(cfg, u.email, u.username, code)
+    return ok_json("{\"two_factor\":true,\"token\":" + json_quote(token) + "}")
+}
+
+
+// The far end of the code mail: one challenge, one code. A wrong code
+// burns an attempt and counts toward the login lock like a wrong
+// password; the right one consumes the challenge and opens the session.
+
+fn handle_login_2fa(app: App, req: http::Request) -> http::Response {
+    let f = parse_body(req.body)
+    let token = field(f, "token")
+    let code = field(f, "code").trim()
+    if token.len() == 0 { return err_json(400, "a login code challenge is required") }
+    if !six_digits(code) { return err_json(400, "the code is the six digits from the mail") }
+    let ip = peer_key(req)
+    let mut eng = open_eng(app)
+    let mut ch = TwoFactorChallenge { uid: -1, expires_at: 0, attempts: 0 }
+    match get_2fa_challenge(&mut eng, token) {
+        None => return err_json(400, "this login code request is invalid or has expired - log in again")
+        Some(c) => ch = c
+    }
+    if ch.attempts >= TWOFACTOR_MAX_ATTEMPTS {
+        del_2fa_challenge(&mut eng, token)
+        return err_json(400, "too many wrong codes - log in again for a new one")
+    }
+    if !code_matches(two_factor_secret(&mut eng, ch.uid), code, now_ms()) {
+        bump_2fa_attempts(&mut eng, token)
+        let store = read_store(&mut eng)
+        match find_user(store, ch.uid) {
+            Some(u) => record_failed_login(app, ip, u.username)
+            None => ()
+        }
+        return err_json(400, "wrong code")
+    }
+    del_2fa_challenge(&mut eng, token)
+    let store = read_store(&mut eng)
+    match find_user(store, ch.uid) {
+        None => return err_json(400, "the account no longer exists")
+        Some(u) => {
+            clear_failed_logins(app, ip, u.username)
+            let now = now_ms()
+            let sess = new_token("s:" + now.to_string() + ":" + u.username)
+            exec_sql(&mut eng, "INSERT INTO sessions VALUES (" + sqlq(sess) + ", " + u.id.to_string()
+                + ", " + now.to_string() + ", " + (now + 30 * 24 * 3600 * 1000).to_string() + ")")
+            return ok_json(user_json(u, true)).with_header("Set-Cookie", "postwisp_session=" + sess
+                + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000")
+        }
+    }
+}
+
+
+fn user_json(u: User, two_factor: bool) -> String {
+    let mut tf = "false"
+    if two_factor { tf = "true" }
+    return "{\"id\":" + u.id.to_string() + ",\"username\":" + json_quote(u.username)
+    + ",\"email\":" + json_quote(u.email) + ",\"role\":" + json_quote(u.role)
+    + ",\"two_factor\":" + tf + "}"
 }
 
 
 fn handle_me(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
-        Ok(u) => return ok_json(user_json(u))
+        Ok(u) => {
+            let mut eng = open_eng(app)
+            return ok_json(user_json(u, two_factor_on(&mut eng, u.id)))
+        }
     }
 }
 
@@ -1701,7 +2048,7 @@ fn handle_create_user(app: App, req: http::Request) -> http::Response {
             }
             if id + 1 > store.next_user_id { store.next_user_id = id + 1 }
             store.users.push(u)
-            return ok_json(user_json(u))
+            return ok_json(user_json(u, false))
         }
     }
 }
@@ -1729,6 +2076,17 @@ fn handle_update_account(app: App, req: http::Request) -> http::Response {
                 new_hash = hash_password(new_pw)
             }
             let mut eng = open_eng(app)
+            // Two-factor opt-in: an absent field keeps the current setting,
+            // so a caller that only changes the password cannot switch it.
+            let tf = field(f, "two_factor")
+            let mut two_factor = two_factor_on(&mut eng, me.id)
+            if tf == "true" || tf == "false" {
+                two_factor = tf == "true"
+                if two_factor && !strings::contains(email, "@") {
+                    return err_json(400, "two-factor login needs an email address on the account")
+                }
+                set_two_factor(&mut eng, me.id, two_factor)
+            }
             if new_hash.len() > 0 {
                 exec_sql(&mut eng, "UPDATE users SET email = " + sqlq(email) + ", password = " + sqlq(new_hash)
                     + " WHERE rowid = " + me.id.to_string())
@@ -1743,7 +2101,7 @@ fn handle_update_account(app: App, req: http::Request) -> http::Response {
                 password: new_hash
                 role: me.role
                 created_at: me.created_at
-            }))
+            }, two_factor))
         }
     }
 }
@@ -1775,6 +2133,10 @@ fn post_sort_key(p: Post) -> i64 {
 
 fn post_cmp(a: Post, b: Post) -> i64 {
     if post_sort_key(a) > post_sort_key(b) { return -1 }
+    if post_sort_key(a) < post_sort_key(b) { return 1 }
+    // same sort key: higher id first, matching pub_cmp's tie-break so
+    // the dashboard list never reorders between two loads
+    if a.id > b.id { return -1 }
     1
 }
 
@@ -2331,6 +2693,8 @@ fn i18n_catalog() -> Vec<Vec<String>> {
         #["latest", "Latest posts", "Neueste Beiträge", "Derniers articles", "Últimas publicaciones"],
         #["empty_home", "No posts yet. The first post will appear here.", "Noch keine Beiträge. Der erste Beitrag erscheint hier.", "Aucun article pour le moment. Le premier apparaîtra ici.", "Aún no hay publicaciones. La primera aparecerá aquí."],
         #["empty_list", "No posts yet.", "Noch keine Beiträge.", "Aucun article pour le moment.", "Aún no hay publicaciones."],
+        #["toc_title", "Contents", "Inhalt", "Sommaire", "Contenido"],
+        #["anchor_label", "Link to this section", "Link zu diesem Abschnitt", "Lien vers cette section", "Enlace a esta sección"],
         #["no_tag_posts", "No posts with the tag \"{tag}\".", "Keine Beiträge mit dem Tag \"{tag}\".", "Aucun article avec l'étiquette « {tag} ».", "No hay publicaciones con la etiqueta \"{tag}\"."],
         #["tag_title", "Posts tagged \"{tag}\"", "Beiträge mit dem Tag \"{tag}\"", "Articles étiquetés « {tag} »", "Publicaciones con la etiqueta \"{tag}\""],
         #["tag_sub", "Every published post with the tag \"{tag}\".", "Alle veröffentlichten Beiträge mit dem Tag \"{tag}\".", "Tous les articles publiés avec l'étiquette « {tag} ».", "Todas las publicaciones con la etiqueta \"{tag}\"."],
@@ -2651,6 +3015,10 @@ fn site_fields(app: App, lang: String, owner: i64 = -1, owner_name: String = "")
     m.insert("latest", tr(lang, "latest"))
     m.insert("empty_home", tr(lang, "empty_home"))
     m.insert("empty_list", tr(lang, "empty_list"))
+    // raw, like nav_posts: both land inside a JS string literal in
+    // post.html's script, where HTML entities would render literally
+    m.insert("toc_title", tr(lang, "toc_title"))
+    m.insert("anchor_label", tr(lang, "anchor_label"))
     m.insert("about_title", tr(lang, "about_title"))
     // attribute-escaped copies: the list page's client script fills the
     // {tag} slot from the active chip, so these arrive via data-* attrs
@@ -2779,6 +3147,11 @@ fn handle_public_post(app: App, req: http::Request) -> http::Response {
 
 fn pub_cmp(a: Post, b: Post) -> i64 {
     if a.published_at > b.published_at { return -1 }
+    if a.published_at < b.published_at { return 1 }
+    // same instant (millis collide easily on a save burst): the newer
+    // post — the higher id — comes first, so the feed and the cards
+    // settle on one order instead of shuffling per request
+    if a.id > b.id { return -1 }
     1
 }
 
@@ -2797,27 +3170,160 @@ fn handle_feed(app: App, req: http::Request) -> http::Response {
             }
             mine.sort_by(|a, b| pub_cmp(a, b))
             if mine.len() > 20 { mine.truncate(20) }
-            let base = "/" + u.username
             let f = settings_map_for(app, u.id)
-            let mut xml = String::new()
-            xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
-            xml += "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
-            xml += "<title>" + escape_html(get_setting(f, "title", u.username)) + "</title>\n"
-            xml += "<link href=\"" + base + "/feed.xml\" rel=\"self\"/>\n"
-            xml += "<updated>" + (if mine.len() > 0 { codec::datetime::render(mine[0].published_at) } else { codec::datetime::render(now_ms()) }) + "</updated>\n"
-            for p in mine {
-                let link = base + "/" + p.slug
-                xml += "<entry>\n<title>" + escape_html(p.title) + "</title>\n"
-                xml += "<link href=\"" + link + "\"/>\n"
-                xml += "<id>" + link + "</id>\n"
-                xml += "<updated>" + codec::datetime::render(p.published_at) + "</updated>\n"
-                xml += "<content type=\"html\">" + escape_html(p.content) + "</content>\n"
-                xml += "</entry>\n"
-            }
-            xml += "</feed>\n"
+            let feed_title = get_setting(f, "title", u.username)
+            // Every href and id is absolute: a feed reader resolves the
+            // file offline, so a relative path is a broken link there.
+            // The author element is required by RFC 4287 and was missing.
+            let xml = feed_xml(base_url_of(req), u.username, feed_title, mine)
             return http::Response::text(200, xml).with_header("Content-Type", "application/atom+xml")
         }
     }
+}
+
+
+// Pure Atom builder, separated from the handler so the suite can assert
+// on the feed's content independent of storage and settings.
+
+fn feed_xml(base: String, username: String, feed_title: String, mine: Vec<Post>) -> String {
+    let root = base + "/" + username
+    let mut xml = String::new()
+    xml += "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+    xml += "<feed xmlns=\"http://www.w3.org/2005/Atom\">\n"
+    xml += "<title>" + escape_html(feed_title) + "</title>\n"
+    xml += "<link href=\"" + escape_html(root) + "\" rel=\"alternate\" type=\"text/html\"/>\n"
+    xml += "<link href=\"" + escape_html(root + "/feed.xml") + "\" rel=\"self\" type=\"application/atom+xml\"/>\n"
+    xml += "<id>" + escape_html(root + "/feed.xml") + "</id>\n"
+    xml += "<author><name>" + escape_html(username) + "</name></author>\n"
+    xml += "<updated>" + (if mine.len() > 0 { codec::datetime::render(mine[0].published_at) } else { codec::datetime::render(now_ms()) }) + "</updated>\n"
+    for p in mine {
+        let link = escape_html(root + "/" + p.slug)
+        xml += "<entry>\n<title>" + escape_html(p.title) + "</title>\n"
+        xml += "<link href=\"" + link + "\" rel=\"alternate\" type=\"text/html\"/>\n"
+        xml += "<id>" + link + "</id>\n"
+        xml += "<updated>" + codec::datetime::render(p.published_at) + "</updated>\n"
+        xml += "<content type=\"html\">" + escape_html(p.content) + "</content>\n"
+        xml += "</entry>\n"
+    }
+    xml += "</feed>\n"
+    xml
+}
+
+
+// ---------- favicon & robots ----------
+//
+// Every first visit and every crawler pass used to cost a 404 HTML page
+// (browsers request /favicon.ico unprompted; robots.txt is the first thing
+// a polite crawler reads). Both now answer properly. The icon is a real
+// ICO built here — a 16x16 32bpp crescent in the site accent — so there is
+// no binary asset to ship beside the source and the suite can assert on
+// its bytes.
+
+fn push_u16(out: &mut Vec<u8>, v: i64) {
+    out.push((v & 0xFF) as u8)
+    out.push(((v >> 8) & 0xFF) as u8)
+}
+
+
+fn push_u32(out: &mut Vec<u8>, v: i64) {
+    out.push((v & 0xFF) as u8)
+    out.push(((v >> 8) & 0xFF) as u8)
+    out.push(((v >> 16) & 0xFF) as u8)
+    out.push(((v >> 24) & 0xFF) as u8)
+}
+
+
+// A crescent ("wisp") on transparency: the accent disc minus an offset
+// disc. Squared distances only — no sqrt, no floats past the compare.
+
+fn favicon_ico() -> Vec<u8> {
+    let w = 16
+    let h = 16
+    let r_out = 7.2 * 7.2   // main disc, centred slightly low
+    let r_cut = 5.6 * 5.6   // bite from the upper right
+    let mut xor: Vec<u8> = #[]   // bottom-up BGRA rows
+    let mut y_top = h - 1
+    while y_top >= 0 {
+        let mut x = 0
+        while x < w {
+            let dx1 = (x as f64 - 7.5) * (x as f64 - 7.5)
+            let dy1 = (y_top as f64 - 8.5) * (y_top as f64 - 8.5)
+            let dx2 = (x as f64 - 10.2) * (x as f64 - 10.2)
+            let dy2 = (y_top as f64 - 5.8) * (y_top as f64 - 5.8)
+            let in_disc = dx1 + dy1 <= r_out
+            let in_bite = dx2 + dy2 <= r_cut
+            if in_disc && !in_bite {
+                // accent #4fc3a7 as BGRA
+                xor.push(0xA7)
+                xor.push(0xC3)
+                xor.push(0x4F)
+                xor.push(0xFF)
+            } else {
+                xor.push(0)
+                xor.push(0)
+                xor.push(0)
+                xor.push(0)
+            }
+            x += 1
+        }
+        y_top -= 1
+    }
+    // AND mask: 32bpp alpha already carries transparency, all-zero mask
+    let mask_row = 4 // one 32-bit mask word covers 16 1-bit pixels
+    let img_len = 40 + w * h * 4 + h * mask_row
+    let mut ico: Vec<u8> = #[]
+    push_u16(&mut ico, 0)      // reserved
+    push_u16(&mut ico, 1)      // type: icon
+    push_u16(&mut ico, 1)      // one image
+    ico.push(w as u8)
+    ico.push(h as u8)
+    ico.push(0)                // palette
+    ico.push(0)                // reserved
+    push_u16(&mut ico, 1)      // colour planes
+    push_u16(&mut ico, 32)     // bits per pixel
+    push_u32(&mut ico, img_len)
+    push_u32(&mut ico, 22)     // data offset: 6 + 16
+    // BITMAPINFOHEADER; height doubled = XOR rows + AND rows
+    push_u32(&mut ico, 40)
+    push_u32(&mut ico, w)
+    push_u32(&mut ico, h * 2)
+    push_u16(&mut ico, 1)
+    push_u16(&mut ico, 32)
+    push_u32(&mut ico, 0)      // BI_RGB
+    push_u32(&mut ico, w * h * 4)
+    push_u32(&mut ico, 0)
+    push_u32(&mut ico, 0)
+    push_u32(&mut ico, 0)
+    push_u32(&mut ico, 0)
+    for b in xor { ico.push(b) }
+    let mut m = 0
+    while m < h * mask_row { ico.push(0); m += 1 }
+    ico
+}
+
+
+fn handle_favicon(app: App, req: http::Request) -> http::Response {
+    let ico = favicon_ico()
+    let mut stream = http::ResponseStream::new()
+    stream.write_bytes(ico)
+    stream.close()
+    return http::Response::stream(200, "image/x-icon", stream)
+        .with_header("Cache-Control", "public, max-age=86400")
+}
+
+
+fn handle_robots(app: App, req: http::Request) -> http::Response {
+    // public pages and media are fine to index; the app surfaces are not
+    let txt = "User-agent: *\n"
+        + "Allow: /\n"
+        + "Disallow: /api/\n"
+        + "Disallow: /editor\n"
+        + "Disallow: /settings\n"
+        + "Disallow: /dashboard\n"
+        + "Disallow: /setup\n"
+    return http::Response::text(200, txt)
+        .with_header("Content-Type", "text/plain; charset=utf-8")
+        .with_header("Cache-Control", "public, max-age=3600")
 }
 
 
@@ -2838,18 +3344,37 @@ fn serve_web_file(app: App, req: http::Request, name: String) -> http::Response 
 
 
 fn serve_web_css(app: App, req: http::Request, name: String) -> http::Response {
-    let lang = lang_of(app, req)
-    match fs::read_to_string(app.web_dir + "/" + name) {
-        Ok(css) => return http::Response::text(200, css).with_header("Content-Type", "text/css; charset=utf-8")
-        Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
-    }
+    return web_asset_response(app, req, name, "text/css; charset=utf-8")
 }
 
 
 fn serve_web_js(app: App, req: http::Request, name: String) -> http::Response {
+    return web_asset_response(app, req, name, "text/javascript; charset=utf-8")
+}
+
+
+// The built-in pages' own assets (app.css, theme-boot.js, the editor's
+// milkdown.js/css) are a megabyte of editor payload that changes only when
+// the binary does. They carry a strong ETag over the file's bytes plus a
+// short freshness window: a repeat visit revalidates and usually
+// transfers nothing, while a changed file picks up immediately (these are
+// not fingerprinted URLs, so max-age stays modest).
+
+fn web_asset_response(app: App, req: http::Request, name: String, ctype: String) -> http::Response {
     let lang = lang_of(app, req)
     match fs::read_to_string(app.web_dir + "/" + name) {
-        Ok(js) => return http::Response::text(200, js).with_header("Content-Type", "text/javascript; charset=utf-8")
+        Ok(body) => {
+            let etag = format("\"z{:x}\"", crc32::checksum(body.as_bytes()))
+            if etag_match(req, etag) {
+                return http::Response::text(304, "")
+                    .with_header("ETag", etag)
+                    .with_header("Cache-Control", "public, max-age=300")
+            }
+            return http::Response::text(200, body)
+                .with_header("Content-Type", ctype)
+                .with_header("ETag", etag)
+                .with_header("Cache-Control", "public, max-age=300")
+        }
         Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
     }
 }
@@ -2988,7 +3513,13 @@ fn settings_json(app: App) -> String {
 fn handle_get_settings(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
-        Ok(u) => return ok_json(settings_json_for(app, u.id, u.username))
+        Ok(u) => {
+            // the Unsplash key rides on the owner's own settings answer
+            // only — /api/public/site serves the same JSON without it
+            let f = settings_map_for(app, u.id)
+            let key = get_setting(f, "unsplash_key", "")
+            return ok_json(settings_json_for(app, u.id, u.username, ",\"unsplash_key\":" + json_quote(key)))
+        }
     }
 }
 
@@ -3011,6 +3542,11 @@ fn handle_put_settings(app: App, req: http::Request) -> http::Response {
             if theme != "light" && theme != "dark" { return err_json(400, "theme must be light or dark") }
             let mut language = get_setting(f, "language", get_setting(cur, "language", "en"))
             if !valid_lang(language) { return err_json(400, "language must be one of en, de, fr, es") }
+            // Unsplash access key for the editor's image search: saved
+            // server-side (setup.sh or the settings page) so every browser
+            // the author logs in from shares it. Never served publicly.
+            let unsplash = get_setting(f, "unsplash_key", get_setting(cur, "unsplash_key", ""))
+            if unsplash.len() > 128 { return err_json(400, "unsplash key too long (max 128)") }
             if title.len() == 0 || title.len() > 100 { return err_json(400, "title required (max 100)") }
             if tagline.len() > 200 { return err_json(400, "tagline too long (max 200)") }
             if description.len() > 500 { return err_json(400, "description too long (max 500)") }
@@ -3022,6 +3558,7 @@ fn handle_put_settings(app: App, req: http::Request) -> http::Response {
             + ",\"show_credit\":" + json_quote(credit)
             + ",\"theme\":" + json_quote(theme)
             + ",\"language\":" + json_quote(language)
+            + ",\"unsplash_key\":" + json_quote(unsplash)
             + "}"
             let mut eng = open_eng(app)
             let key = "postwisp/settings/" + u.id.to_string()
@@ -3377,6 +3914,7 @@ fn router(app: App) -> router::Router {
         .get("/setup", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
         .post("/api/setup", fn(req: http::Request) -> http::Response { return handle_setup(app, req) })
         .post("/api/login", fn(req: http::Request) -> http::Response { return handle_login(app, req) })
+        .post("/api/login/2fa", fn(req: http::Request) -> http::Response { return handle_login_2fa(app, req) })
         .post("/api/recover", fn(req: http::Request) -> http::Response { return handle_recover(app, req) })
         .post("/api/reset", fn(req: http::Request) -> http::Response { return handle_reset(app, req) })
         .post("/api/logout", fn(req: http::Request) -> http::Response { return handle_logout(app, req) })
@@ -3397,6 +3935,8 @@ fn router(app: App) -> router::Router {
         .get("/theme.css", fn(req: http::Request) -> http::Response { return handle_theme_css(app, req) })
         .get("/app.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, req, "app.css") })
         .get("/theme-boot.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "theme-boot.js") })
+        .get("/milkdown.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "milkdown.js") })
+        .get("/milkdown.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, req, "milkdown.css") })
         .get("/", fn(req: http::Request) -> http::Response { return handle_home(app, req) })
         .get("/posts", fn(req: http::Request) -> http::Response { return handle_list(app, req) })
         .get("/about", fn(req: http::Request) -> http::Response { return handle_about(app, req) })
@@ -3406,6 +3946,8 @@ fn router(app: App) -> router::Router {
         // redirect so bookmarks and old links keep working
         .get("/dashboard", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
         .get("/admin", fn(req: http::Request) -> http::Response { return http::Response::text(302, "").with_header("Location", "/dashboard") })
+        .get("/favicon.ico", fn(req: http::Request) -> http::Response { return handle_favicon(app, req) })
+        .get("/robots.txt", fn(req: http::Request) -> http::Response { return handle_robots(app, req) })
         .get("/api/public/site", fn(req: http::Request) -> http::Response { return handle_public_site(app, req) })
         .get("/api/public/posts", fn(req: http::Request) -> http::Response { return handle_public_posts(app, req) })
         .get("/api/settings", fn(req: http::Request) -> http::Response { return handle_get_settings(app, req) })
@@ -3417,10 +3959,26 @@ fn router(app: App) -> router::Router {
 }
 
 
+fn listen_addr() -> String {
+    // PW_ADDR pins the bind address (e.g. "0.0.0.0:80" to serve a LAN,
+    // "127.0.0.1:9000" when something else holds the default port);
+    // anything unparsable falls back to the loopback default rather
+    // than refusing to start.
+    match env::var("PW_ADDR") {
+        Some(a) => {
+            if a.contains(":") && a.len() > 0 { return a }
+        }
+        None => ()
+    }
+    "127.0.0.1:8080"
+}
+
+
 fn main() {
     let app = new_app()
-    println("postwisp listening on 127.0.0.1:8080 (data: " + app.dir + ", templates: " + app.tpl_dir + ")")
-    match http::serve("127.0.0.1:8080", router(app)) {
+    let addr = listen_addr()
+    println("postwisp listening on " + addr + " (data: " + app.dir + ", templates: " + app.tpl_dir + ")")
+    match http::serve(addr, router(app)) {
         Ok(_) => ()
         Err(e) => eprintln("serve failed: {}", e)
     }
@@ -3474,6 +4032,11 @@ fn media_kind_hint_and_extension() {
     assert_eq(media_kind("/u/media/abc", ""), "")
     // a malformed hint is not a link at all, so kind never sees it
     assert_eq(media_kind("u", "wrong"), "")
+    // the ?embed= query is how the Milkdown uploader marks an
+    // extension-less media URL; it survives editor round-trips
+    assert_eq(media_kind("/u/media/abc?embed=video", ""), "video")
+    assert_eq(media_kind("/u/media/abc?embed=audio", ""), "audio")
+    assert_eq(media_kind("/u/media/abc?embed=1", ""), "")
 }
 
 #[test]
@@ -3489,17 +4052,26 @@ fn markdown_embeds_video_and_audio_players() {
     assert_eq(h2.contains("<video controls"), true)
     let h3 = render_markdown("![song](https://e.com/x.ogg)\n")
     assert_eq(h3.contains("<audio controls"), true)
+    // a quoted hint — the form markdown serializers emit for a title —
+    // still embeds a player (posts round-trip through the Milkdown editor)
+    let h4 = render_markdown("![clip](/u/media/abc \"video\")\n![song](/u/media/def 'audio')\n")
+    assert_eq(h4.contains("<video controls preload=\"metadata\" src=\"/u/media/abc\"></video>"), true)
+    assert_eq(h4.contains("<audio controls preload=\"metadata\" src=\"/u/media/def\">song</audio>"), true)
+    // a captioned image — Milkdown's ![ratio](url "caption") form — keeps
+    // its caption as the img title
+    let h8 = render_markdown("![1.00](/u/media/img1 \"tiny.png\")\n")
+    assert_eq(h8.contains("<img src=\"/u/media/img1\" alt=\"1.00\" title=\"tiny.png\">"), true)
     // a plain image is untouched
-    let h4 = render_markdown("![pic](/u/media/img1)\n")
-    assert_eq(h4.contains("<img src=\"/u/media/img1\""), true)
+    let h5 = render_markdown("![pic](/u/media/img1)\n")
+    assert_eq(h5.contains("<img src=\"/u/media/img1\""), true)
     // a bogus hint word degrades to literal text, never a player
-    let h5 = render_markdown("![x](https://e.com/a.png bogus)\n")
-    assert_eq(h5.contains("<video"), false)
-    assert_eq(h5.contains("<audio"), false)
-    assert_eq(h5.contains("![x]"), true)
+    let h6 = render_markdown("![x](https://e.com/a.png bogus)\n")
+    assert_eq(h6.contains("<video"), false)
+    assert_eq(h6.contains("<audio"), false)
+    assert_eq(h6.contains("![x]"), true)
     // the javascript: block still applies to player sources
-    let h6 = render_markdown("![x](javascript:alert(1) video)\n")
-    assert_eq(h6.contains("src=\"#\""), true)
+    let h7 = render_markdown("![x](javascript:alert(1) video)\n")
+    assert_eq(h7.contains("src=\"#\""), true)
 }
 
 #[test]
@@ -3844,9 +4416,154 @@ fn user_json_lists_account_fields() {
         role: "author"
         created_at: 5
     }
-    let want = "{\"id\":7,\"username\":\"daniel\""
-        + ",\"email\":\"d@example.net\",\"role\":\"author\"}"
-    assert_eq(user_json(u), want)
+    assert_eq(user_json(u, false),
+        "{\"id\":7,\"username\":\"daniel\",\"email\":\"d@example.net\",\"role\":\"author\",\"two_factor\":false}")
+    assert_eq(user_json(u, true),
+        "{\"id\":7,\"username\":\"daniel\",\"email\":\"d@example.net\",\"role\":\"author\",\"two_factor\":true}")
+}
+
+
+// ---------- two-factor login ----------
+
+#[test]
+
+fn totp_codes_are_six_digits_and_step_bound() {
+    let secret = new_token("probe")
+    // a code is always six decimal digits, whatever the step
+    for s in #[0, 1, 7, 123456, -1] {
+        let c = totp_code(secret, s)
+        assert_eq(six_digits(c), true, "code for step " + s.to_string() + " must be six digits: " + c)
+    }
+    // consecutive steps give (almost surely) different codes
+    assert_eq(totp_code(secret, 100) == totp_code(secret, 101), false)
+    // the code is reproducible and matches across one step boundary
+    let now = now_ms()
+    let cur = totp_code(secret, totp_step(now))
+    assert_eq(code_matches(secret, cur, now), true)
+    assert_eq(code_matches(secret, cur, now + TOTP_STEP_MS), true, "a just-mailed code must survive one step boundary")
+    assert_eq(code_matches(secret, cur, now + 5 * TOTP_STEP_MS), false, "an old code must stop matching")
+    assert_eq(code_matches(secret, "000000", now), false)
+    // the shape check rejects anything that is not six digits
+    assert_eq(six_digits("12345"), false)
+    assert_eq(six_digits("1234567"), false)
+    assert_eq(six_digits("12a456"), false)
+    assert_eq(six_digits(""), false)
+}
+
+
+#[test]
+
+fn two_factor_challenges_expire_and_burn() {
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    let app = new_app()
+    let mut eng = open_eng(app)
+    // a fresh challenge answers, a wrong code keeps it alive but burns an
+    // attempt, and the budget of wrong codes kills it
+    put_2fa_challenge(&mut eng, "tok-2fa", 9, now_ms() + TWOFACTOR_VALIDITY_MS, 0)
+    assert_eq(get_2fa_challenge(&mut eng, "tok-2fa").is_some(), true)
+    bump_2fa_attempts(&mut eng, "tok-2fa")
+    match get_2fa_challenge(&mut eng, "tok-2fa") {
+        Some(ch) => {
+            assert_eq(ch.uid, 9)
+            assert_eq(ch.attempts, 1)
+        }
+        None => assert(false, "a wrong code must keep the challenge retryable")
+    }
+    bump_2fa_attempts(&mut eng, "tok-2fa")
+    bump_2fa_attempts(&mut eng, "tok-2fa")
+    match get_2fa_challenge(&mut eng, "tok-2fa") {
+        Some(ch) => assert_eq(ch.attempts >= TWOFACTOR_MAX_ATTEMPTS, true, "the attempt budget must be reachable")
+        None => assert(false, "the challenge survives until the endpoint judges the budget")
+    }
+    // an expired challenge is gone on sight
+    put_2fa_challenge(&mut eng, "tok-old", 9, now_ms() - 1, 0)
+    assert_eq(get_2fa_challenge(&mut eng, "tok-old").is_none(), true)
+    // a malformed row and an unknown token are both just invalid
+    let _ = eng.store.put("postwisp/2fa/chal/tok-junk", "garbage".as_bytes())
+    assert_eq(get_2fa_challenge(&mut eng, "tok-junk").is_none(), true)
+    assert_eq(get_2fa_challenge(&mut eng, "tok-nope").is_none(), true)
+    // the opt-in flag and the secret round-trip
+    assert_eq(two_factor_on(&mut eng, 9), false)
+    set_two_factor(&mut eng, 9, true)
+    assert_eq(two_factor_on(&mut eng, 9), true)
+    set_two_factor(&mut eng, 9, false)
+    assert_eq(two_factor_on(&mut eng, 9), false)
+    let s1 = two_factor_secret(&mut eng, 9)
+    assert_eq(s1.len() >= 32, true, "the secret is 32 hex chars from the CSPRNG")
+    assert_eq(two_factor_secret(&mut eng, 9), s1, "the secret is minted once and then stable")
+    let _ = fs::remove_dir_all(dir)
+}
+
+
+#[test]
+
+fn login_with_two_factor_answers_a_challenge_then_a_session() {
+    let dir = env::temp_dir() + "/pw-test-" + new_token("d")
+    let _ = fs::create_dir_all(dir)
+    env::set_var("PW_DATA", dir)
+    env::set_var("PW_SMTP_HOST", "127.0.0.1")
+    env::set_var("PW_SMTP_PORT", "1") // nothing listens: the send fails fast, the flow still runs
+    let app = new_app()
+    let mut eng = open_eng(app)
+    let uid = insert_user_row(&mut eng, "bob", "bob@example.net", hash_password("hunter2hunter2!"), "author")
+    set_two_factor(&mut eng, uid, true)
+
+    // before opt-in, the password alone logs in
+    let r_plain = handle_login(app, treq("/api/login", "{\"username\":\"bob\",\"password\":\"hunter2hunter2!\"}"))
+    assert_eq(r_plain.status, 200, "a plain account logs straight in")
+
+    // after opt-in, the same credentials answer a challenge, no session
+    set_two_factor(&mut eng, uid, true)
+    let r_chal = handle_login(app, treq("/api/login", "{\"username\":\"bob\",\"password\":\"hunter2hunter2!\"}"))
+    assert_eq(r_chal.status, 200)
+    assert_eq(strings::contains(r_chal.body, "\"two_factor\":true"), true, "the login must hand back a challenge: " + r_chal.body)
+    assert_eq(strings::contains(r_chal.body, "\"token\""), true)
+    let tok = field(parse_body(r_chal.body), "token")
+
+    // a wrong password never reaches the code step
+    let r_bad = handle_login(app, treq("/api/login", "{\"username\":\"bob\",\"password\":\"wrongwrong1!\"}"))
+    assert_eq(r_bad.status, 401)
+
+    // the code the server would have mailed closes the login
+    let code = totp_code(two_factor_secret(&mut eng, uid), totp_step(now_ms()))
+    let r_code = handle_login_2fa(app, treq("/api/login/2fa", "{\"token\":" + json_quote(tok) + ",\"code\":\"" + code + "\"}"))
+    assert_eq(r_code.status, 200, "the mailed code must open the session: " + r_code.body)
+    let mut cookie = ""
+    for (n, v) in r_code.headers {
+        if n.to_lowercase() == "set-cookie" { cookie = v }
+    }
+    assert_eq(cookie.starts_with("postwisp_session="), true, "the code must log the user in")
+
+    // the challenge is single-use: a replayed code is just invalid
+    let r_replay = handle_login_2fa(app, treq("/api/login/2fa", "{\"token\":" + json_quote(tok) + ",\"code\":\"" + code + "\"}"))
+    assert_eq(r_replay.status, 400)
+
+    // a wrong code is refused and retryable, an out-of-shape one never asked
+    set_two_factor(&mut eng, uid, true)
+    let r_chal2 = handle_login(app, treq("/api/login", "{\"username\":\"bob\",\"password\":\"hunter2hunter2!\"}"))
+    assert_eq(r_chal2.status, 200)
+    let tok2 = field(parse_body(r_chal2.body), "token")
+    let r_wrong = handle_login_2fa(app, treq("/api/login/2fa", "{\"token\":" + json_quote(tok2) + ",\"code\":\"000000\"}"))
+    assert_eq(r_wrong.status, 400)
+    let r_shape = handle_login_2fa(app, treq("/api/login/2fa", "{\"token\":" + json_quote(tok2) + ",\"code\":\"abc\"}"))
+    assert_eq(r_shape.status, 400)
+    // the challenge survives the wrong tries and still closes
+    let code2 = totp_code(two_factor_secret(&mut eng, uid), totp_step(now_ms()))
+    let r_close = handle_login_2fa(app, treq("/api/login/2fa", "{\"token\":" + json_quote(tok2) + ",\"code\":\"" + code2 + "\"}"))
+    assert_eq(r_close.status, 200, "a wrong code must not kill the challenge: " + r_close.body)
+
+    // opt-out restores single-step login
+    set_two_factor(&mut eng, uid, false)
+    let r_off = handle_login(app, treq("/api/login", "{\"username\":\"bob\",\"password\":\"hunter2hunter2!\"}"))
+    assert_eq(r_off.status, 200)
+    assert_eq(strings::contains(r_off.body, "\"token\""), false, "no challenge once opted out: " + r_off.body)
+
+    // leave the environment clean for the tests that follow
+    env::set_var("PW_SMTP_HOST", "")
+    env::set_var("PW_SMTP_PORT", "")
+    let _ = fs::remove_dir_all(dir)
 }
 
 
@@ -4185,6 +4902,143 @@ fn reset_sets_password_logs_in_and_kills_old_sessions() {
     // a replayed token is just another invalid one
     let r_replay = handle_reset(app, treq("/api/reset", "{\"token\":\"tok-reset\",\"password\":\"third password3!\"}"))
     assert_eq(r_replay.status, 400)
+}
+
+
+// ---------- tests: feed, ordering, favicon, asset caching ----------
+
+
+fn tpost(id: i64, user_id: i64, title: String, slug: String, status: String, published_at: i64) -> Post {
+    Post {
+        id: id
+        user_id: user_id
+        title: title
+        source: "# " + title
+        content: "<h1>" + title + "</h1>"
+        tags: ""
+        status: status
+        published_at: published_at
+        slug: slug
+        created_at: published_at
+        modified_at: published_at
+    }
+}
+
+
+fn tget(path: String, headers: Vec<(String, String)>) -> http::Request {
+    http::Request {
+        method: "GET"
+        path: path
+        query: ""
+        query_pairs: #[]
+        headers: headers
+        body: ""
+        raw_body: #[]
+        peer_addr: "127.0.0.1:1"
+    }
+}
+
+
+fn resp_header(r: http::Response, name: String) -> String {
+    for (n, v) in r.headers {
+        if n.to_lowercase() == name.to_lowercase() { return v }
+    }
+    ""
+}
+
+
+#[test]
+
+fn feed_is_valid_atom_with_absolute_urls() {
+    let posts = #[tpost(1, 7, "First", "first", "published", 1_700_000_000_000)
+        , tpost(2, 7, "Second", "second", "published", 1_700_000_060_000)]
+    let xml = feed_xml("https://example.com", "alice", "Alice's notes", posts)
+    // the feed-level author RFC 4287 requires
+    assert_eq(xml.contains("<author><name>alice</name></author>"), true, "feed must carry an author element")
+    // every href and id is absolute
+    assert_eq(xml.contains("href=\"https://example.com/alice/feed.xml\""), true, "self link must be absolute")
+    assert_eq(xml.contains("href=\"https://example.com/alice\""), true, "alternate link must be absolute")
+    assert_eq(xml.contains("<id>https://example.com/alice/second</id>"), true, "entry ids must be absolute")
+    assert_eq(xml.contains("href=\"https://example.com/alice/second\""), true, "entry links must be absolute")
+    assert_eq(xml.contains("rel=\"alternate\""), true, "links must name their relation")
+    // no relative href or id survives anywhere in the document
+    assert_eq(xml.contains("href=\"/"), false, "no relative href may remain")
+    assert_eq(xml.contains("<id>/"), false, "no relative id may remain")
+    // titles are escaped
+    let x2 = feed_xml("https://example.com", "bob", "Bob & <b>friends</b>", #[])
+    assert_eq(x2.contains("Bob &amp; &lt;b&gt;friends&lt;/b&gt;"), true, "the feed title must be escaped")
+}
+
+
+#[test]
+
+fn post_ordering_is_deterministic_on_the_same_instant() {
+    let a = tpost(1, 7, "A", "a", "published", 1_700_000_000_000)
+    let b = tpost(2, 7, "B", "b", "published", 1_700_000_000_000)
+    // same millisecond: the newer post (higher id) sorts first, both ways
+    assert_eq(pub_cmp(b, a), -1, "higher id wins on a tie")
+    assert_eq(pub_cmp(a, b), 1, "the tie-break is stable in both directions")
+    assert_eq(post_cmp(b, a), -1, "the dashboard sort shares the tie-break")
+    let mut xs = #[a, b]
+    xs.sort_by(|p, q| pub_cmp(p, q))
+    assert_eq(xs[0].id, 2, "the sorted feed begins with the newer post")
+    assert_eq(xs[1].id, 1)
+}
+
+
+#[test]
+
+fn favicon_is_a_wellformed_ico_with_transparency() {
+    let ico = favicon_ico()
+    let n = ico.len()
+    // ICONDIR: reserved 0, type 1 (icon), one image
+    assert_eq(n > 22, true, "the file must carry pixels past its headers")
+    assert_eq(ico[0], 0)
+    assert_eq(ico[2], 1)
+    assert_eq(ico[4], 1)
+    assert_eq(ico[6], 16)
+    assert_eq(ico[7], 16)
+    // the declared image length accounts for exactly the remaining bytes
+    let declared = (ico[14] as i64) | ((ico[15] as i64) << 8) | ((ico[16] as i64) << 16) | ((ico[17] as i64) << 24)
+    assert_eq(22 + declared, n, "the directory's size field must match the file")
+    // the pixel payload carries both the accent (B A7 C3 4F FF) and
+    // transparent (all zero) pixels — a crescent, not a full square
+    let mut accent = 0
+    let mut clear = 0
+    let mut i = 22 + 40
+    while i < n - 64 {
+        if ico[i] == 0 && ico[i + 1] == 0 && ico[i + 2] == 0 && ico[i + 3] == 0 { clear += 1 }
+        else { accent += 1 }
+        i += 4
+    }
+    assert_eq(accent > 0, true, "some pixels must be the accent colour")
+    assert_eq(clear > 0, true, "some pixels must be transparent")
+}
+
+
+#[test]
+
+fn built_in_assets_revalidate_to_304() {
+    // the suite runs from the project root, so web/ is the default web dir
+    let app = new_app()
+    let first = web_asset_response(app, tget("/app.css", #[]), "app.css", "text/css; charset=utf-8")
+    assert_eq(first.status, 200, "a first fetch must answer the file")
+    let etag = resp_header(first, "ETag")
+    assert_eq(etag.len() > 2, true, "the asset must carry a strong ETag")
+    let cc = resp_header(first, "Cache-Control")
+    assert_eq(cc.contains("max-age=300"), true, "the freshness window must be set")
+    // a revalidation naming that ETag transfers nothing
+    let again = web_asset_response(app, tget("/app.css", #[("If-None-Match", etag)]), "app.css", "text/css; charset=utf-8")
+    assert_eq(again.status, 304, "a matching If-None-Match must answer 304")
+    // a stale or absent ETag still serves the bytes
+    let stale = web_asset_response(app, tget("/app.css", #[("If-None-Match", "\"zzz\"")]), "app.css", "text/css; charset=utf-8")
+    assert_eq(stale.status, 200, "a non-matching ETag must answer the file")
+    // the wildcard form matches anything present
+    let wild = web_asset_response(app, tget("/app.css", #[("If-None-Match", "*")]), "app.css", "text/css; charset=utf-8")
+    assert_eq(wild.status, 304, "If-None-Match: * is a match")
+    // a missing file is a 404, never a crash
+    let gone = web_asset_response(app, tget("/nope.css", #[]), "nope.css", "text/css; charset=utf-8")
+    assert_eq(gone.status, 404, "a missing asset must answer 404")
 }
 
 // ---------- end of tests ----------

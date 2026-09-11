@@ -1,0 +1,43 @@
+/* scripts/milkdown-theme.css — appended to web/milkdown.css by
+   scripts/build-editor.sh. Crepe's component styles are driven by
+   --crepe-* variables; these bridge them to postwisp's own tokens
+   (defined on :root / [data-theme] in app.css), so the editor follows
+   the site's light/dark theme with no second palette to maintain. */
+
+.milkdown {
+  --crepe-color-background: var(--bg);
+  --crepe-color-on-background: var(--fg);
+  --crepe-color-surface: var(--bg-raised);
+  --crepe-color-surface-low: var(--bg-overlay);
+  --crepe-color-on-surface: var(--fg);
+  --crepe-color-on-surface-variant: var(--fg-muted);
+  --crepe-color-outline: var(--line);
+  --crepe-color-primary: var(--accent);
+  --crepe-color-secondary: var(--line-soft);
+  --crepe-color-on-secondary: var(--fg);
+  --crepe-color-inverse: var(--fg);
+  --crepe-color-on-inverse: var(--bg);
+  --crepe-color-inline-code: var(--danger);
+  --crepe-color-error: var(--danger);
+  --crepe-color-hover: var(--line-soft);
+  --crepe-color-selected: var(--bg-overlay);
+  --crepe-color-inline-area: var(--bg-overlay);
+
+  --crepe-font-title: var(--font-serif);
+  --crepe-font-default: var(--font-ui);
+  --crepe-font-code: var(--font-mono);
+}
+
+/* the editor pane sits where the old textarea was: give it a body-sized
+   writing area and the site's card treatment */
+.md-editor .milkdown {
+  min-height: 22rem;
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  padding: 0.25rem 0.75rem;
+}
+.md-editor .ProseMirror {
+  min-height: 20rem;
+  outline: none;
+}

@@ -125,13 +125,15 @@ thumbnail.
 
 Unsplash's API needs a free **Access Key**: create an app at
 <https://unsplash.com/oauth/applications> (demo tier: 50 requests/hour)
-and paste the key either
+and paste the key
 
+- when `scripts/setup.sh` asks during first-run setup,
 - on the **Settings** page (`/settings`, "Unsplash access key"), or
 - into the picker itself the first time you search.
 
-The key is stored in your browser only (`localStorage`), never on the
-server — each author supplies their own. Without a key, everything else
+The key is stored on the server with the author's settings, so every
+browser you log in from shares it; a key pasted straight into the picker
+is kept in that browser as a fallback. Without a key, everything else
 works; the button just asks for one.
 
 A post's header image is the first markdown image of its source, and it
@@ -193,6 +195,22 @@ translated or overridden. Adding a language is one row per message in
 the `i18n_catalog` in `src/main.gos` plus its month names; the test
 suite fails if a row or translation is missing or is an English copy.
 
+## Feeds, favicon, robots
+
+Each author has an Atom feed at `/<user>/feed.xml` (up to 20 published
+posts, newest first). Its URLs are absolute — scheme and host are resolved
+per request and honour `X-Forwarded-Proto` behind a TLS proxy — and it
+carries the `<author>` element RFC 4287 requires, so readers and
+validators resolve it outside the browser.
+
+`/favicon.ico` (a 16×32-bpp crescent in the site accent, built into the
+binary — nothing to deploy) and `/robots.txt` (public pages indexable,
+`/api/`, `/editor`, `/settings`, `/dashboard`, `/setup` disallowed)
+answer properly. The dashboard's own assets (`/app.css`,
+`/theme-boot.js`, `/milkdown.js`, `/milkdown.css`) carry a strong `ETag`
+and answer `304` on revalidation, so an author's browser re-checks them
+once every five minutes instead of re-downloading on every page.
+
 ## HTTPS
 
 TLS is out of scope for the binary. Put it behind a reverse proxy, e.g.
@@ -247,8 +265,21 @@ Behaviour worth knowing:
 - `gos build` — debug binary
 - Environment overrides: `PW_DATA` (data dir, default `data/`),
   `PW_TEMPLATES` (public templates, default `templates/`),
-  `PW_WEB` (built-in admin/editor pages, default `web/`), and the
-  `PW_SMTP_*` set for account recovery (see above)
+  `PW_WEB` (built-in admin/editor pages, default `web/`), `PW_ADDR`
+  (bind address, default `127.0.0.1:8080` — set `0.0.0.0:8080` to serve a
+  LAN), and the `PW_SMTP_*` set for account recovery (see above)
+
+## Two-factor login over email
+
+Any account with an email address can require a second step at login: tick
+**Require a login code from my email** on the Account page. After a correct
+password, postwisp mails a 6-digit code to the account's address, and the
+session exists only once the code is entered on the login screen. A code
+works once and stays valid for five minutes; a login request tolerates at
+most three wrong codes, and the server caps how many codes one source can
+ask for per ten minutes. The feature uses the same `PW_SMTP_*` settings as
+account recovery above; with no relay configured, a two-factor login is
+answered with a named 503 instead of a half-open door.
 
 ## Password hashing note
 

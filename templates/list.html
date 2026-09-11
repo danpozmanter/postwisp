@@ -142,6 +142,32 @@ footer.site-footer {
     margin-top: 4rem; padding: 1.4rem 0; font-size: var(--step--1);
 }
 
+/* ---- language switcher (injected by the server into .site-nav) ---- */
+.lang-switch {
+    background: transparent; border: 1px solid var(--line); color: var(--fg-muted);
+    border-radius: 99px; height: 2.1rem; padding: 0 0.2rem 0 0.6rem; cursor: pointer;
+    font: 500 0.82rem/1 var(--font-ui);
+    transition: color .15s ease, border-color .15s ease;
+}
+.lang-switch:hover { color: var(--fg); border-color: var(--fg-faint); }
+.lang-switch option { color: #23262e; background: #fff; }
+
+/* ---- small screens: the header keeps its shape, the page tightens ---- */
+@media (max-width: 720px) {
+    .site-header .wrap { flex-wrap: wrap; row-gap: 0.2rem; min-height: 3.2rem; padding-top: 0.4rem; padding-bottom: 0.4rem; }
+    .brand { font-size: var(--step-0); }
+    .site-nav { gap: 0.1rem; margin-left: auto; }
+    .site-nav a { padding: 0.35rem 0.45rem; }
+    .lang-switch { max-width: 5.5rem; }
+    main { padding-left: 1rem; padding-right: 1rem; }
+    .page-title { font-size: var(--step-2); }
+}
+@media (max-width: 480px) {
+    .cards { grid-template-columns: 1fr; gap: 0.9rem; }
+    .card:hover { transform: none; } /* a tap is not a hover: no jump */
+    .chips { gap: 0.35rem; }
+}
+
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>

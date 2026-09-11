@@ -15,16 +15,23 @@ step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32mOK:\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31mFAILED:\033[0m %s\n' "$*" >&2; exit 1; }
 ask()  { read -r -p "$1 " ans; echo "$ans"; }
+# ask_secret: like ask, but the typed text is not echoed (password entry)
+ask_secret() {
+    local ans
+    read -r -s -p "$1 " ans
+    echo >&2
+    printf '%s' "$ans"
+}
 # minimal JSON string escaping so quotes/backslashes in user input survive
 json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-step "1/5 Prerequisites"
+step "1/6 Prerequisites"
 [ -x "$BIN" ] || die "no postwisp binary in this directory (expected ./$BIN)"
 command -v curl >/dev/null 2>&1 || die "curl not found. Install curl first."
 [ -f templates/index.html ] || die "templates/ is missing next to the binary."
 ok "postwisp binary and templates present."
 
-step "2/5 Start the server"
+step "2/6 Start the server"
 echo "The server stores everything in ./${DATA_DIR}/. On first boot it prints a"
 echo "one-time setup URL containing a token. If ${DATA_DIR}/ already exists with"
 echo "users in it, setup is already done — restart at step 4."
@@ -53,14 +60,14 @@ else
     echo "The same URL was printed to the console: $(grep "first boot" "$BOOT_LOG")"
 fi
 
-step "3/5 Create the admin account"
+step "3/6 Create the admin account"
 while true; do
     USERNAME="$(ask "Admin username (lowercase letters/digits/-/_, or press Enter to abort):")"
     if [ -z "$USERNAME" ]; then
         die "aborted at user request (no admin account created)"
     fi
     EMAIL="$(ask "Admin email:")"
-    PASSWORD="$(ask "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
+    PASSWORD="$(ask_secret "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
     RESP="$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/api/setup" \
         -H 'Content-Type: application/json' \
         -d "{\"token\":\"$(json "$TOKEN")\",\"username\":\"$(json "$USERNAME")\",\"email\":\"$(json "$EMAIL")\",\"password\":\"$(json "$PASSWORD")\"}")"
@@ -76,7 +83,7 @@ while true; do
 done
 ok "Admin account '$USERNAME' created."
 
-step "4/5 Log in"
+step "4/6 Log in"
 RESP="$(curl -s -w '\n%{http_code}' -c "$JAR" -X POST "$BASE_URL/api/login" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"$(json "$USERNAME")\",\"password\":\"$(json "$PASSWORD")\"}")"
@@ -85,7 +92,7 @@ CODE="$(echo "$RESP" | tail -n1)"
 ok "Logged in; session cookie saved to $JAR."
 curl -sf -b "$JAR" "$BASE_URL/api/me" >/dev/null || die "session check failed (/api/me)."
 
-step "5/5 Choose the site theme"
+step "5/6 Choose the site theme"
 echo "postwisp is dark by default. This choice applies to the whole site"
 echo "(public pages, the post listing, and the admin dashboard)."
 THEME="$(ask "Theme — dark or light? [dark]:")"
@@ -100,6 +107,22 @@ RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
 CODE="$(echo "$RESP" | tail -n1)"
 [ "$CODE" = "200" ] || die "theme save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
 ok "Site theme set to '$THEME'."
+
+step "6/6 Unsplash access key (optional)"
+echo "The editor's image search and cover-photo picker use the Unsplash API."
+echo "A free Access Key comes from creating an app at"
+echo "  https://unsplash.com/oauth/applications  (demo tier: 50 requests/hour)."
+UKEY="$(ask "Paste your Unsplash Access Key (or press Enter to skip):")"
+if [ -n "$UKEY" ]; then
+    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+        -H 'Content-Type: application/json' \
+        -d "{\"unsplash_key\":\"$(json "$UKEY")\"}")"
+    CODE="$(echo "$RESP" | tail -n1)"
+    [ "$CODE" = "200" ] || die "Unsplash key save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
+    ok "Unsplash key saved with the server settings."
+else
+    echo "Skipped — you can add one later on the Settings page ($BASE_URL/settings)."
+fi
 
 echo
 echo "Verifying public output..."
