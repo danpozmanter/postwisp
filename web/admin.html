@@ -5,7 +5,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>postwisp</title>
 <link rel="stylesheet" href="/app.css">
-<link rel="stylesheet" href="/milkdown.css">
 <style>
 /* admin-specific bits not in the shared design system */
 main form.auth { margin-top: 2.5rem; }
@@ -18,7 +17,6 @@ main form.auth { margin-top: 2.5rem; }
 .media-glyph { font-size: 1.3rem; opacity: .7; }
 </style>
 <script src="/theme-boot.js"></script>
-<script src="/milkdown.js"></script>
 <script>
 // ---- tiny helpers ----
 function api(method, path, body) {
@@ -44,10 +42,6 @@ function fmtDate(ms) {
   if (!ms) return '';
   return new Date(ms).toISOString().slice(0, 10);
 }
-function slugify(t) {
-  return t.toLowerCase().trim().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
-}
-function validSlug(s) { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 96; }
 
 // theme applied pre-paint by /theme-boot.js; toggleTheme below only
 // flips it and remembers the choice.
@@ -59,12 +53,8 @@ function toggleTheme() {
 
 // ---- state ----
 let me = null;
-let editing = null;        // post being edited, or null for a new one
-let postStatus = 'draft';  // live status of the post in the editor
-let slugTouched = false;   // stop auto-following once the user edits the slug field
 let recoverToken = null;   // one-time token from a ?recover= link, consumed by /api/reset
 let twoFactorToken = null; // one-time challenge from a 2FA login, consumed by /api/login/2fa
-let md = null;             // the Milkdown editor behind #editor-source
 
 // ---- views ----
 // Populated in onReady(): this script runs in <head>, before the DOM exists.
@@ -72,7 +62,7 @@ let md = null;             // the Milkdown editor behind #editor-source
 // never through show(), so it does not need a section of its own.
 const views = {};
 function initViews() {
-  for (const id of ['view-setup', 'view-login', 'view-twofactor', 'view-recover', 'view-reset', 'view-dashboard', 'view-editor', 'view-account'])
+  for (const id of ['view-setup', 'view-login', 'view-twofactor', 'view-recover', 'view-reset', 'view-dashboard', 'view-account'])
     views[id] = document.getElementById(id);
 }
 function show(id) {
@@ -125,7 +115,7 @@ async function boot() {
 function renderBar() {
   document.getElementById('bar-right').innerHTML =
     me ? `<span class="who">Welcome, ${esc(me.username)}</span>
-         <button class="ghost" onclick="openEditor(null)">New post</button>
+         <a class="btn ghost" href="/editor" title="Write a post in the full editor">New post</a>
          <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
          <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
          ${me.role === 'admin' ? '<button class="ghost" onclick="toggleUsers()">Users</button>' : ''}
@@ -137,14 +127,14 @@ function renderBar() {
 
 // ---- about page ----
 // Each author maintains one about page: a singleton post with the slug
-// "about". Find yours or create it, then open it in the editor.
+// "about". Find yours or create it, then open it in the editor at /editor.
 async function openAbout() {
   const el = document.getElementById('dash-err');
   el.textContent = '';
   try {
     if (!allPosts.length) allPosts = await api('GET', '/api/posts');
     const mine = allPosts.find(p => p.slug === 'about');
-    if (mine) { openEditor(mine.id); return; }
+    if (mine) { location.href = '/editor?id=' + mine.id; return; }
     const created = await api('POST', '/api/posts', {
       title: 'About',
       slug: 'about',
@@ -153,7 +143,7 @@ async function openAbout() {
       tags: '',
       status: 'published'
     });
-    openEditor(created.id);
+    location.href = '/editor?id=' + created.id;
   } catch (e) { el.textContent = e.message; }
 }
 
@@ -294,7 +284,7 @@ function renderDashboard() {
   const item = p => `
     <div class="item">
       <div>
-        <div class="t"><a href="#" onclick="openEditor(${p.id});return false">${esc(p.title)}</a></div>
+        <div class="t"><a href="/editor?id=${p.id}">${esc(p.title)}</a></div>
         <div class="m">
           ${p.status === 'published'
             ? `/${esc(p.username)}/${esc(p.slug)} · published ${fmtDate(p.published_at)}`
@@ -304,7 +294,7 @@ function renderDashboard() {
       </div>
       <div class="row">
         ${p.status === 'published' ? `<a class="btn ghost" href="/${esc(p.username)}/${esc(p.slug)}" target="_blank">view</a>` : ''}
-        <button class="ghost" onclick="openEditor(${p.id})">edit</button>
+        <a class="btn ghost" href="/editor?id=${p.id}">edit</a>
         <button class="danger" onclick="delPost(${p.id})">delete</button>
       </div>
     </div>`;
@@ -321,7 +311,6 @@ async function delPost(id) {
   try { await api('DELETE', '/api/posts/' + id, {}); } catch (e) {
     document.getElementById('dash-err').textContent = e.message; return;
   }
-  clearDrafts(id);
   await loadDashboard();
 }
 
@@ -459,279 +448,9 @@ async function saveAccount(ev) {
 }
 
 // ---- editor ----
-async function openEditor(id) {
-  const el = document.getElementById('editor-err');
-  el.textContent = '';
-  document.getElementById('editor-ok').textContent = '';
-  editing = null;
-  slugTouched = false;
-  document.getElementById('editor-title').value = '';
-  document.getElementById('editor-slug').value = '';
-  document.getElementById('editor-tags').value = '';
-  postStatus = 'draft';
-  document.getElementById('slug-state').textContent = '';
-  document.getElementById('preview-pane').innerHTML = '';
-  document.getElementById('editor-restore').hidden = true;
-  dirty = false;
-  pendingDraft = null;
-  let source = '';
-  if (id !== null) {
-    try {
-      editing = await api('GET', '/api/posts/' + id);
-    } catch (e) { el.textContent = e.message; return; }
-    document.getElementById('editor-title').value = editing.title;
-    document.getElementById('editor-slug').value = editing.slug;
-    document.getElementById('editor-tags').value = editing.tags;
-    source = editing.source;
-    postStatus = editing.status;
-    slugTouched = true;
-  }
-  syncPublishBtn();
-  // a server-side Unsplash key (setup.sh or the settings page) wins over
-  // the per-browser one in the picker
-  if (typeof pw !== 'undefined' && !pw._serverUnsplashKey) {
-    try {
-      const s = await api('GET', '/api/settings');
-      if (s.unsplash_key) pw._serverUnsplashKey = s.unsplash_key;
-    } catch (e) { /* optional: fall back to the browser key */ }
-  }
-  show('view-editor');
-  await ensureMd();
-  md.setMarkdown(source);
-  checkDraft();
-  document.getElementById('editor-title').focus();
-}
-
-function onTitleInput() {
-  if (!slugTouched) {
-    document.getElementById('editor-slug').value = slugify(document.getElementById('editor-title').value);
-    checkSlug();
-  }
-  markDirty();
-}
-function onSlugInput() { slugTouched = true; markDirty(); checkSlug(); }
-
-let slugTimer = null;
-function checkSlug() {
-  clearTimeout(slugTimer);
-  const slug = document.getElementById('editor-slug').value;
-  const state = document.getElementById('slug-state');
-  if (!slug) { state.textContent = ''; return; }
-  if (!validSlug(slug)) { state.textContent = 'malformed slug'; state.className = 'slug-state err'; return; }
-  state.textContent = '…'; state.className = 'slug-state';
-  slugTimer = setTimeout(async () => {
-    try {
-      const r = await api('GET', '/api/slug-check?slug=' + encodeURIComponent(slug));
-      if (r.ok) { state.textContent = 'ok'; state.className = 'slug-state ok'; }
-      else if (r.reason === 'taken') { state.textContent = 'taken'; state.className = 'slug-state err'; }
-      else { state.textContent = 'malformed'; state.className = 'slug-state err'; }
-    } catch (e) { state.textContent = ''; }
-  }, 250);
-}
-
-function collectPost() {
-  return {
-    title: document.getElementById('editor-title').value.trim(),
-    slug: document.getElementById('editor-slug').value.trim(),
-    source: getSrc(),
-    tags: document.getElementById('editor-tags').value,
-    status: postStatus,
-  };
-}
-
-// The publish button shows the transition the post cannot make yet: a
-// draft offers "publish", a published post offers "unpublish".
-function syncPublishBtn() {
-  const btn = document.getElementById('editor-publish');
-  const pub = postStatus === 'published';
-  btn.textContent = pub ? 'unpublish' : 'publish';
-  btn.className = pub ? 'danger' : '';
-  btn.title = pub ? 'Move this post back to drafts'
-                  : 'Make this post live at its public URL';
-}
-
-// Saves the post as shown. The publish button routes through here with the
-// status flipped, so a status change is always a save of the whole post:
-// anything typed but not yet saved goes to the server with the transition.
-async function savePost(status) {
-  const el = document.getElementById('editor-err');
-  const ok = document.getElementById('editor-ok');
-  el.textContent = '';
-  ok.textContent = '';
-  const body = collectPost();
-  if (status) body.status = status;
-  if (!body.title) { el.textContent = 'A title is required.'; return; }
-  if (!validSlug(body.slug)) { el.textContent = 'The slug is malformed.'; return; }
-  try {
-    let saved;
-    if (editing) saved = await api('PUT', '/api/posts/' + editing.id, body);
-    else saved = await api('POST', '/api/posts', body);
-    editing = saved;
-    postStatus = saved.status;
-    slugTouched = true;
-    syncPublishBtn();
-    clearDrafts(saved.id);
-    document.getElementById('editor-restore').hidden = true;
-    ok.textContent = saved.status === 'published'
-      ? 'Saved · published' + (saved.published_at ? ' ' + fmtDate(saved.published_at) : '')
-      : 'Saved · draft';
-  } catch (e) { el.textContent = e.message; }
-}
-
-// The publish/unpublish button: save the post with its status flipped.
-function togglePublish() {
-  savePost(postStatus === 'published' ? 'draft' : 'published');
-}
-
-async function previewPost() {
-  const pane = document.getElementById('preview-pane');
-  const el = document.getElementById('editor-err');
-  el.textContent = '';
-  try {
-    const r = await api('POST', '/api/preview', {markdown: getSrc()});
-    pane.innerHTML = r.html;
-  } catch (e) { el.textContent = e.message; }
-}
-
-// The markdown the editor holds right now.
-function getSrc() { return md ? md.getMarkdown() : ''; }
-
-// The editor is created the first time the editor view opens — its root
-// must be visible for correct measuring — and reused for every post.
-async function ensureMd() {
-  if (md) return;
-  md = await pwMilkdown.create(document.getElementById('editor-source'), {
-    placeholder: 'Write **markdown** here…',
-    onChange: onSourceChange,
-    onUpload: uploadMediaUrl,
-  });
-}
-
-// ---- unsaved-work guard ----
-// Every edit lands in localStorage (debounced) under a key per post, so a
-// crash, a closed tab, or a dropped session never eats a draft silently:
-// reopening the post offers the snapshot, and leaving with unsaved edits
-// warns first. A save clears the snapshot; the server copy is the truth.
-const DRAFT_PREFIX = 'postwisp-draft-';
-let dirty = false;
-let snapTimer = null;
-let pendingDraft = null;
-function draftKey() { return DRAFT_PREFIX + (editing ? editing.id : 'new'); }
-function markDirty() {
-  dirty = true;
-  if (snapTimer) clearTimeout(snapTimer);
-  snapTimer = setTimeout(saveDraft, 600);
-}
-function saveDraft() {
-  if (!dirty) return;
-  try {
-    localStorage.setItem(draftKey(), JSON.stringify({
-      title: document.getElementById('editor-title').value,
-      slug: document.getElementById('editor-slug').value,
-      tags: document.getElementById('editor-tags').value,
-      source: getSrc(), ts: Date.now()
-    }));
-  } catch (e) { /* storage full or blocked: the leaving-warning still covers it */ }
-}
-function clearDrafts(id) {
-  dirty = false;
-  try {
-    localStorage.removeItem(DRAFT_PREFIX + 'new');
-    localStorage.removeItem(DRAFT_PREFIX + id);
-  } catch (e) { /* nothing to clean up */ }
-}
-// Offer the snapshot only when it differs from what the editor holds now.
-function checkDraft() {
-  let snap = null;
-  try { snap = JSON.parse(localStorage.getItem(draftKey()) || 'null'); } catch (e) { return; }
-  if (!snap || typeof snap.source !== 'string') return;
-  if (snap.source === getSrc() &&
-      snap.title === document.getElementById('editor-title').value &&
-      snap.slug === document.getElementById('editor-slug').value &&
-      snap.tags === document.getElementById('editor-tags').value) return;
-  pendingDraft = snap;
-  document.getElementById('editor-restore').hidden = false;
-}
-function restoreDraft(keep) {
-  const snap = pendingDraft;
-  pendingDraft = null;
-  document.getElementById('editor-restore').hidden = true;
-  if (!keep) {
-    try { localStorage.removeItem(draftKey()); } catch (e) { /* already gone */ }
-    return;
-  }
-  if (!snap) return;
-  document.getElementById('editor-title').value = snap.title || '';
-  document.getElementById('editor-slug').value = snap.slug || '';
-  document.getElementById('editor-tags').value = snap.tags || '';
-  slugTouched = !!snap.slug;
-  md.setMarkdown(snap.source || '');
-  dirty = true;
-  previewPost();
-}
-window.addEventListener('beforeunload', e => {
-  if (dirty) { e.preventDefault(); e.returnValue = ''; }
-});
-
-// Every keystroke in the Milkdown editor lands here: the debounced
-// server preview.
-let pvTimer = null;
-function onSourceChange() {
-  markDirty();
-  clearTimeout(pvTimer);
-  pvTimer = setTimeout(previewPost, 400);
-}
-
-// Upload a local file and answer its markdown-ready URL. A media URL
-// carries no extension, so video/audio ride on an ?embed= query the
-// renderer turns into a player; it round-trips through the editor
-// untouched, unlike a title-attribute hint.
-async function uploadMediaUrl(file) {
-  const r = await fetch('/api/media', {
-    method: 'POST',
-    credentials: 'same-origin',
-    headers: {'Content-Type': file.type},
-    body: file,
-  }).then(async resp => {
-    const d = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(d.error || 'upload failed');
-    return d;
-  });
-  const hint = file.type.startsWith('video/') ? '?embed=video'
-    : file.type.startsWith('audio/') ? '?embed=audio' : '';
-  return r.url + hint;
-}
-
-async function uploadImage(file) {
-  const el = document.getElementById('editor-err');
-  const av = file.type.startsWith('video/') || file.type.startsWith('audio/');
-  // the file name rides in the image title — the slot Milkdown keeps when
-  // it round-trips a post (the alt slot becomes a size ratio)
-  const name = file.name.replace(/["'()[\]]/g, '');
-  try {
-    md.insert(`![](${await uploadMediaUrl(file)}${name ? ` "${name}"` : ''})`);
-  } catch (e) {
-    el.textContent = e.message + (e.message.includes('too large') ? ` (max ${av ? '50MB' : '5MB'})` : '');
-  }
-}
-
-function pickImage() {
-  const inp = document.createElement('input');
-  inp.type = 'file';
-  inp.accept = 'image/png,image/jpeg,image/webp,image/gif,video/mp4,video/webm,audio/mpeg,audio/ogg,audio/wav,audio/mp4';
-  inp.onchange = () => { if (inp.files[0]) uploadImage(inp.files[0]); };
-  inp.click();
-}
-
-// Hashnode-style Unsplash search, inserting the picked photo at the cursor.
-// The credit goes in the image title — the slot Milkdown preserves when it
-// round-trips a post (the alt slot is rewritten to a size ratio).
-function pickUnsplashImage() {
-  if (typeof pw === 'undefined' || !pw.pickUnsplash) return;
-  pw.pickUnsplash({}, d => {
-    md.insert(`![](${d.url} "Photo by ${d.credit.replace(/["'()[\]]/g, '')} on Unsplash")`);
-  });
-}
+// The dashboard no longer embeds an editor: /editor is the single
+// writing surface, and every edit entry point (New post, a post's edit
+// link, the About page button) navigates there.
 
 // ---- wire up ----
 // This script lives in <head>, so nothing may touch the DOM until it is ready.
@@ -757,20 +476,6 @@ onReady(function () {
     document.getElementById('users-form').addEventListener('submit', createUser);
     document.getElementById('account-form').addEventListener('submit', saveAccount);
     document.getElementById('search').addEventListener('input', renderDashboard);
-    document.getElementById('editor-tags').addEventListener('input', markDirty);
-    document.getElementById('editor-title').addEventListener('input', onTitleInput);
-    document.getElementById('editor-slug').addEventListener('input', onSlugInput);
-    document.getElementById('editor-source').addEventListener('drop', ev => {
-      const f = ev.dataTransfer.files[0];
-      // Milkdown has no drop-to-upload of its own, so the page handles
-      // every media kind here. Capture phase, before the ProseMirror
-      // view's own drop handling can swallow the event.
-      if (f && /^(image|video|audio)\//.test(f.type)) {
-        ev.preventDefault();
-        ev.stopPropagation();
-        uploadImage(f);
-      }
-    }, true);
     // note: the Media and Users buttons live in the top bar, which
     // renderBar() fills in after login — they use inline onclick handlers,
     // so they are not wired here.
@@ -940,40 +645,6 @@ window.addEventListener('unhandledrejection', function (ev) {
     <div id="account-err" class="err"></div>
     <button type="submit">Save account</button>
   </form>
-</section>
-
-<section id="view-editor" class="hidden">
-  <div class="row" style="justify-content:space-between">
-    <h1 id="editor-heading" style="margin:0">New post</h1>
-    <div class="row">
-      <button class="ghost" onclick="loadDashboard()">back</button>
-      <button class="ghost" onclick="pickImage()">image</button>
-      <button class="ghost" onclick="pickUnsplashImage()">unsplash</button>
-      <button class="ghost" onclick="previewPost()">preview</button>
-      <button onclick="savePost()">save</button>
-      <button id="editor-publish" onclick="togglePublish()">publish</button>
-    </div>
-  </div>
-  <div class="err" id="editor-err"></div>
-  <div id="editor-restore" class="hint" hidden>
-    This browser has unsaved edits to this post from an earlier session.
-    <button type="button" class="ghost" onclick="restoreDraft(true)">Restore</button>
-    <button type="button" class="ghost" onclick="restoreDraft(false)">Discard</button>
-  </div>
-  <div class="ok" id="editor-ok" style="min-height:1.3rem;margin:0.35rem 0"></div>
-  <div class="row" style="align-items:end">
-    <div style="flex:2;min-width:14rem"><label>Title</label>
-      <input type="text" id="editor-title" maxlength="200"></div>
-    <div style="flex:2;min-width:12rem"><label>Slug<span id="slug-state" class="slug-state"></span></label>
-      <input type="text" id="editor-slug" maxlength="96"></div>
-    <div style="flex:2;min-width:12rem"><label>Tags (comma-separated)</label>
-      <input type="text" id="editor-tags"></div>
-  </div>
-  <div class="editor-grid">
-    <div><label>Markdown (images: the editor's own image button, paste, or drag-in; video/audio: drag a file here)</label>
-      <div id="editor-source" class="md-editor"></div></div>
-    <div><label>Preview</label><div id="preview-pane"></div></div>
-  </div>
 </section>
 
 </main>

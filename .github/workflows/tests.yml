@@ -33,3 +33,9 @@ jobs:
 
       - name: Tests
         run: gos test
+
+      - name: Editor page checks
+        run: node scripts/check-editor.js
+
+      - name: Dashboard editor checks
+        run: node scripts/check-admin.js

@@ -24,7 +24,9 @@ with terndb as the embedded storage engine.
 
        ./scripts/setup.sh
 
-   It starts the server, captures the one-time first-boot token, creates
+   The script never starts the server itself. Start it in another terminal
+   (or a service unit) with `./postwisp`, then run the walkthrough: it waits
+   for the server, asks you to paste the one-time first-boot token, creates
    your admin account, logs you in, sets the site theme, and verifies the
    public pages. Password policy: min 10 chars, at least 1 digit and 1
    non-alphanumeric.
@@ -53,8 +55,8 @@ with terndb as the embedded storage engine.
 
 The about page is not a file you edit per se — it is a **singleton post**
 each author maintains, with the reserved slug `about`. Log in to
-`/dashboard`, press **About page**, and write it like any post (markdown,
-live preview). It is then served at `/about` (the first user's — the
+`/dashboard`, press **About page**, and write it like any post (markdown, in
+the same full-width editor with the styled/raw toggle). It is then served at `/about` (the first user's — the
 admin's) and at `/<user>/about` for every author. About pages never
 appear in the post lists or feeds; `templates/about.html` only frames
 them. Until someone writes one, a placeholder fills the frame.
@@ -66,17 +68,20 @@ dashboard + JSON API + public pages), behind any reverse proxy for TLS.
 
 The dashboard is served by the binary itself at `/dashboard` (a built-in
 page, not one of the templates; the old `/admin` link redirects there).
-Authors log in there to write posts in markdown, upload files, and manage
-drafts; every logged-in user can also edit their own email and password
-from the **Account** button. The admin creates further
-author accounts; there is no open registration by design. Failed logins
-are rate-limited (5 failures per username per 10 minutes).
+Authors log in there to manage drafts, published posts, and media; every
+editing entry point — **New post**, a post's **edit** link, the **About
+page** button — opens the write page at `/editor`, the single place a
+post is edited (there is no second embedded editor anymore). Every
+logged-in user can also edit their own email and password from the
+**Account** button. The admin creates further author accounts; there is
+no open registration by design. Failed logins are rate-limited (5
+failures per username per 10 minutes).
 
 ## File uploads (photos, video, audio)
 
-The **Upload** button in both editors (and drag-and-drop onto the source
-pane) uploads a file to your own media library and inserts a reference at
-the cursor:
+Both the **Upload** button in the editor and drag-and-drop onto the
+writing surface upload a file to your own media library and insert a
+reference at the cursor:
 
 - **Photos** — `![alt](/<user>/media/<id>)`, rendered as `<img>`; the
   first image in a post is its cover.
@@ -115,13 +120,12 @@ video and iOS Safari play it at all.
 
 ## Cover photos & images (Unsplash)
 
-Both editors (the write page at `/editor` and the one inside `/dashboard`)
-have an **Unsplash** button: a search modal in the Hashnode style — type a
-query, pick a photo, and it becomes the post's cover (or lands at the
-cursor in the body). The picked photo is written as the post's first
-markdown image, so covers travel with the text everywhere: the post page
-hoists it into a header figure, and the home/posts cards show it as a
-thumbnail.
+The editor's **Unsplash** button opens a search modal in the Hashnode
+style — type a query, pick a photo, and it becomes the post's cover (or
+lands at the cursor in the body). The picked photo is written as the
+post's first markdown image, so covers travel with the text everywhere:
+the post page hoists it into a header figure, and the home/posts cards
+show it as a thumbnail.
 
 Unsplash's API needs a free **Access Key**: create an app at
 <https://unsplash.com/oauth/applications> (demo tier: 50 requests/hour)
@@ -164,6 +168,17 @@ admin pages, in both light and dark mode:
   layered borders/shadows. Everything honours `prefers-reduced-motion`.
 - **Reading first**: 44rem measure, 1.78 line-height for prose, generous
   spacing, WCAG-leaning contrast in both modes.
+- **Editor**: the write page (`/editor`) is one full-width writing card —
+  the formatting toolbar (headings, emphasis, code, links, lists, quotes)
+  fused into its top edge beside a **Raw markdown** toggle that flips
+  between the styled view and the plain source, with a writing surface
+  styled like the published post that fills the screen. A **heading
+  outline** rides beside the card on wide screens: it lists the post's
+  headings, highlights the section you are in, and clicking an entry
+  jumps there. Selecting text opens a context toolbar with bold, italic,
+  strikethrough, code, links, and heading 1/2/3. The status line counts
+  words and estimated read time and says when edits are unsaved;
+  Ctrl/Cmd-S saves.
 
 The public templates inline the same token set the admin stylesheet
 (`/app.css`) uses, so a page is one request with no stylesheet
@@ -262,7 +277,15 @@ Behaviour worth knowing:
 
 - `gos run .` — run from source (templates then load from `./templates/`)
 - `gos test` — test suite
-- `gos build` — debug binary
+- `node scripts/check-editor.js` — behavioral check of the `/editor` page's
+  inline script (the styled/raw toggle, word count, insert-at-cursor,
+  heading outline, slug feedback); plain Node, no packages and no browser
+- `node scripts/check-admin.js` — behavioral check of the `/dashboard`
+  page's inline script plus a proof of the editor consolidation (no
+  embedded editor, every edit link routes to `/editor`)
+- `./scripts/build-editor.sh` — rebuild `web/milkdown.js` / `web/milkdown.css`
+  from the pinned sources in `vendor-src/` (only needed when the editor bundle
+  changes)
 - Environment overrides: `PW_DATA` (data dir, default `data/`),
   `PW_TEMPLATES` (public templates, default `templates/`),
   `PW_WEB` (built-in admin/editor pages, default `web/`), `PW_ADDR`

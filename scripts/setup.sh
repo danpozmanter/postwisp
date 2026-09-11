@@ -2,8 +2,9 @@
 # scripts/setup.sh — interactive first-run walkthrough for a postwisp dist
 # directory (binary + templates/ + this script). Run it ON THE SERVER, from
 # the directory you copied dist/'s contents into.
-# Covers: start server -> create admin -> login -> choose site theme ->
-# verify the public pages.
+# Covers: you start the server yourself -> create admin -> login -> choose
+# site theme -> verify the public pages. The script never starts, stops, or
+# restarts the server.
 set -euo pipefail
 
 BASE_URL="http://127.0.0.1:8080"
@@ -31,57 +32,59 @@ command -v curl >/dev/null 2>&1 || die "curl not found. Install curl first."
 [ -f templates/index.html ] || die "templates/ is missing next to the binary."
 ok "postwisp binary and templates present."
 
-step "2/6 Start the server"
-echo "The server stores everything in ./${DATA_DIR}/. On first boot it prints a"
-echo "one-time setup URL containing a token. If ${DATA_DIR}/ already exists with"
-echo "users in it, setup is already done — restart at step 4."
+step "2/6 Check the server is running"
+echo "The script does not start the server itself. In another terminal (or a"
+echo "service unit), start it from this directory:"
+echo
+echo "    $BIN"
+echo
+echo "It stores everything in ./${DATA_DIR}/ and, on first boot, prints a"
+echo "one-time setup URL containing a token. If ${DATA_DIR}/ already exists"
+echo "with users in it, setup is already done — you can still use this script"
+echo "to log in and set the theme/key."
+echo "Waiting for $BASE_URL (press Ctrl-C to give up)..."
 rm -f "$JAR"
-[ -d "$DATA_DIR" ] && echo "Note: ./${DATA_DIR}/ already exists ( continuing; this may not be a first boot )."
-BOOT_LOG="$(mktemp)"
-"$BIN" >"$BOOT_LOG" 2>&1 &
-SERVER_PID=$!
 UP=0
 for _ in $(seq 1 60); do
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then
-        die "server exited during startup (see $BOOT_LOG)"
-    fi
     if curl -sf -o /dev/null "$BASE_URL/setup"; then UP=1; break; fi
     sleep 0.5
 done
-[ "$UP" = 1 ] || die "server did not come up on $BASE_URL (see $BOOT_LOG)"
-ok "Server is up (pid $SERVER_PID)."
-if ! grep -q "first boot" "$BOOT_LOG"; then
-    echo "No first-boot token in the log — the database may already be initialized."
-    TOKEN="$(ask "Paste the setup token (or press Enter to abort):")"
-    [ -n "$TOKEN" ] || die "no token available; see $BOOT_LOG"
-else
-    TOKEN="$(grep "first boot" "$BOOT_LOG" | sed -n 's/.*token=\([^ ]*\).*/\1/p')"
-    ok "First-boot token captured: $TOKEN"
-    echo "The same URL was printed to the console: $(grep "first boot" "$BOOT_LOG")"
+[ "$UP" = 1 ] || die "no server on $BASE_URL — start it with ./$BIN and rerun this script"
+ok "Server found at $BASE_URL."
+BOOT_LOG=""
+TOKEN="$(ask "Paste the setup token from the server's console (or press Enter if the database is already initialized):")"
+if [ -n "$TOKEN" ]; then
+    ok "Setup token captured: $TOKEN"
 fi
 
 step "3/6 Create the admin account"
-while true; do
-    USERNAME="$(ask "Admin username (lowercase letters/digits/-/_, or press Enter to abort):")"
-    if [ -z "$USERNAME" ]; then
-        die "aborted at user request (no admin account created)"
-    fi
-    EMAIL="$(ask "Admin email:")"
-    PASSWORD="$(ask_secret "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
-    RESP="$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/api/setup" \
-        -H 'Content-Type: application/json' \
-        -d "{\"token\":\"$(json "$TOKEN")\",\"username\":\"$(json "$USERNAME")\",\"email\":\"$(json "$EMAIL")\",\"password\":\"$(json "$PASSWORD")\"}")"
-    CODE="$(echo "$RESP" | tail -n1)"
-    if [ "$CODE" = "200" ]; then
-        break
-    fi
-    printf '\033[1;31mFAILED:\033[0m setup rejected (HTTP %s): %s\n' "$CODE" "$(echo "$RESP" | head -n1)"
-    CHOICE="$(ask "Press Enter to re-enter the details, or type 'exit' to quit:")"
-    if [ "$CHOICE" = "exit" ]; then
-        die "aborted at user request (no admin account created)"
-    fi
-done
-ok "Admin account '$USERNAME' created."
+if [ -z "$TOKEN" ]; then
+    echo "No token given, so the admin account is assumed to exist already."
+    USERNAME="$(ask "Existing admin username:")"
+    PASSWORD="$(ask_secret "Password:")"
+else
+    while true; do
+        USERNAME="$(ask "Admin username (lowercase letters/digits/-/_, or press Enter to abort):")"
+        if [ -z "$USERNAME" ]; then
+            die "aborted at user request (no admin account created)"
+        fi
+        EMAIL="$(ask "Admin email:")"
+        PASSWORD="$(ask_secret "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
+        RESP="$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/api/setup" \
+            -H 'Content-Type: application/json' \
+            -d "{\"token\":\"$(json "$TOKEN")\",\"username\":\"$(json "$USERNAME")\",\"email\":\"$(json "$EMAIL")\",\"password\":\"$(json "$PASSWORD")\"}")"
+        CODE="$(echo "$RESP" | tail -n1)"
+        if [ "$CODE" = "200" ]; then
+            break
+        fi
+        printf '\033[1;31mFAILED:\033[0m setup rejected (HTTP %s): %s\n' "$CODE" "$(echo "$RESP" | head -n1)"
+        CHOICE="$(ask "Press Enter to re-enter the details, or type 'exit' to quit:")"
+        if [ "$CHOICE" = "exit" ]; then
+            die "aborted at user request (no admin account created)"
+        fi
+    done
+    ok "Admin account '$USERNAME' created."
+fi
 
 step "4/6 Log in"
 RESP="$(curl -s -w '\n%{http_code}' -c "$JAR" -X POST "$BASE_URL/api/login" \
@@ -135,16 +138,16 @@ ok "About:           $BASE_URL/about     (templates/about.html)"
 
 echo
 ok "Setup complete."
-echo "The server is still running in the background (pid $SERVER_PID, log: $BOOT_LOG)."
 echo
-echo "Your blog:"
+echo "Your blog (the server you started is still running):"
 echo "  Home:             $BASE_URL/"
 echo "  All posts:        $BASE_URL/posts  (?tag=NAME lists one tag)"
 echo "  About:            $BASE_URL/about"
 echo "  Dashboard:        $BASE_URL/dashboard"
 echo
-echo "To stop it:      kill $SERVER_PID"
-echo "To start again later: ./$BIN"
+echo "To stop the server:  however you started it (Ctrl-C in its terminal,"
+echo "or stop the service unit)."
+echo "To start it again:   $BIN"
 echo
 echo "Last step: edit the templates in ./templates/ as you see fit — the"
 echo "server reads them from disk, so changes show up on the next page"

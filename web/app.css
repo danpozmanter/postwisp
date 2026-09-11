@@ -372,30 +372,50 @@ a.tag:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); te
 .muted { color: var(--fg-muted); }
 
 /* ------------------------------------------------- editor page */
-.toolbar {
+/* the editor card: a tools strip fused onto the writing surface below
+   (the postwisp toolbar with its own border lives inside Crepe) */
+.editor-shell { border-radius: var(--radius); box-shadow: var(--shadow-1); }
+.editor-tools {
     display: flex;
-    gap: 0.35rem;
+    gap: 0.4rem;
     flex-wrap: wrap;
-    padding: 0.5rem;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.45rem 0.6rem;
     border: 1px solid var(--line);
-    border-radius: var(--radius);
+    border-bottom: none;
+    border-radius: var(--radius) var(--radius) 0 0;
     background: var(--bg-raised);
-    margin-bottom: 1rem;
 }
-.toolbar .btn { min-width: 2.4rem; justify-content: center; }
+.editor-tools .group { display: flex; gap: 0.4rem; flex-wrap: wrap; }
+.editor-tools .btn { padding: 0.3rem 0.75rem; }
+.editor-tools .btn-toggle[aria-pressed='true'] {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: transparent;
+}
+/* whatever view is showing, it closes the card's bottom corners and
+   drops its own top border: the strip above already drew that line */
+.editor-shell .md-editor .milkdown,
+.editor-shell textarea.raw-source {
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+    box-shadow: none;
+}
 
-.editor-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; }
-@media (max-width: 62rem) { .editor-grid { grid-template-columns: 1fr; } }
-
-.pane { display: flex; flex-direction: column; min-width: 0; }
-.pane label { margin-bottom: 0.4rem; }
-
-textarea#source, textarea#editor-source {
+textarea.raw-source {
     min-height: 20rem;
     font-family: var(--font-mono);
     font-size: 0.92rem;
     line-height: 1.7;
     tab-size: 4;
+}
+
+/* the raw view of the post editor: fused under the tools strip and as
+   tall as the styled view it stands in for */
+.editor-shell textarea.raw-source {
+    min-height: calc(60vh - 2.75rem);
+    margin: 0;
 }
 
 .statusline {
@@ -405,17 +425,74 @@ textarea#source, textarea#editor-source {
     font-variant-numeric: tabular-nums;
 }
 
-#preview, #preview-pane {
+.slug-state { font-size: var(--step--1); margin-left: 0.5rem; font-weight: 500; }
+.slug-state.ok { color: var(--accent-strong); }
+.slug-state.err { color: var(--danger); }
+.savestate { color: var(--fg-faint); font-style: italic; }
+.savestate:empty { display: none; }
+
+/* ------------------------------------------------- editor outline */
+/* The writing page is two columns on wide screens: the outline beside
+   the card, sticky so the full heading list stays visible while the
+   post scrolls; one column below 64rem. */
+.editor-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+    gap: 1.25rem;
+    align-items: start;
+}
+@media (min-width: 64rem) {
+    .wrap:has(.editor-layout) { max-width: 74rem; }
+    .editor-layout { grid-template-columns: 15rem minmax(0, 1fr); }
+    .outline-col { position: sticky; top: 4.5rem; max-height: calc(100vh - 6rem); overflow-y: auto; }
+}
+.outline {
     border: 1px solid var(--line);
     border-radius: var(--radius);
     background: var(--bg-raised);
-    padding: 1.1rem 1.25rem;
-    min-height: 20rem;
-    overflow: auto;
-    flex: 1;
+    box-shadow: var(--shadow-1);
+    padding: 0.75rem 0.85rem 0.9rem;
 }
-
-.slug-state { font-size: var(--step--1); margin-left: 0.5rem; font-weight: 500; }
+.outline-title {
+    font-size: var(--step--1);
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--fg-muted);
+    margin-bottom: 0.4rem;
+}
+.outline-list { list-style: none; margin: 0; padding: 0; }
+.outline-list li { margin: 0; padding: 0; }
+.outline-item a {
+    display: block;
+    padding: 0.22rem 0.3rem;
+    border-radius: var(--radius-sm);
+    color: var(--fg-muted);
+    text-decoration: none;
+    font-size: var(--step--1);
+    line-height: 1.45;
+    border-left: 2px solid transparent;
+    overflow-wrap: anywhere;
+}
+.outline-item a:hover { color: var(--fg); background: var(--bg-overlay); text-decoration: none; }
+.outline-item.active > a {
+    color: var(--accent-strong);
+    border-left-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    font-weight: 500;
+}
+.outline-item[data-level="2"] > a { padding-left: 1rem; }
+.outline-item[data-level="3"] > a { padding-left: 1.7rem; }
+.outline-item[data-level="4"] > a { padding-left: 2.4rem; }
+.outline-item[data-level="5"] > a,
+.outline-item[data-level="6"] > a { padding-left: 2.4rem; opacity: 0.85; }
+.outline-empty {
+    color: var(--fg-faint);
+    font-size: var(--step--1);
+    line-height: 1.5;
+    padding: 0.2rem 0.3rem;
+}
+.outline-empty code { font-family: var(--font-mono); font-size: 0.85em; }
 
 /* ------------------------------------------------- cover picker row */
 .cover-row {

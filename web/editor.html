@@ -21,7 +21,7 @@
 
 <div class="wrap">
   <h1 class="page-title" id="heading">New post</h1>
-  <p class="page-sub">Write in markdown. The preview renders live.</p>
+  <p class="page-sub">Write in markdown.</p>
 
   <div id="gate" hidden class="notice">
     You need to be logged in to write. <a href="/dashboard">Go to the dashboard to log in</a>,
@@ -36,58 +36,67 @@
     <button type="button" class="btn ghost" id="restore-no">Discard</button>
   </div>
 
-  <div id="editor" hidden>
-    <div class="meta-row">
-      <div class="field">
-        <label for="title">Title</label>
-        <input id="title" maxlength="200" placeholder="Post title">
-      </div>
-    </div>
-    <div class="meta-row">
-      <div class="field">
-        <label for="slug">Slug</label>
-        <input id="slug" maxlength="96" placeholder="auto-generated from title">
-      </div>
-      <div class="field">
-        <label for="tags">Tags (comma-separated)</label>
-        <input id="tags" placeholder="essays, tech">
-      </div>
-    </div>
+  <!-- The single editor: an outline column beside the writing card on
+       wide screens, one column on narrow ones. -->
+  <div class="editor-layout" id="layout">
+    <aside class="outline-col" id="outline-col" hidden aria-label="Post outline">
+      <nav class="outline">
+        <div class="outline-title">Outline</div>
+        <ol id="outline-list" class="outline-list"></ol>
+      </nav>
+    </aside>
 
-    <div class="cover-row" id="cover-row">
-      <div class="cover-thumb" id="cover-thumb">no cover</div>
-      <div class="cover-controls">
-        <div class="cover-title">Cover image</div>
-        <p class="cover-sub">Picked from Unsplash search (Hashnode-style) — becomes the post's header on the public page. The first image in the markdown is the cover.</p>
-        <div class="row">
-          <button type="button" class="btn" id="cover-pick">Search Unsplash</button>
-          <button type="button" class="btn ghost" id="cover-remove" hidden>Remove</button>
+    <div id="editor" hidden class="editor-main">
+      <div class="meta-row">
+        <div class="field">
+          <label for="title">Title</label>
+          <input id="title" maxlength="200" placeholder="Post title">
         </div>
       </div>
-    </div>
-
-    <div class="toolbar">
-      <button type="button" class="btn" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash image</button>
-      <button type="button" class="btn" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
-      <span class="muted" style="align-self:center;margin-left:.4rem">bold, headings, lists &amp; links: select text or type&nbsp;/ &mdash; the editor has its own toolbar</span>
-    </div>
-
-    <div class="editor-grid">
-      <div class="pane">
-        <div id="source" class="md-editor"></div>
-        <div class="statusline"><span id="wc">0 words</span> &middot; <span id="slugline"></span></div>
+      <div class="meta-row">
+        <div class="field">
+          <label for="slug">Slug<span id="slug-state" class="slug-state"></span></label>
+          <input id="slug" maxlength="96" placeholder="auto-generated from title">
+        </div>
+        <div class="field">
+          <label for="tags">Tags (comma-separated)</label>
+          <input id="tags" placeholder="essays, tech">
+        </div>
       </div>
-      <div class="pane prose" id="preview">
-        <p class="muted">Preview appears here as you type.</p>
-      </div>
-    </div>
 
-    <div class="actions">
-      <button type="button" class="btn btn-primary" id="save">Save</button>
-      <button type="button" class="btn" id="publish" title="Make this post live at its public URL">publish</button>
-      <a class="btn" id="viewlink" hidden>View post</a>
-      <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
-      <span id="msg" class="flash" hidden></span>
+      <div class="cover-row" id="cover-row">
+        <div class="cover-thumb" id="cover-thumb">no cover</div>
+        <div class="cover-controls">
+          <div class="cover-title">Cover image</div>
+          <p class="cover-sub">Picked from Unsplash search (Hashnode-style) — becomes the post's header on the public page. The first image in the markdown is the cover.</p>
+          <div class="row">
+            <button type="button" class="btn" id="cover-pick">Search Unsplash</button>
+            <button type="button" class="btn ghost" id="cover-remove" hidden>Remove</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="editor-shell" id="shell">
+        <div class="editor-tools">
+          <div class="group">
+            <button type="button" class="btn ghost" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash image</button>
+            <button type="button" class="btn ghost" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
+          </div>
+          <button type="button" class="btn ghost btn-toggle" id="rawbtn" aria-pressed="false" title="Flip between the styled view and the raw markdown source">Raw markdown</button>
+        </div>
+
+        <div id="source" class="md-editor md-editor-tall"></div>
+        <textarea id="raw" class="raw-source" hidden spellcheck="false"></textarea>
+      </div>
+      <div class="statusline"><span id="wc">0 words · 1 min read</span> &middot; <span id="savestate" class="savestate"></span><span id="slugline"></span></div>
+
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="save">Save</button>
+        <button type="button" class="btn" id="publish" title="Make this post live at its public URL">publish</button>
+        <a class="btn" id="viewlink" hidden>View post</a>
+        <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
+        <span id="msg" class="flash" hidden></span>
+      </div>
     </div>
   </div>
 </div>
@@ -104,8 +113,13 @@ let postStatus = 'draft';   // live status of the post being edited
 let slugTouched = false;
 let md = null;              // the Milkdown editor behind #source
 
-function getSrc() { return md ? md.getMarkdown() : ''; }
-function setSrc(s) { if (md) md.setMarkdown(s); }
+let rawMode = false;   // true = the raw-markdown textarea is the editor
+
+function getSrc() { return rawMode ? $('raw').value : (md ? md.getMarkdown() : ''); }
+function setSrc(s) {
+    if (rawMode) { $('raw').value = s; return; }
+    if (md) md.setMarkdown(s);
+}
 
 async function jfetch(u, opts) {
     const r = await fetch(u, Object.assign({
@@ -130,31 +144,12 @@ function slugify(s) {
         .replace(/^-+|-+$/g, '')
         .slice(0, 96);
 }
+function validSlug(s) { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 96; }
 
 function updateWc() {
     const n = (getSrc().trim().match(/\S+/g) || []).length;
-    $('wc').textContent = n + (n === 1 ? ' word' : ' words');
-}
-
-let pt = null;
-function previewSoon() {
-    if (pt) clearTimeout(pt);
-    pt = setTimeout(renderPreview, 350);
-}
-
-async function renderPreview() {
-    const src = getSrc();
-    if (!src.trim()) {
-        $('preview').innerHTML = '<p class="muted">Preview appears here as you type.</p>';
-        return;
-    }
-    try {
-        const d = await jfetch('/api/preview', {
-            method: 'POST',
-            body: JSON.stringify({ markdown: src })
-        });
-        $('preview').innerHTML = d.html || '';
-    } catch (e) { /* preview is best-effort; saving still works */ }
+    const mins = Math.max(1, Math.round(n / 200));
+    $('wc').textContent = n + (n === 1 ? ' word' : ' words') + ' · ' + mins + ' min read';
 }
 
 function flash(msg, isErr) {
@@ -164,6 +159,160 @@ function flash(msg, isErr) {
     m.hidden = false;
     clearTimeout(flash._t);
     flash._t = setTimeout(() => { m.hidden = true; }, 2600);
+}
+
+// ---- live slug feedback ----
+// The slug is the post's public URL segment, so the field says where it
+// stands while you type: available, taken, or malformed. While editing an
+// existing post its own slug is excluded ("except="), so keeping it does
+// not read as a conflict with itself.
+let slugTimer = null;
+function slugCheckUrl(slug) {
+    let u = '/api/slug-check?slug=' + encodeURIComponent(slug);
+    if (postId) u += '&except=' + encodeURIComponent(String(postId));
+    return u;
+}
+function applySlugResult(r) {
+    const st = $('slug-state');
+    if (!r) { st.textContent = ''; st.className = 'slug-state'; return; }
+    if (r.checking) { st.textContent = 'checking…'; st.className = 'slug-state'; return; }
+    if (r.ok) { st.textContent = '✓ available'; st.className = 'slug-state ok'; }
+    else if (r.reason === 'taken') { st.textContent = '✗ taken — pick another'; st.className = 'slug-state err'; }
+    else { st.textContent = 'letters, digits, single hyphens'; st.className = 'slug-state err'; }
+}
+function checkSlug() {
+    clearTimeout(slugTimer);
+    const slug = $('slug').value.trim();
+    if (!slug) { applySlugResult(null); return; }
+    if (!validSlug(slug)) { applySlugResult({ ok: false, reason: 'invalid' }); return; }
+    applySlugResult({ checking: true });
+    slugTimer = setTimeout(async () => {
+        try { applySlugResult(await jfetch(slugCheckUrl(slug))); }
+        catch (e) { applySlugResult(null); /* offline: save will name it */ }
+    }, 250);
+}
+
+// ---- outline ----
+// The post's headings, parsed from the markdown itself so the outline is
+// right in both views: click an entry to jump there, and the section you
+// are currently reading is highlighted as the editor scrolls.
+let activeHead = -1;
+function isFence(line) { return /^ {0,3}(```|~~~)/.test(line); }
+// Pure heading scan: ATX headings (# .. ######) outside fenced code
+// blocks, up to three spaces of indent (CommonMark's rule).
+function parseOutline(src) {
+    const heads = [];
+    let fence = false;
+    for (const line of src.split('\n')) {
+        if (isFence(line)) { fence = !fence; continue; }
+        if (fence) continue;
+        const m = /^ {0,3}(#{1,6})\s+(.*)$/.exec(line);
+        if (m) heads.push({ level: m[1].length, text: m[2].trim() });
+    }
+    return heads;
+}
+// The character offset and line number of each heading in the raw text,
+// for jumps and scroll tracking in the raw view.
+function outlineMap() {
+    const src = getSrc();
+    const map = [];
+    let fence = false, pos = 0, ln = 0;
+    for (const line of src.split('\n')) {
+        if (isFence(line)) { fence = !fence; }
+        else if (!fence) {
+            const m = /^ {0,3}(#{1,6})\s+/.exec(line);
+            if (m) map.push({ offset: pos, line: ln, level: m[1].length });
+        }
+        pos += line.length + 1;
+        ln++;
+    }
+    return map;
+}
+function escText(s) {
+    return s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+function renderOutline() {
+    const heads = parseOutline(getSrc());
+    const list = $('outline-list');
+    if (!heads.length) {
+        list.innerHTML = '<li class="outline-empty">No headings yet — start a line with <code>#</code>, <code>##</code> or <code>###</code>.</li>';
+    } else {
+        list.innerHTML = heads.map((h, i) =>
+            '<li class="outline-item" data-level="' + h.level + '">' +
+            '<a href="#" data-i="' + i + '">' + escText(h.text) + '</a></li>').join('');
+    }
+    if (activeHead >= heads.length) activeHead = heads.length - 1;
+    markActive();
+}
+function markActive() {
+    const list = $('outline-list');
+    if (!list.querySelectorAll) return;
+    const items = list.querySelectorAll('.outline-item');
+    items.forEach((li, i) => li.classList.toggle('active', i === activeHead));
+}
+function updateActive() {
+    const map = outlineMap();
+    if (!map.length) { activeHead = -1; markActive(); return; }
+    if (rawMode) {
+        const ta = $('raw');
+        const topLine = ((ta.scrollTop || 0) / 25) + 3;   // 25px = the raw view's line height
+        let best = -1;
+        for (const h of map) { if (h.line <= topLine) best++; else break; }
+        activeHead = best;
+    } else {
+        // The styled card grows the page: the WINDOW is the scroller, so
+        // the heading to name is the last one whose viewport top has
+        // passed under the sticky header + toolbar (~7rem). Scoped to
+        // .ProseMirror: the editor root also carries Crepe's UI widgets,
+        // and any heading-shaped node there would break index parity
+        // with the outline.
+        const wrap = $('source').querySelector ? $('source').querySelector('.ProseMirror') : null;
+        if (!wrap || !wrap.querySelectorAll || !wrap.getBoundingClientRect) return;
+        const nodes = wrap.querySelectorAll('h1,h2,h3,h4,h5,h6');
+        let best = -1;
+        nodes.forEach((n, i) => {
+            if (n.getBoundingClientRect && n.getBoundingClientRect().top <= 120) best = i;
+        });
+        activeHead = best;
+    }
+    markActive();
+}
+function jumpTo(i) {
+    if (rawMode) {
+        const h = outlineMap()[i];
+        if (!h) return;
+        const ta = $('raw');
+        ta.setSelectionRange(h.offset, h.offset);
+        ta.focus();
+        ta.scrollTop = Math.max(0, h.line * 25 - (ta.clientHeight || 300) / 2);
+        updateActive();
+    } else {
+        // scoped to .ProseMirror for the same index-parity reason as
+        // updateActive: Crepe's widgets live in the root, not the surface
+        const wrap = $('source').querySelector ? $('source').querySelector('.ProseMirror') : null;
+        if (!wrap) return;
+        const nodes = wrap.querySelectorAll('h1,h2,h3,h4,h5,h6');
+        const n = nodes[i];
+        if (n && n.scrollIntoView) n.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    }
+}
+$('outline-list').addEventListener('click', ev => {
+    const a = ev.target && ev.target.closest ? ev.target.closest('a[data-i]') : null;
+    if (!a) return;
+    ev.preventDefault();
+    jumpTo(parseInt(a.getAttribute('data-i'), 10));
+});
+// Scroll tracking: the window carries the styled view (the card grows
+// the page), the textarea carries the raw view. One window listener,
+// registered once; the textarea listener follows the active view.
+if (typeof window !== 'undefined') {
+    window.addEventListener('scroll', () => updateActive(), { passive: true });
+}
+function trackScroll() {
+    const el = rawMode ? $('raw') : null;
+    if (!el || !el.addEventListener || el._pwTracked) return;
+    el._pwTracked = true;
+    el.addEventListener('scroll', () => updateActive());
 }
 
 // ---- unsaved-work guard ----
@@ -178,6 +327,7 @@ let pendingDraft = null;
 function draftKey() { return DRAFT_PREFIX + (postId || 'new'); }
 function markDirty() {
     dirty = true;
+    $('savestate').textContent = 'unsaved edits';
     if (snapTimer) clearTimeout(snapTimer);
     snapTimer = setTimeout(saveDraft, 600);
 }
@@ -192,6 +342,7 @@ function saveDraft() {
 }
 function clearDrafts(id) {
     dirty = false;
+    $('savestate').textContent = '';
     try {
         localStorage.removeItem(DRAFT_PREFIX + 'new');
         localStorage.removeItem(DRAFT_PREFIX + id);
@@ -218,7 +369,7 @@ $('restore-yes').onclick = () => {
     slugTouched = !!snap.slug;
     setSrc(snap.source || '');
     dirty = true;
-    updateWc(); previewSoon(); syncCover();
+    updateWc(); syncCover(); renderOutline();
 };
 $('restore-no').onclick = () => {
     pendingDraft = null;
@@ -229,14 +380,43 @@ window.addEventListener('beforeunload', e => {
     if (dirty) { e.preventDefault(); e.returnValue = ''; }
 });
 
-// Every keystroke in the Milkdown editor lands here: word count, the
-// debounced server preview, and cover sync.
+// Every keystroke in the Milkdown editor lands here: word count, cover
+// sync, and the outline.
 function onSourceChange() {
     markDirty();
     updateWc();
-    previewSoon();
     syncCover();
+    renderOutline();
 }
+
+// ---- styled view / raw view ----
+// One toggle flips between the Crepe editor and a plain textarea over
+// the same markdown: each direction carries the text across, so no
+// edit is lost and the word count, cover, and draft snapshot follow.
+function setMode(raw) {
+    if (raw === rawMode) return;
+    if (raw) {
+        $('raw').value = md ? md.getMarkdown() : '';
+        $('source').hidden = true;
+        $('raw').hidden = false;
+        $('raw').focus();
+    } else {
+        if (md) md.setMarkdown($('raw').value);
+        $('raw').hidden = true;
+        $('source').hidden = false;
+        if (md) md.focus();
+    }
+    rawMode = raw;
+    $('rawbtn').setAttribute('aria-pressed', String(raw));
+    $('rawbtn').textContent = raw ? 'Styled view' : 'Raw markdown';
+    updateWc();
+    syncCover();
+    renderOutline();
+    trackScroll();
+    updateActive();
+}
+$('rawbtn').onclick = () => setMode(!rawMode);
+$('raw').addEventListener('input', onSourceChange);
 
 // Upload a local file; the answer is the markdown-ready URL. A media URL
 // carries no extension, so video/audio ride on an ?embed= query the
@@ -273,7 +453,7 @@ async function save(status) {
     const title = $('title').value.trim();
     const slug = ($('slug').value.trim() || slugify(title)).slice(0, 96);
     if (!title) { flash('A title is required.', true); return; }
-    if (!slug) { flash('Could not derive a slug &mdash; set one manually.', true); return; }
+    if (!slug) { flash('Could not derive a slug — set one manually.', true); return; }
     const body = JSON.stringify({
         title: title,
         slug: slug,
@@ -298,17 +478,28 @@ async function save(status) {
         $('heading').textContent = 'Edit post';
         syncPublishBtn();
         clearDrafts(p.id);
-        flash(p.status === 'published' ? 'Saved &middot; published.' : 'Saved &middot; draft.');
+        applySlugResult(null);
+        flash(p.status === 'published' ? 'Saved · published.' : 'Saved · draft.');
     } catch (e) {
         flash(e.message, true);
     }
 }
 
+// Ctrl/Cmd-S saves from anywhere on the page — the reflex every editor
+// trained into its writers.
+window.addEventListener('keydown', e => {
+    if ((e.ctrlKey || e.metaKey) && (e.key === 's' || e.key === 'S')) {
+        e.preventDefault();
+        save();
+    }
+});
+
 $('title').addEventListener('input', () => {
     if (!slugTouched && !postId) $('slug').value = slugify($('title').value);
     markDirty();
+    if (!slugTouched && !postId) checkSlug();
 });
-$('slug').addEventListener('input', () => { slugTouched = true; markDirty(); });
+$('slug').addEventListener('input', () => { slugTouched = true; markDirty(); checkSlug(); });
 $('tags').addEventListener('input', markDirty);
 
 // ---- cover image (first markdown image = the post header) ----
@@ -329,20 +520,34 @@ function syncCover() {
 $('cover-pick').onclick = () => {
     pw.pickUnsplash({ defaultQuery: $('title').value.trim() }, d => {
         setSrc(pw.setCover(getSrc(), 'Photo by ' + d.credit + ' on Unsplash', d.url));
-        syncCover(); updateWc(); previewSoon();
+        syncCover(); updateWc(); renderOutline();
     });
 };
 $('cover-remove').onclick = () => {
     setSrc(pw.removeCover(getSrc()));
-    syncCover(); updateWc(); previewSoon();
+    syncCover(); updateWc(); renderOutline();
 };
 
 // ---- insert an Unsplash image at the cursor ----
 // The credit goes in the image title — the slot Milkdown preserves when
 // it round-trips a post (the alt slot is rewritten to a size ratio).
+// Insert markdown at the cursor: through the Crepe editor in styled
+// view, spliced into the textarea in raw view.
+function insertMd(text) {
+    if (rawMode) {
+        const ta = $('raw');
+        const p = ta.selectionStart, q = ta.selectionEnd;
+        ta.value = ta.value.slice(0, p) + text + ta.value.slice(q);
+        ta.selectionStart = ta.selectionEnd = p + text.length;
+        onSourceChange();
+    } else {
+        md.insert(text);
+    }
+}
+
 $('imgbtn').onclick = () => {
     pw.pickUnsplash({}, d => {
-        md.insert('![](' + d.url + ' "Photo by ' + d.credit.replace(/["'()[\]]/g, '') + ' on Unsplash")');
+        insertMd('![](' + d.url + ' "Photo by ' + d.credit.replace(/["'()[\]]/g, '') + ' on Unsplash")');
         syncCover();
     });
 };
@@ -357,7 +562,7 @@ async function insertUploaded(file) {
     // when it round-trips a post (the alt slot becomes a size ratio)
     const name = file.name.replace(/["'()[\]]/g, '');
     try {
-        md.insert('![](' + await uploadFile(file) + (name ? ' "' + name + '"' : '') + ')');
+        insertMd('![](' + await uploadFile(file) + (name ? ' "' + name + '"' : '') + ')');
     } catch (e) {
         flash(e.message + (e.message.indexOf('too large') >= 0 ? ' (max ' + (av ? '50MB' : '5MB') + ')' : ''), true);
     }
@@ -370,9 +575,10 @@ $('uploadbtn').onclick = () => {
     inp.click();
 };
 // files dropped into the editor: Milkdown has no drop-to-upload of its
-// own, so the page handles every media kind here. Capture phase, before
+// own, so the page handles every media kind here — on the shell, so it
+// covers the styled view and the raw view alike. Capture phase, before
 // the ProseMirror view's own drop handling can swallow the event.
-$('source').addEventListener('drop', ev => {
+$('shell').addEventListener('drop', ev => {
     const f = ev.dataTransfer.files[0];
     if (f && /^(image|video|audio)\//.test(f.type)) {
         ev.preventDefault();
@@ -404,6 +610,7 @@ $('delete').onclick = async () => {
         return;
     }
     $('editor').hidden = false;
+    $('outline-col').hidden = false;
 
     // a server-side Unsplash key (setup.sh or the settings page) wins
     // over the per-browser one in the picker
@@ -435,18 +642,27 @@ $('delete').onclick = async () => {
             flash(e.message, true);
         }
     }
+    // A ReferenceError here ("pwMilkdown is not defined") means the
+    // /milkdown.js bundle never parsed — name that as a page error
+    // instead of dying as an unhandled rejection.
+    if (typeof pwMilkdown === 'undefined') {
+        $('neterr').hidden = false;
+        $('neterr').textContent = 'The editor bundle failed to load — /milkdown.js did not run. See the browser console for the reason.';
+        return;
+    }
     md = await pwMilkdown.create($('source'), {
         defaultValue: initial,
         placeholder: 'Write your post in markdown…',
         onChange: onSourceChange,
         onUpload: uploadFile,
+        toolbar: true,
     });
     updateWc();
     syncCover();
+    renderOutline();
+    trackScroll();
     checkDraft();
-    if (initial) renderPreview();
 })();
 </script>
 </body>
 </html>
-

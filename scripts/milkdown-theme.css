@@ -17,7 +17,7 @@
   --crepe-color-on-secondary: var(--fg);
   --crepe-color-inverse: var(--fg);
   --crepe-color-on-inverse: var(--bg);
-  --crepe-color-inline-code: var(--danger);
+  --crepe-color-inline-code: var(--fg);
   --crepe-color-error: var(--danger);
   --crepe-color-hover: var(--line-soft);
   --crepe-color-selected: var(--bg-overlay);
@@ -28,16 +28,96 @@
   --crepe-font-code: var(--font-mono);
 }
 
-/* the editor pane sits where the old textarea was: give it a body-sized
-   writing area and the site's card treatment */
+/* The editor card: Crepe's top bar and the writing surface form one
+   card. Padding lives on the ProseMirror body (not the card) so the
+   bar spans the full width, and the focus treatment matches the site's
+   inputs. */
 .md-editor .milkdown {
   min-height: 22rem;
   border: 1px solid var(--line);
   border-radius: var(--radius);
   background: var(--bg-raised);
-  padding: 0.25rem 0.75rem;
+  box-shadow: var(--shadow-1);
+  transition: border-color .15s ease;
+}
+.md-editor .milkdown:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 50%, var(--line));
 }
 .md-editor .ProseMirror {
   min-height: 20rem;
   outline: none;
+  padding: 1.15rem 1.4rem 1.6rem;
+  font-family: var(--font-serif);
+  font-size: 1.05rem;
+  line-height: 1.75;
+}
+
+/* the formatting toolbar rides under the sticky site header instead of
+   sliding beneath it while a long post scrolls; a whisper of layering
+   separates it from the writing surface */
+.md-editor .milkdown-top-bar {
+  top: 3.6rem;
+  background: var(--bg-overlay);
+}
+
+/* The selection (context) toolbar carries more actions now — Crepe's
+   own marks plus heading 1/2/3 — so it wraps instead of running off the
+   card on narrow screens, and stays inside the viewport. */
+.md-editor .milkdown-toolbar {
+  flex-wrap: wrap;
+  max-width: min(92vw, 30rem);
+}
+
+/* the writing surface reads like the published post: the site's type
+   scale, serif body, accent links and quote bars; scroll-margin keeps a
+   heading jumped to from the outline clear of the sticky header + bar */
+.md-editor .ProseMirror h1,
+.md-editor .ProseMirror h2,
+.md-editor .ProseMirror h3,
+.md-editor .ProseMirror h4,
+.md-editor .ProseMirror h5,
+.md-editor .ProseMirror h6 {
+  scroll-margin-top: 6.5rem;
+}
+.md-editor .ProseMirror h1,
+.md-editor .ProseMirror h2,
+.md-editor .ProseMirror h3,
+.md-editor .ProseMirror h4,
+.md-editor .ProseMirror h5,
+.md-editor .ProseMirror h6 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--fg);
+}
+.md-editor .ProseMirror h1 { font-size: var(--step-3); }
+.md-editor .ProseMirror h2 { font-size: var(--step-2); }
+.md-editor .ProseMirror h3 { font-size: var(--step-1); }
+.md-editor .ProseMirror h4 { font-size: 1.12rem; }
+.md-editor .ProseMirror h5 { font-size: 1rem; }
+.md-editor .ProseMirror h6 { font-size: var(--step--1); text-transform: uppercase; letter-spacing: 0.04em; }
+.md-editor .ProseMirror a { color: var(--accent); text-underline-offset: 3px; }
+.md-editor .ProseMirror blockquote { color: var(--fg-muted); font-style: italic; }
+.md-editor .ProseMirror blockquote::before { background: var(--accent); }
+.md-editor .ProseMirror pre {
+  background: color-mix(in srgb, var(--fg) 6%, var(--bg-overlay));
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  overflow-x: auto;
+}
+
+/* The post editor has no preview pane: its writing area takes the full
+   page width and runs long down the rest of the screen. Scoped to
+   md-editor-tall so the admin page's compact editor keeps its height.
+   The tall surface fills the viewport below the metadata rows, so the
+   whole editing area is on screen at once instead of a short strip. */
+.md-editor-tall .milkdown {
+  min-height: calc(100vh - 24rem);
+}
+.md-editor-tall .ProseMirror {
+  min-height: calc(100vh - 26.75rem);
+}
+@media (max-height: 40rem) {
+  .md-editor-tall .milkdown { min-height: 60vh; }
+  .md-editor-tall .ProseMirror { min-height: calc(60vh - 2.75rem); }
 }

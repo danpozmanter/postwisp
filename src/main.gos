@@ -2203,9 +2203,12 @@ fn handle_slug_check(app: App, req: http::Request) -> http::Response {
         Ok(me) => {
             let slug = query_value(req, "slug")
             if !valid_slug(slug) { return ok_json("{\"ok\":false,\"reason\":\"invalid\"}") }
+            // "except" names the post being edited, so its own slug does
+            // not read as taken while the editor has it open
+            let except = query_value(req, "except").to_i64().unwrap_or(0)
             let mut eng = open_eng(app)
             let store = read_store(&mut eng)
-            if slug_taken(store, me.id, slug, 0) {
+            if slug_taken(store, me.id, slug, except) {
                 return ok_json("{\"ok\":false,\"reason\":\"taken\"}")
             }
             return ok_json("{\"ok\":true}")
