@@ -21,6 +21,7 @@ cp "$BIN_OUT" dist/postwisp
 cp -r templates dist/templates
 cp -r web dist/web
 cp scripts/setup.sh dist/scripts/setup.sh
+cp scripts/README-env.md dist/README-env.md
 
 echo
 echo "dist/ is ready:"

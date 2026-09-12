@@ -71,6 +71,7 @@
           <p class="cover-sub">Picked from Unsplash search (Hashnode-style) — becomes the post's header on the public page. The first image in the markdown is the cover.</p>
           <div class="row">
             <button type="button" class="btn" id="cover-pick">Search Unsplash</button>
+            <button type="button" class="btn" id="cover-upload" title="Upload a photo from this computer and make it the cover">Upload file</button>
             <button type="button" class="btn ghost" id="cover-remove" hidden>Remove</button>
           </div>
         </div>
@@ -526,6 +527,30 @@ $('cover-pick').onclick = () => {
 $('cover-remove').onclick = () => {
     setSrc(pw.removeCover(getSrc()));
     syncCover(); updateWc(); renderOutline();
+};
+
+// ---- upload a photo from this computer as the cover ----
+// The image bytes go to the author's media library (uploadFile), then
+// the answer is written in as the post's first markdown image — the
+// same slot the Unsplash picker writes, so the cover travels with the
+// text onto the public page and the cards. The alt text carries the
+// credit-style note the cover slot expects.
+$('cover-upload').onclick = () => {
+    const inp = document.createElement('input');
+    inp.type = 'file';
+    inp.accept = 'image/png,image/jpeg,image/webp,image/gif';
+    inp.onchange = async () => {
+        const file = inp.files[0];
+        if (!file) return;
+        try {
+            const url = await uploadFile(file);
+            setSrc(pw.setCover(getSrc(), file.name.replace(/["'()[\]]/g, ''), url));
+            syncCover(); updateWc(); renderOutline();
+        } catch (e) {
+            flash(e.message + (e.message.indexOf('too large') >= 0 ? ' (max 5MB)' : ''), true);
+        }
+    };
+    inp.click();
 };
 
 // ---- insert an Unsplash image at the cursor ----

@@ -117,14 +117,21 @@ echo "A free Access Key comes from creating an app at"
 echo "  https://unsplash.com/oauth/applications  (demo tier: 50 requests/hour)."
 UKEY="$(ask "Paste your Unsplash Access Key (or press Enter to skip):")"
 if [ -n "$UKEY" ]; then
+    # The key rides in ./env — read by the server itself on every boot, so
+    # the editor picks it up automatically and the author is never asked
+    # for it in the browser. Also pushed to the server settings below, so
+    # both paths agree from the first login.
+    printf '# postwisp environment — read by the server at boot.\n# See README-env.md in this directory.\nPW_UNSPLASH_KEY=%s\n' "$UKEY" > env
+    chmod 600 env
     RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
         -H 'Content-Type: application/json' \
         -d "{\"unsplash_key\":\"$(json "$UKEY")\"}")"
     CODE="$(echo "$RESP" | tail -n1)"
     [ "$CODE" = "200" ] || die "Unsplash key save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
-    ok "Unsplash key saved with the server settings."
+    ok "Unsplash key saved to ./env (server settings updated too)."
 else
-    echo "Skipped — you can add one later on the Settings page ($BASE_URL/settings)."
+    echo "Skipped — you can add one later: put PW_UNSPLASH_KEY=... in ./env"
+    echo "(see README-env.md) or use the Settings page ($BASE_URL/settings)."
 fi
 
 echo

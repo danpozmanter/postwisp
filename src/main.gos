@@ -83,6 +83,7 @@ struct App {
     dir: String
     web_dir: String
     tpl_dir: String
+    env_unsplash_key: String
 }
 
 struct LoginAttempt {
@@ -211,6 +212,45 @@ fn resolve_dir(env_name: String, dflt: String) -> String {
     cwd + "/" + dflt
 }
 
+// Reads the `env` file the deployment ships (scripts/setup.sh writes it
+// with the Unsplash access key): KEY=VALUE lines, blank lines and `#`
+// comments ignored. Only PW_UNSPLASH_KEY is looked for; a real
+// PW_UNSPLASH_KEY in the process environment wins over the file, so a
+// service unit's setting cannot be silently overridden by a stale file.
+// The file sits beside the binary, never inside data/, so a data-dir
+// backup never carries secrets.
+
+fn read_env_file(path: String) -> Map<String, String> {
+    let mut out = Map::new()
+    let text = match fs::read_to_string(path) {
+        Ok(t) => t
+        Err(_) => return out
+    }
+    for line in text.split("\n") {
+        let l = line.trim()
+        if l.len() == 0 || l[0] == '#' { continue }
+        match strings::split_once(l, "=") {
+            Some(pair) => {
+                let k, v = pair
+                if k.len() > 0 { out.insert(k, v) }
+            }
+            None => ()
+        }
+    }
+    return out
+}
+
+fn unsplash_env_key() -> String {
+    match env::var("PW_UNSPLASH_KEY") {
+        Some(k) => return k
+        None => ()
+    }
+    match read_env_file("env").get("PW_UNSPLASH_KEY") {
+        Some(k) => return k
+        None => return ""
+    }
+}
+
 fn new_app() -> App {
     // Boot step only: ensure the data dir, tables, and the first-boot
     // setup token exist. Handlers open the engine per request (open_eng).
@@ -239,7 +279,7 @@ fn new_app() -> App {
         // setup is completed so the URL cannot be lost.
         println("first boot: open /setup?token=" + store.setup_token + " to create the admin account")
     }
-    App { dir: dir, web_dir: web_dir, tpl_dir: tpl_dir }
+    App { dir: dir, web_dir: web_dir, tpl_dir: tpl_dir, env_unsplash_key: unsplash_env_key() }
 }
 
 // Rebuilds the in-memory cache from the engine. Row identity is the engine's
@@ -3518,9 +3558,13 @@ fn handle_get_settings(app: App, req: http::Request) -> http::Response {
         Err(r) => return r
         Ok(u) => {
             // the Unsplash key rides on the owner's own settings answer
-            // only — /api/public/site serves the same JSON without it
+            // only — /api/public/site serves the same JSON without it.
+            // Precedence: a key saved on the Settings page wins, then
+            // PW_UNSPLASH_KEY in the environment / the `env` file
+            // (setup.sh), so an author never has to paste one at all.
             let f = settings_map_for(app, u.id)
-            let key = get_setting(f, "unsplash_key", "")
+            let mut key = get_setting(f, "unsplash_key", "")
+            if key.len() == 0 { key = app.env_unsplash_key }
             return ok_json(settings_json_for(app, u.id, u.username, ",\"unsplash_key\":" + json_quote(key)))
         }
     }

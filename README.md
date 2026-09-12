@@ -131,14 +131,21 @@ Unsplash's API needs a free **Access Key**: create an app at
 <https://unsplash.com/oauth/applications> (demo tier: 50 requests/hour)
 and paste the key
 
-- when `scripts/setup.sh` asks during first-run setup,
+- when `scripts/setup.sh` asks during first-run setup — it writes the
+  key to an `env` file beside the binary (see `README-env.md` in the
+  deployment), which the server reads at every boot and hands to the
+  editor with your settings, so **no one is ever prompted for a key in
+  the browser**,
 - on the **Settings** page (`/settings`, "Unsplash access key"), or
 - into the picker itself the first time you search.
 
-The key is stored on the server with the author's settings, so every
-browser you log in from shares it; a key pasted straight into the picker
-is kept in that browser as a fallback. Without a key, everything else
-works; the button just asks for one.
+The key is stored on the server — in `env` (`PW_UNSPLASH_KEY`) or with
+the author's settings — so every browser you log in from shares it; a
+key pasted straight into the picker is kept in that browser as a
+fallback. Without a key, everything else works; the button just asks
+for one. An uploaded photo works as a cover too: the editor's cover
+row has an **Upload file** button that puts a photo from your computer
+straight into the cover slot.
 
 A post's header image is the first markdown image of its source, and it
 is the only image that gets special treatment: the post page hoists it
@@ -290,7 +297,9 @@ Behaviour worth knowing:
   `PW_TEMPLATES` (public templates, default `templates/`),
   `PW_WEB` (built-in admin/editor pages, default `web/`), `PW_ADDR`
   (bind address, default `127.0.0.1:8080` — set `0.0.0.0:8080` to serve a
-  LAN), and the `PW_SMTP_*` set for account recovery (see above)
+  LAN), `PW_UNSPLASH_KEY` (Unsplash access key — also read from an `env`
+  file beside the binary, see "Cover photos & images"), and the
+  `PW_SMTP_*` set for account recovery (see above)
 
 ## Two-factor login over email
 
