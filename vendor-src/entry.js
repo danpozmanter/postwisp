@@ -96,7 +96,7 @@ async function create(root, opts) {
   }
   const featureConfigs = {
     [Crepe.Feature.Placeholder]: {
-      text: opts.placeholder || 'Write your post in markdown\u2026',
+      text: opts.placeholder || 'Begin writing here',
       mode: 'doc',
     },
     [Crepe.Feature.ImageBlock]: {

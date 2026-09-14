@@ -138,7 +138,7 @@ list if it ever needs to be index-backed; not in v1.
 **Slug rules.** Frontend auto-populates from title (lowercase, trim, non
 alnum → `-`, collapse repeats, trim `-`), stops auto-following once the user
 edits the field by hand. Save is rejected (409) when the slug is taken or
-malformed (`^[a-z0-9]+(?:-[a-z0-9]+)*$`, ≤ 96 chars). Slugs are unique
+malformed (`^[a-z0-9]+(?:-[a-z0-9]+)*$`, ≤ 216 chars). Slugs are unique
 **per user**; the public URL is `/<username>/<slug>`.
 
 **Image uploads.** `POST /api/media` takes a multipart image (jpg/png/webp/

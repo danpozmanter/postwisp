@@ -39,3 +39,6 @@ jobs:
 
       - name: Dashboard editor checks
         run: node scripts/check-admin.js
+
+      - name: Shared theme module checks
+        run: node scripts/check-theme.js

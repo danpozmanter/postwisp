@@ -411,6 +411,11 @@ fn slugify(s: String) -> String {
         }
         i += 1
     }
+    // a long title still derives a usable slug: cut at the slug limit
+    // (the trim below keeps the cut from leaving a trailing '-')
+    if out.len() > 216 {
+        out = sub(out, 0, 216)
+    }
     if out.len() > 0 && out[out.len() - 1] == '-' {
         out = sub(out, 0, out.len() - 1)
     }
@@ -419,7 +424,7 @@ fn slugify(s: String) -> String {
 
 
 fn valid_slug(slug: String) -> bool {
-    if slug.len() == 0 || slug.len() > 96 { return false }
+    if slug.len() == 0 || slug.len() > 216 { return false }
     if slug[0] == '-' || slug[slug.len() - 1] == '-' { return false }
     let mut prev_dash = false
     for c in slug.bytes() {
@@ -2279,7 +2284,7 @@ fn handle_create_post(app: App, req: http::Request) -> http::Response {
             let source = field(f, "source")
             let tags = field(f, "tags")
             let status = field(f, "status")
-            if title.len() == 0 || title.len() > 200 { return err_json(400, "title required (max 200)") }
+            if title.len() == 0 || title.len() > 450 { return err_json(400, "title required (max 450)") }
             // derive from the title when the client sends none (or junk)
             if !valid_slug(slug) { slug = slugify(title) }
             if !valid_slug(slug) { return err_json(400, "could not derive a slug from the title") }
@@ -2334,7 +2339,7 @@ fn handle_update_post(app: App, req: http::Request) -> http::Response {
             let source = field(f, "source")
             let tags = field(f, "tags")
             let status = field(f, "status")
-            if title.len() == 0 || title.len() > 200 { return err_json(400, "title required (max 200)") }
+            if title.len() == 0 || title.len() > 450 { return err_json(400, "title required (max 450)") }
             let mut eng = open_eng(app)
             let mut store = read_store(&mut eng)
             let mut found: Option<Post> = None
@@ -4380,6 +4385,30 @@ fn slug_validation() {
     assert_eq(valid_slug("-x"), false)
     assert_eq(valid_slug("a--b"), false)
     assert_eq(valid_slug(""), false)
+    // the slug limit is 216 characters (96 grown by half twice)
+    let mut at_limit = String::new()
+    for _ in ..216 { at_limit += "a" }
+    assert_eq(valid_slug(at_limit), true)
+    at_limit += "a"
+    assert_eq(valid_slug(at_limit), false)
+}
+
+
+#[test]
+
+fn slugify_caps_long_titles() {
+    // a 450-char title (the grown title limit) still derives a usable slug
+    let mut t = String::new()
+    for _ in ..450 { t += "a" }
+    assert_eq(slugify(t).len(), 216)
+    // when the cut lands on a dash, the derived slug must not end with one
+    let mut d = String::new()
+    for _ in ..215 { d += "a" }
+    d += "-"
+    for _ in ..10 { d += "b" }
+    let s = slugify(d)
+    assert_eq(s.len(), 215)
+    assert_eq(valid_slug(s), true)
 }
 
 

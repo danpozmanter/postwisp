@@ -120,23 +120,20 @@ pw.coverFromExcerpt = function (excerpt) {
 };
 
 // ---------------------------------------------------------------- 4. unsplash
-// Client-side Unsplash search. The access key is per-browser (the settings
-// API ignores unknown fields, so there is no server-side slot for it):
-// set it on the settings page or directly in the picker.
+// Client-side Unsplash search. The access key lives on the server only
+// (setup.sh or the settings page): the editor page sets _serverUnsplashKey
+// from /api/settings after login, and the picker reads it through here.
+// There is no key entry in the picker — with no key configured the modal
+// opens to a gentle note pointing at the settings page instead.
 
-pw.unsplashKey = function (k) {
-    if (arguments.length > 0) {
-        try { localStorage.setItem('postwisp-unsplash-key', k); } catch (e) { /* ignore */ }
-    }
-    try { return localStorage.getItem('postwisp-unsplash-key') || ''; } catch (e) { return ''; }
-};
-
-// A key saved on the server (setup.sh or the settings page) wins over the
-// per-browser one: the editors set _serverUnsplashKey after loading
-// /api/settings, and the picker reads it through here.
 pw.unsplashApiKey = function () {
-    return pw._serverUnsplashKey || pw.unsplashKey();
+    return pw._serverUnsplashKey || '';
 };
+
+// The gentle note for a server with no key configured yet.
+var PW_NO_KEY_NOTE = 'Unsplash search isn\u2019t set up on this server yet. A free access ' +
+    'key from unsplash.com/oauth/applications can be added on the Settings page, ' +
+    'and the search will work right away.';
 
 // pick({ defaultQuery }, onPick) — onPick receives
 // { url, thumb, alt, credit, creditUrl } for the chosen photo.
@@ -152,8 +149,8 @@ pw.pickUnsplash = function (opts, onPick) {
     state.query = opts.defaultQuery || '';
     state.page = 1;
 
-    if (!key) { showKeyRow(); return; }
-    hideKeyRow();
+    if (!key) { showNoKey(); return; }
+    modal.noteRow.hidden = true;
     // the search input lives on the modal object, not on _state
     modal.search.value = state.query;
     if (state.query) doSearch(); else { modal.grid.innerHTML = ''; setStatus('Type a word or two and press Enter — try “mountains”, “desk setup”, “abstract”.'); }
@@ -177,14 +174,8 @@ pw.pickUnsplash = function (opts, onPick) {
             '    <button type="button" class="btn btn-primary pw-search-btn">Search</button>' +
             '  </div>' +
             '  <div class="pw-status" role="status"></div>' +
-            '  <div class="pw-key-row" hidden>' +
-            '    <p>To search Unsplash you need a free <em>Access Key</em>. Create an app at ' +
-            '      <a href="https://unsplash.com/oauth/applications" target="_blank" rel="noopener">unsplash.com/oauth/applications</a>' +
-            '      (demo tier: 50 requests/hour) and paste the key here. It is stored in this browser only.</p>' +
-            '    <div class="pw-key-form">' +
-            '      <input type="text" class="pw-key-input" placeholder="Unsplash Access Key">' +
-            '      <button type="button" class="btn btn-primary pw-key-save">Save key</button>' +
-            '    </div>' +
+            '  <div class="pw-note-row" hidden>' +
+            '    <p></p>' +
             '  </div>' +
             '  <div class="pw-grid"></div>' +
             '  <div class="pw-modal-foot">Photos by their creators, via <a href="https://unsplash.com" target="_blank" rel="noopener">Unsplash</a> — click one to use it.</div>' +
@@ -197,9 +188,8 @@ pw.pickUnsplash = function (opts, onPick) {
             searchBtn: root.querySelector('.pw-search-btn'),
             status: root.querySelector('.pw-status'),
             grid: root.querySelector('.pw-grid'),
-            keyRow: root.querySelector('.pw-key-row'),
-            keyInput: root.querySelector('.pw-key-input'),
-            keySave: root.querySelector('.pw-key-save'),
+            noteRow: root.querySelector('.pw-note-row'),
+            note: root.querySelector('.pw-note-row p'),
             _state: { query: '', page: 1, onPick: null, busy: false }
         };
         root._modal = m;
@@ -223,17 +213,6 @@ pw.pickUnsplash = function (opts, onPick) {
             if (m._state.onPick) m._state.onPick(d);
         });
         m.grid.addEventListener('scroll', function () { }, { passive: true });
-        m.keySave.addEventListener('click', function () {
-            var k = m.keyInput.value.trim();
-            if (!k) return;
-            pw.unsplashKey(k);
-            hideKeyRow();
-            m._state.page = 1;
-            doSearch();
-        });
-        m.keyInput.addEventListener('keydown', function (ev) {
-            if (ev.key === 'Enter') { ev.preventDefault(); m.keySave.click(); }
-        });
         return m;
     }
 
@@ -242,14 +221,18 @@ pw.pickUnsplash = function (opts, onPick) {
         document.body.classList.remove('pw-modal-open');
     }
     function setStatus(t) { modal.status.textContent = t; }
-    function showKeyRow() { modal.keyRow.hidden = false; modal.grid.innerHTML = ''; setStatus('No Unsplash access key saved in this browser yet.'); modal.keyInput.focus(); }
-    function hideKeyRow() { modal.keyRow.hidden = true; }
+    function showNoKey(msg) {
+        modal.note.textContent = msg || PW_NO_KEY_NOTE;
+        modal.noteRow.hidden = false;
+        modal.grid.innerHTML = '';
+        setStatus('');
+    }
 
     function doSearch() {
         if (state.busy) return;
         var q = state.query;
         if (!q) { setStatus('Type something to search for first.'); return; }
-        if (!pw.unsplashApiKey()) { showKeyRow(); return; }
+        if (!pw.unsplashApiKey()) { showNoKey(); return; }
         state.busy = true;
         setStatus('Searching Unsplash for “' + q + '”…');
         if (state.page === 1) modal.grid.innerHTML = '';
@@ -285,13 +268,13 @@ pw.pickUnsplash = function (opts, onPick) {
         }).catch(function (e) {
             state.busy = false;
             setStatus(e.message || 'Could not reach Unsplash.');
-            if (/rejected the access key/.test(e.message || '')) { keyInvalid(); }
+            if (/rejected the access key/.test(e.message || '')) { keyRejected(); }
         });
     }
 
-    function keyInvalid() {
-        try { localStorage.removeItem('postwisp-unsplash-key'); } catch (e) { /* ignore */ }
-        showKeyRow();
+    function keyRejected() {
+        showNoKey('The Unsplash access key configured on this server was rejected \u2014 ' +
+            'please check or replace it on the Settings page.');
     }
 
     function ensureMore() {

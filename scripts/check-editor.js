@@ -13,6 +13,33 @@ const fs = require('fs');
 const path = require('path');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'editor.html'), 'utf8');
+const appCss = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.css'), 'utf8');
+
+// ---- static page checks ------------------------------------------
+// Copy and structure the DOM stub cannot observe: the page's labels, the
+// placeholder text, and the raw view's entry outline.
+const staticChecks = [
+    ['heading says "New Post"', /<h1[^>]*id="heading"[^>]*>\s*New Post\s*</.test(html), true],
+    ['the "Write in markdown." subtitle is gone', html.includes('Write in markdown.'), false],
+    ['editor placeholder reads "Begin writing here"', html.includes("placeholder: 'Begin writing here'"), true],
+    ['raw textarea placeholder reads "Begin writing here"', /<textarea id="raw"[^>]*placeholder="Begin writing here"/.test(html), true],
+    ['raw view keeps the entry outline (component border)', /\.editor-shell textarea\.raw-source\s*\{[^}]*border:\s*1px solid var\(--line\)/.test(appCss), true],
+    ['raw view gets the input focus treatment', /\.editor-shell textarea\.raw-source:focus/.test(appCss), true],
+    ['title input accepts 450 characters (96 grown by half twice over 200)', /<input id="title" maxlength="450"/.test(html), true],
+    ['slug input accepts 216 characters (96 grown by half twice)', /<input id="slug" maxlength="216"/.test(html), true],
+    ['tags input has no length cap', /<input id="tags"(?![^>]*maxlength)/.test(html), true],
+];
+let staticFailures = 0;
+for (const c of staticChecks) {
+    const ok = c[1] === c[2];
+    console.log((ok ? 'ok   ' : 'FAIL ') + c[0] +
+        (ok ? '' : '  got=' + JSON.stringify(c[1]) + ' want=' + JSON.stringify(c[2])));
+    if (!ok) staticFailures++;
+}
+if (staticFailures) {
+    console.error('editor page static checks FAILED: ' + staticFailures + ' check(s) failed');
+    process.exit(1);
+}
 
 // the page's inline script is the last <script> block in the file
 const start = html.lastIndexOf('<script>');
@@ -179,6 +206,10 @@ const driver = `
     // ---- slug feedback ----
     eq('slug: valid shape accepted', validSlug('a-b-2'), true);
     eq('slug: uppercase rejected', validSlug('Nope'), false);
+    eq('slug: 216 characters accepted', validSlug('a'.repeat(216)), true);
+    eq('slug: 217 characters rejected', validSlug('a'.repeat(217)), false);
+    eq('slugify: a long title derives at most 216', slugify('a'.repeat(450)).length, 216);
+    eq('slugify: the cut never leaves a trailing dash', slugify('a'.repeat(215) + '-' + 'b'.repeat(10)).length, 215);
     applySlugResult({ ok: true });
     eq('slug: available named', document.getElementById('slug-state').textContent, '✓ available');
     applySlugResult({ ok: false, reason: 'taken' });

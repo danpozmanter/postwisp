@@ -395,9 +395,10 @@ a.tag:hover { background: color-mix(in srgb, var(--accent) 24%, transparent); te
     border-color: transparent;
 }
 /* whatever view is showing, it closes the card's bottom corners and
-   drops its own top border: the strip above already drew that line */
-.editor-shell .md-editor .milkdown,
-.editor-shell textarea.raw-source {
+   drops its own top border: the strip above already drew that line.
+   The milkdown card also drops its own shadow — the shell carries the
+   card's shadow for both views. */
+.editor-shell .md-editor .milkdown {
     border-top: none;
     border-radius: 0 0 var(--radius) var(--radius);
     box-shadow: none;
@@ -411,11 +412,23 @@ textarea.raw-source {
     tab-size: 4;
 }
 
-/* the raw view of the post editor: fused under the tools strip and as
-   tall as the styled view it stands in for */
+/* the raw view of the post editor: fused under the tools strip, as tall
+   as the styled view it stands in for, and carrying the same outline —
+   the border is restated here at component level so the card keeps its
+   frame in raw mode too, and focus gets the accent border and ring the
+   styled view gets from :focus-within */
 .editor-shell textarea.raw-source {
     min-height: calc(60vh - 2.75rem);
     margin: 0;
+    border: 1px solid var(--line);
+    border-top: none;
+    border-radius: 0 0 var(--radius) var(--radius);
+    background: var(--bg-raised);
+}
+.editor-shell textarea.raw-source:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
+    outline: none;
 }
 
 .statusline {
@@ -641,10 +654,10 @@ body.pw-modal-open { overflow: hidden; }
 
 .pw-status { padding: 0.25rem 1.15rem 0.5rem; color: var(--fg-muted); font-size: var(--step--1); min-height: 1.6rem; }
 
-.pw-key-row { padding: 0.5rem 1.15rem 0.9rem; border-bottom: 1px solid var(--line-soft); }
-.pw-key-row p { margin: 0 0 0.6rem; color: var(--fg-muted); font-size: var(--step--1); }
-.pw-key-form { display: flex; gap: 0.5rem; }
-.pw-key-form input { margin: 0; flex: 1; font-family: var(--font-mono); font-size: 0.85rem; }
+/* the gentle "search isn't set up" note that replaced the old key-entry
+   row: a quiet paragraph, no inputs */
+.pw-note-row { padding: 0.7rem 1.15rem 0.95rem; border-bottom: 1px solid var(--line-soft); }
+.pw-note-row p { margin: 0; color: var(--fg-muted); font-size: var(--step--1); line-height: 1.55; }
 
 .pw-grid {
     display: grid;

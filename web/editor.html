@@ -20,8 +20,7 @@
 </div></header>
 
 <div class="wrap">
-  <h1 class="page-title" id="heading">New post</h1>
-  <p class="page-sub">Write in markdown.</p>
+  <h1 class="page-title" id="heading">New Post</h1>
 
   <div id="gate" hidden class="notice">
     You need to be logged in to write. <a href="/dashboard">Go to the dashboard to log in</a>,
@@ -50,13 +49,13 @@
       <div class="meta-row">
         <div class="field">
           <label for="title">Title</label>
-          <input id="title" maxlength="200" placeholder="Post title">
+          <input id="title" maxlength="450" placeholder="Post title">
         </div>
       </div>
       <div class="meta-row">
         <div class="field">
           <label for="slug">Slug<span id="slug-state" class="slug-state"></span></label>
-          <input id="slug" maxlength="96" placeholder="auto-generated from title">
+          <input id="slug" maxlength="216" placeholder="auto-generated from title">
         </div>
         <div class="field">
           <label for="tags">Tags (comma-separated)</label>
@@ -87,7 +86,7 @@
         </div>
 
         <div id="source" class="md-editor md-editor-tall"></div>
-        <textarea id="raw" class="raw-source" hidden spellcheck="false"></textarea>
+        <textarea id="raw" class="raw-source" hidden spellcheck="false" placeholder="Begin writing here"></textarea>
       </div>
       <div class="statusline"><span id="wc">0 words · 1 min read</span> &middot; <span id="savestate" class="savestate"></span><span id="slugline"></span></div>
 
@@ -143,9 +142,11 @@ function slugify(s) {
     return s.toLowerCase().trim()
         .replace(/[^a-z0-9]+/g, '-')
         .replace(/^-+|-+$/g, '')
-        .slice(0, 96);
+        .slice(0, 216)
+        // a cut that lands on a dash must not leave one at the end
+        .replace(/-+$/, '');
 }
-function validSlug(s) { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 96; }
+function validSlug(s) { return /^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(s) && s.length <= 216; }
 
 function updateWc() {
     const n = (getSrc().trim().match(/\S+/g) || []).length;
@@ -452,7 +453,7 @@ function syncPublishBtn() {
 
 async function save(status) {
     const title = $('title').value.trim();
-    const slug = ($('slug').value.trim() || slugify(title)).slice(0, 96);
+    const slug = ($('slug').value.trim() || slugify(title)).slice(0, 216);
     if (!title) { flash('A title is required.', true); return; }
     if (!slug) { flash('Could not derive a slug — set one manually.', true); return; }
     const body = JSON.stringify({
@@ -637,8 +638,9 @@ $('delete').onclick = async () => {
     $('editor').hidden = false;
     $('outline-col').hidden = false;
 
-    // a server-side Unsplash key (setup.sh or the settings page) wins
-    // over the per-browser one in the picker
+    // the server-side Unsplash key (setup.sh or the settings page) is the
+    // only key the picker uses; with none configured it shows a gentle
+    // note pointing at the settings page
     try {
         const s = await jfetch('/api/settings');
         if (s.unsplash_key) pw._serverUnsplashKey = s.unsplash_key;
@@ -677,7 +679,7 @@ $('delete').onclick = async () => {
     }
     md = await pwMilkdown.create($('source'), {
         defaultValue: initial,
-        placeholder: 'Write your post in markdown…',
+        placeholder: 'Begin writing here',
         onChange: onSourceChange,
         onUpload: uploadFile,
         toolbar: true,

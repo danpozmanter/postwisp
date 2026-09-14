@@ -18,8 +18,19 @@ const markupChecks = [
     ['no editor stylesheet on the dashboard', html.includes('/milkdown.css'), false],
     ['no embedded editor view', html.includes('view-editor'), false],
     ['no raw-toggle button', html.includes('dash-rawbtn'), false],
-    ['New post opens /editor', /href="\/editor"[^>]*title="Write a post in the full editor"/.test(html), true],
+    ['New Post opens /editor', /href="\/editor"[^>]*title="Write a post in the full editor"[^>]*>New Post</.test(html), true],
     ['each post edit link opens /editor', html.includes('href="/editor?id=${p.id}"'), true],
+    // ---- page titles in Proper Case ----
+    ['dashboard heading "Your Posts" is Proper Case', /<h1[^>]*>\s*Your Posts\s*</.test(html), true],
+    ['panel heading "Media Library" is Proper Case', /<h2>\s*Media Library\s*</.test(html), true],
+    ['panel heading "Users" is Proper Case', /<h2>\s*Users\s*</.test(html), true],
+    ['account heading "Your Account" is Proper Case', /<h1[^>]*>\s*Your Account\s*</.test(html), true],
+    ['login heading "Log In" is Proper Case', /<h1>\s*Log In\s*</.test(html), true],
+    ['two-factor heading "Login Code" is Proper Case', /<h1>\s*Login Code\s*</.test(html), true],
+    ['recovery heading "Recover Your Account" is Proper Case', /<h1>\s*Recover Your Account\s*</.test(html), true],
+    ['reset heading "Set a New Password" is Proper Case', /<h1>\s*Set a New Password\s*</.test(html), true],
+    ['setup heading "First Boot — Create the Admin Account" is Proper Case', /<h1>\s*First Boot — Create the Admin Account\s*</.test(html), true],
+    ['no lowercase page headings remain', /<h[12][^>]*>\s*(Log in|Login code|Recover your account|Set a new password|Your posts|Your account|Media library|First boot)/.test(html), false],
 ];
 let bad = 0;
 for (const [name, got, want] of markupChecks) {

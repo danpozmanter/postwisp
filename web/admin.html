@@ -115,7 +115,7 @@ async function boot() {
 function renderBar() {
   document.getElementById('bar-right').innerHTML =
     me ? `<span class="who">Welcome, ${esc(me.username)}</span>
-         <a class="btn ghost" href="/editor" title="Write a post in the full editor">New post</a>
+         <a class="btn ghost" href="/editor" title="Write a post in the full editor">New Post</a>
          <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
          <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
          ${me.role === 'admin' ? '<button class="ghost" onclick="toggleUsers()">Users</button>' : ''}
@@ -449,7 +449,7 @@ async function saveAccount(ev) {
 
 // ---- editor ----
 // The dashboard no longer embeds an editor: /editor is the single
-// writing surface, and every edit entry point (New post, a post's edit
+// writing surface, and every edit entry point (New Post, a post's edit
 // link, the About page button) navigates there.
 
 // ---- wire up ----
@@ -516,7 +516,7 @@ window.addEventListener('unhandledrejection', function (ev) {
 
 <section id="view-setup" class="hidden">
   <form id="setup-form" class="auth">
-    <h1>First boot — create the admin account</h1>
+    <h1>First Boot — Create the Admin Account</h1>
     <label>Setup token</label>
     <input type="text" id="setup-token" required>
     <label>Username</label>
@@ -531,14 +531,14 @@ window.addEventListener('unhandledrejection', function (ev) {
 </section>
 
 <section id="view-login">
-  <h1>Log in</h1>
+  <h1>Log In</h1>
   <div class="hint" id="login-hint" hidden>
     No admin account exists yet. The server prints a one-time setup URL on
     first boot — open the <code>/setup?token=…</code> URL from its console
     to create the admin account.
   </div>
   <form id="login-form" class="auth">
-    <h1>Log in</h1>
+    <h1>Log In</h1>
     <label>Username</label>
     <input type="text" id="login-username" required autocomplete="username">
     <label>Password</label>
@@ -551,7 +551,7 @@ window.addEventListener('unhandledrejection', function (ev) {
 
 <section id="view-twofactor" class="hidden">
   <form id="twofactor-form" class="auth">
-    <h1>Login code</h1>
+    <h1>Login Code</h1>
     <p class="m" style="color:var(--muted)">A 6-digit code was just mailed to the address
       on the account <b id="twofactor-who"></b>. It works once and stays valid
       for five minutes.</p>
@@ -566,7 +566,7 @@ window.addEventListener('unhandledrejection', function (ev) {
 
 <section id="view-recover" class="hidden">
   <form id="recover-form" class="auth">
-    <h1>Recover your account</h1>
+    <h1>Recover Your Account</h1>
     <p class="m" style="color:var(--muted)">Enter the email address you signed up
       with. If it belongs to an account on this server, a mail arrives with the
       username and a link to set a new password.</p>
@@ -581,7 +581,7 @@ window.addEventListener('unhandledrejection', function (ev) {
 
 <section id="view-reset" class="hidden">
   <form id="reset-form" class="auth">
-    <h1>Set a new password</h1>
+    <h1>Set a New Password</h1>
     <p class="m" style="color:var(--muted)">You followed a recovery link. Choose a
       new password (min 10 chars, a digit, a non-alphanumeric); you are logged
       in with it right away.</p>
@@ -596,7 +596,7 @@ window.addEventListener('unhandledrejection', function (ev) {
 </section>
 
 <section id="view-dashboard" class="hidden">
-  <h1 style="margin-top:1rem">Your posts</h1>
+  <h1 style="margin-top:1rem">Your Posts</h1>
   <div class="err" id="dash-err"></div>
   <input type="text" id="search" placeholder="Search your posts…">
   <div id="dash-lists"></div>
@@ -617,14 +617,14 @@ window.addEventListener('unhandledrejection', function (ev) {
     <div id="users-list"></div>
   </div>
   <div id="media-panel" class="hidden">
-    <h2>Media library</h2>
+    <h2>Media Library</h2>
     <p class="m" style="color:var(--muted)">Your uploaded photos, videos and audio. Copy a link to embed it in a post; delete removes it for good (blocked while a post still uses it).</p>
     <div id="media-list"></div>
   </div>
 </section>
 
 <section id="view-account" class="hidden">
-  <h1 style="margin-top:1rem">Your account</h1>
+  <h1 style="margin-top:1rem">Your Account</h1>
   <p class="m" style="color:var(--muted)">Change the email you log in with, or set a
     new password. Your username stays as it is.</p>
   <form id="account-form" class="auth" style="margin-top:1rem">

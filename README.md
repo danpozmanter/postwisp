@@ -69,7 +69,7 @@ dashboard + JSON API + public pages), behind any reverse proxy for TLS.
 The dashboard is served by the binary itself at `/dashboard` (a built-in
 page, not one of the templates; the old `/admin` link redirects there).
 Authors log in there to manage drafts, published posts, and media; every
-editing entry point — **New post**, a post's **edit** link, the **About
+editing entry point — **New Post**, a post's **edit** link, the **About
 page** button — opens the write page at `/editor`, the single place a
 post is edited (there is no second embedded editor anymore). Every
 logged-in user can also edit their own email and password from the
@@ -135,17 +135,17 @@ and paste the key
   key to an `env` file beside the binary (see `README-env.md` in the
   deployment), which the server reads at every boot and hands to the
   editor with your settings, so **no one is ever prompted for a key in
-  the browser**,
-- on the **Settings** page (`/settings`, "Unsplash access key"), or
-- into the picker itself the first time you search.
+  the browser**, or
+- on the **Settings** page (`/settings`, "Unsplash access key").
 
-The key is stored on the server — in `env` (`PW_UNSPLASH_KEY`) or with
-the author's settings — so every browser you log in from shares it; a
-key pasted straight into the picker is kept in that browser as a
-fallback. Without a key, everything else works; the button just asks
-for one. An uploaded photo works as a cover too: the editor's cover
-row has an **Upload file** button that puts a photo from your computer
-straight into the cover slot.
+The key lives on the server — in `env` (`PW_UNSPLASH_KEY`) or with the
+author's settings — so every browser you log in from shares it, and the
+picker has no key entry of its own. Without a key, everything else
+works: the Unsplash button opens the picker to a gentle note that
+search isn't set up yet and where to add the key. An uploaded photo
+works as a cover too: the editor's cover row has an **Upload file**
+button that puts a photo from your computer straight into the cover
+slot.
 
 A post's header image is the first markdown image of its source, and it
 is the only image that gets special treatment: the post page hoists it
@@ -290,6 +290,10 @@ Behaviour worth knowing:
 - `node scripts/check-admin.js` — behavioral check of the `/dashboard`
   page's inline script plus a proof of the editor consolidation (no
   embedded editor, every edit link routes to `/editor`)
+- `node scripts/check-theme.js` — behavioral check of the shared
+  `theme-boot.js` module: the Unsplash picker with a server-side key
+  (the search reaches the Unsplash API) and without one (a gentle note,
+  and no key entry anywhere in the modal)
 - `./scripts/build-editor.sh` — rebuild `web/milkdown.js` / `web/milkdown.css`
   from the pinned sources in `vendor-src/` (only needed when the editor bundle
   changes)

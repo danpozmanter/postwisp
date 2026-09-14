@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Blog settings — postwisp</title>
+<title>Blog Settings — postwisp</title>
 <link rel="stylesheet" href="/app.css">
 <script src="/theme-boot.js"></script>
 </head>
@@ -18,7 +18,7 @@
 </div></header>
 
 <div class="wrap">
-  <h1 class="page-title">Blog settings</h1>
+  <h1 class="page-title">Blog Settings</h1>
   <p class="page-sub">
     These control the name, tagline, description and footer shown on the
     landing page, the posts list and around every post.
@@ -88,8 +88,8 @@
       <label for="ukey">Unsplash access key (cover photos &amp; image search)</label>
       <input id="ukey" placeholder="Paste a free key from unsplash.com/oauth/applications">
       <p class="hint" id="ukey-hint">Stored on the server with your other settings, so
-        every browser you log in from shares it. Without a key, the Unsplash button in the
-        editor asks for one when first used.</p>
+        every browser you log in from shares it. Without a key, the editor's Unsplash
+        search says it isn't set up yet and points here.</p>
     </div>
     <div class="actions">
       <button type="button" class="btn btn-primary" id="save">Save settings</button>
@@ -157,7 +157,7 @@ $('save').onclick = async () => {
 (function () {
     // pre-fill from the browser's old per-browser slot, if any; the
     // server-side value (loaded below) wins once it arrives
-    try { $('ukey').value = localStorage.getItem('postwisp-unsplash-key') || ''; } catch (e) { /* ignore */ }
+    // the access key is server-side only — nothing to seed from the browser
 })();
 
 (async () => {
