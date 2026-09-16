@@ -2,7 +2,7 @@
 // proleptic Gregorian calendar arithmetic that converts between the two.
 
 /// Renders epoch milliseconds as RFC 3339 in UTC, always with a millisecond field.
-pub fn render(ms: i64) -> String {
+pub fn text(ms: i64) -> String {
     let days = floor_div(ms, 86_400_000)
     let rem = ms - days * 86_400_000
     let millis = rem % 1000
@@ -108,12 +108,12 @@ mod tests {
         match super::parse("2023-11-14T22:13:20.123Z") {
             Ok(ms) => {
                 assert_eq(ms, 1_700_000_000_123)
-                assert_eq(super::render(ms), "2023-11-14T22:13:20.123Z")
+                assert_eq(super::text(ms), "2023-11-14T22:13:20.123Z")
             }
             Err(e) => assert(false, e)
         }
         assert_eq(super::parse("1970-01-01T00:00:00Z").unwrap_or(-1), 0)
-        assert_eq(super::render(0), "1970-01-01T00:00:00.000Z")
+        assert_eq(super::text(0), "1970-01-01T00:00:00.000Z")
     }
 
     #[test]
@@ -147,7 +147,7 @@ mod tests {
         ]
         for s in stamps {
             match super::parse(s) {
-                Ok(ms) => assert_eq(super::render(ms), s)
+                Ok(ms) => assert_eq(super::text(ms), s)
                 Err(e) => assert(false, s + ": " + e)
             }
         }

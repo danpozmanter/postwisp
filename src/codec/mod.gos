@@ -32,6 +32,9 @@ pub const TAG_DT: u8 = 9
 /// replaces it before the statement runs.
 pub const TAG_PARAM: u8 = 10
 
+/// The calendar spelling of a datetime, exposed for [`crate::codec::json`].
+pub fn datetime_text(ms: i64) -> String { datetime::text(ms) }
+
 /// A single column value: the tag selects which payload field is meaningful.
 pub struct Value {
     pub tag: u8
@@ -84,7 +87,7 @@ impl Display for Value {
         if self.tag == TAG_BOOL { return self.b.to_string() }
         if self.tag == TAG_TEXT { return self.s }
         if self.tag == TAG_F32 || self.tag == TAG_F64 { return self.f.to_string() }
-        if self.tag == TAG_DT { return datetime::render(self.i) }
+        if self.tag == TAG_DT { return datetime::text(self.i) }
         self.i.to_string()
     }
 }

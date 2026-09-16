@@ -29,7 +29,7 @@ pub fn keys(names: Vec<String>) -> Vec<String> {
 /// here and returned rather than appended to a caller's buffer, so the answer
 /// is one allocation sized for the row rather than a caller's buffer regrown
 /// per column.
-pub fn render(buf: Vec<u8>, keys: Vec<String>, id: i64) -> String {
+pub fn render_row(buf: Vec<u8>, keys: Vec<String>, id: i64) -> String {
     render_window(buf, 0, buf.len(), keys, id)
 }
 
@@ -84,7 +84,7 @@ pub fn render_window(buf: Vec<u8>, start: i64, end: i64, keys: Vec<String>, id: 
             codec::TAG_DT => {
                 if p + 8 > n { return "" }
                 out.push_str("\"")
-                out.push_str(datetime::render(i64_at(buf, p)))
+                out.push_str(codec::datetime_text(i64_at(buf, p)))
                 out.push_str("\"")
                 p += 8
             }
@@ -174,7 +174,7 @@ pub fn value(v: codec::Value) -> String {
     if v.tag == codec::TAG_NIL { return "null" }
     if v.tag == codec::TAG_BOOL { return if v.b { "true" } else { "false" } }
     if v.tag == codec::TAG_TEXT { return "\"" + escape(v.s) + "\"" }
-    if v.tag == codec::TAG_DT { return "\"" + datetime::render(v.i) + "\"" }
+    if v.tag == codec::TAG_DT { return "\"" + codec::datetime_text(v.i) + "\"" }
     if v.tag == codec::TAG_F32 || v.tag == codec::TAG_F64 { return v.f.to_string() }
     v.i.to_string()
 }
@@ -231,9 +231,9 @@ mod tests {
         codec::encode_into(&mut buf, codec::Value::float(1.5))
         codec::encode_into(&mut buf, codec::Value::bool(true))
         codec::encode_into(&mut buf, codec::Value::nil())
-        assert_eq(super::render(buf, super::keys(#["name", "email", "score", "active", "note"]), 7)
+        assert_eq(super::render_row(buf, super::keys(#["name", "email", "score", "active", "note"]), 7)
             "{\"id\":7,\"name\":\"user-1\",\"email\":\"u\\\"q\\\\b\",\"score\":1.5,\"active\":true,\"note\":null}")
-        assert_eq(super::render(buf.slice(0, 5).unwrap_or(#[]), super::keys(#["name"]), 1), "", "a truncated row is refused")
+        assert_eq(super::render_row(buf.slice(0, 5).unwrap_or(#[]), super::keys(#["name"]), 1), "", "a truncated row is refused")
     }
 
     #[test]
@@ -244,19 +244,19 @@ mod tests {
         let raw = "é\"🌍\\x\u{1}y\tz"
         let mut buf: Vec<u8> = #[]
         codec::encode_into(&mut buf, codec::Value::text(raw))
-        assert_eq(super::render(buf, super::keys(#["t"]), 3)
+        assert_eq(super::render_row(buf, super::keys(#["t"]), 3)
             "{\"id\":3,\"t\":\"é\\\"🌍\\\\x\\u0001y\\tz\"}")
         // A text column with nothing to escape, and an empty one.
         let mut plain: Vec<u8> = #[]
         codec::encode_into(&mut plain, codec::Value::text("héllo 🌍"))
         codec::encode_into(&mut plain, codec::Value::text(""))
-        assert_eq(super::render(plain, super::keys(#["a", "b"]), 1)
+        assert_eq(super::render_row(plain, super::keys(#["a", "b"]), 1)
             "{\"id\":1,\"a\":\"héllo 🌍\",\"b\":\"\"}")
         // A row whose text length runs past the buffer is refused rather than
         // rendered short.
         let mut cut: Vec<u8> = #[]
         codec::encode_into(&mut cut, codec::Value::text("abcdefgh"))
-        assert_eq(super::render(cut.slice(0, 8).unwrap_or(#[]), super::keys(#["a"]), 1), "")
+        assert_eq(super::render_row(cut.slice(0, 8).unwrap_or(#[]), super::keys(#["a"]), 1), "")
     }
 
     #[test]
@@ -267,7 +267,7 @@ mod tests {
         for v in vals { codec::encode_into(&mut buf, v) }
         let mut names: Vec<String> = #[]
         for i in 0..vals.len() { names.push("c" + i.to_string()) }
-        let out = super::render(buf, super::keys(names), 1)
+        let out = super::render_row(buf, super::keys(names), 1)
         // Every column renders what Display renders, quoted where
         // JSON asks for a string.
         let mut want = "{\"id\":1"
@@ -288,7 +288,7 @@ mod tests {
         for v in vals {
             let mut buf: Vec<u8> = #[]
             codec::encode_into(&mut buf, v)
-            assert_eq(super::render(buf, super::keys(#["n"]), 1), "{\"id\":1,\"n\":" + super::value(v) + "}")
+            assert_eq(super::render_row(buf, super::keys(#["n"]), 1), "{\"id\":1,\"n\":" + super::value(v) + "}")
         }
     }
 }

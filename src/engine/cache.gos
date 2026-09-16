@@ -125,7 +125,7 @@ impl Plans {
             kv::Read::Absent => return Ok("")
             kv::Read::Fault(e) => return Err(e)
         }
-        let body = codec::json::render(bytes, self.kv_tables[idx].keys, id)
+        let body = codec::json::render_row(bytes, self.kv_tables[idx].keys, id)
         if body.len() == 0 {
             return Err("row " + id.to_string() + " of " + table + " is malformed")
         }

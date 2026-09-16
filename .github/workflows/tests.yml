@@ -10,13 +10,13 @@ on:
   pull_request:
 
 env:
-  GOSSAMER_VERSION: v0.59.2
+  GOSSAMER_VERSION: v0.61.1
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
         run: |

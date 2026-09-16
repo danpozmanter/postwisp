@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>postwisp — Documentation</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:ital,wght@0,400;0,700;1,400;1,700&family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;1,8..60,400&family=JetBrains+Mono:wght@400;500&display=swap');
+
+:root {
+    --bg: #101318; --bg-raised: #161b22; --bg-overlay: #1a2029;
+    --fg: #e8eaee; --fg-muted: #a2abbd; --fg-faint: #6c7689;
+    --accent: #4fc3a7; --accent-strong: #66d9bb;
+    --line: #27303c; --line-soft: #1f2732;
+    --font-ui: 'Atkinson Hyperlegible', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-serif: 'Source Serif 4', Georgia, 'Times New Roman', serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+    --step--1: clamp(0.78rem, 0.74rem + 0.2vw, 0.84rem);
+    --step-0: clamp(0.94rem, 0.9rem + 0.2vw, 1rem);
+    --step-1: clamp(1.15rem, 1.08rem + 0.35vw, 1.28rem);
+    --step-2: clamp(1.42rem, 1.3rem + 0.6vw, 1.62rem);
+    --step-3: clamp(1.75rem, 1.5rem + 1.2vw, 2.2rem);
+    --step-4: clamp(2.2rem, 1.6rem + 2.6vw, 3.1rem);
+    --radius: 12px; --radius-sm: 8px;
+    --shadow-1: 0 1px 2px rgba(0,0,0,.35), 0 4px 14px rgba(0,0,0,.28);
+    --shadow-2: 0 6px 18px rgba(0,0,0,.45), 0 2px 4px rgba(0,0,0,.35);
+    --grain: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='140' height='140'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='140' height='140' filter='url(%23n)' opacity='0.5'/%3E%3C/svg%3E");
+    --glow: radial-gradient(1100px 480px at 50% -180px, rgba(79,195,167,0.14), transparent 70%);
+    color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+    margin: 0; background-color: var(--bg); background-image: var(--glow);
+    background-repeat: no-repeat; color: var(--fg);
+    font-family: var(--font-ui); font-size: var(--step-0); line-height: 1.65;
+    -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
+}
+body::before {
+    content: ''; position: fixed; inset: 0; background-image: var(--grain);
+    background-size: 140px 140px; opacity: 0.05; pointer-events: none; z-index: 0;
+}
+body > header, body > main, body > footer { position: relative; z-index: 1; }
+::selection { background: color-mix(in srgb, var(--accent) 30%, transparent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; text-underline-offset: 3px; }
+.wrap { max-width: 60rem; margin: 0 auto; padding: 0 1.25rem; }
+
+header.site-header {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 82%, transparent);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--line);
+}
+.site-header .wrap { display: flex; align-items: center; justify-content: space-between; gap: 1rem; min-height: 3.6rem; }
+.brand { font-family: var(--font-serif); font-weight: 600; font-size: var(--step-1); color: var(--fg); letter-spacing: -0.01em; }
+.brand:hover { color: var(--accent-strong); text-decoration: none; }
+.site-nav { display: flex; align-items: center; gap: 0.35rem; flex-wrap: wrap; }
+.site-nav a {
+    color: var(--fg-muted); padding: 0.3rem 0.65rem; border-radius: 99px;
+    font-weight: 500; font-size: var(--step--1);
+    transition: color .15s ease, background-color .15s ease;
+}
+.site-nav a:hover { color: var(--fg); background: color-mix(in srgb, var(--fg) 8%, transparent); text-decoration: none; }
+.site-nav a[aria-current="page"] { color: var(--accent-strong); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+
+main { max-width: 60rem; margin: 0 auto; padding: 3.2rem 1.25rem 3.5rem; }
+h1, h2, h3 { font-family: var(--font-serif); font-weight: 600; line-height: 1.25; letter-spacing: -0.01em; }
+h1 { font-size: var(--step-3); margin: 0 0 0.8rem; }
+h2 { font-size: var(--step-2); margin: 2.6rem 0 0.9rem; }
+h3 { font-size: var(--step-1); margin: 1.8rem 0 0.6rem; }
+p { margin: 0 0 1rem; }
+.prose p, .prose li { max-width: 46rem; }
+code {
+    font-family: var(--font-mono); font-size: 0.88em;
+    background: var(--bg-raised); border: 1px solid var(--line);
+    border-radius: 6px; padding: 0.1rem 0.35rem;
+}
+pre { margin: 0 0 1.2rem; }
+pre code {
+    display: block; padding: 0.9rem 1.1rem; overflow-x: auto;
+    background: var(--bg-raised); border: 1px solid var(--line);
+    border-radius: var(--radius-sm); font-size: var(--step--1); line-height: 1.6;
+}
+table { border-collapse: collapse; width: 100%; margin: 0 0 1.4rem; font-size: var(--step--1); }
+th, td { text-align: left; padding: 0.55rem 0.85rem; border: 1px solid var(--line); vertical-align: top; }
+th { background: var(--bg-raised); font-weight: 600; color: var(--fg); }
+td { color: var(--fg-muted); }
+td code, th code { font-size: 0.95em; }
+.section-title {
+    color: var(--fg-faint); text-transform: uppercase; letter-spacing: 0.14em;
+    font-size: var(--step--1); font-weight: 600; margin: 3rem 0 1.1rem;
+    display: flex; align-items: center; gap: 0.9rem;
+}
+.section-title::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+.cards { display: grid; gap: 1.1rem; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
+.card {
+    display: flex; flex-direction: column; gap: 0.4rem;
+    border: 1px solid var(--line-soft); border-radius: var(--radius);
+    background: var(--bg-raised); padding: 1.1rem 1.2rem; color: var(--fg);
+    transition: border-color .15s ease, box-shadow .15s ease, transform .1s ease;
+}
+.card:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--line)); box-shadow: var(--shadow-1); transform: translateY(-2px); text-decoration: none; }
+.card h2 { margin: 0; font-size: var(--step-1); }
+.card p { margin: 0; color: var(--fg-muted); font-size: var(--step-0); flex: 1; }
+.card .go { color: var(--accent-strong); font-size: var(--step--1); font-weight: 600; }
+.features { display: grid; gap: 0.8rem; grid-template-columns: repeat(auto-fill, minmax(270px, 1fr)); padding: 0; margin: 0; list-style: none; }
+.features li {
+    border: 1px solid var(--line-soft); border-radius: var(--radius-sm);
+    background: var(--bg-raised); padding: 0.75rem 0.95rem;
+    color: var(--fg-muted); font-size: var(--step--1);
+}
+.features li strong { color: var(--fg); display: block; margin-bottom: 0.15rem; font-size: var(--step-0); }
+.hero { text-align: center; padding: 1rem 0 0.5rem; }
+.hero h1 { font-size: var(--step-4); margin: 0 0 0.6rem; }
+.hero p { color: var(--fg-muted); margin: 0 auto; max-width: 38rem; font-size: var(--step-1); font-family: var(--font-serif); font-style: italic; }
+.badge {
+    display: inline-block; background: color-mix(in srgb, var(--accent) 13%, transparent);
+    color: var(--accent-strong); border-radius: 99px; padding: 0.08rem 0.7rem;
+    font-size: var(--step--1); font-weight: 500; margin-bottom: 1rem;
+}
+.note {
+    border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    background: var(--bg-raised); border-radius: var(--radius-sm);
+    padding: 0.8rem 1rem; margin: 0 0 1.3rem; color: var(--fg-muted); font-size: var(--step--1);
+}
+.note strong { color: var(--fg); }
+footer.site-footer {
+    border-top: 1px solid var(--line); color: var(--fg-muted);
+    margin-top: 4rem; padding: 1.4rem 0; font-size: var(--step--1);
+}
+footer.site-footer .wrap { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+@media (max-width: 720px) {
+    .site-header .wrap { flex-wrap: wrap; row-gap: 0.2rem; min-height: 3.2rem; padding-top: 0.4rem; padding-bottom: 0.4rem; }
+    .brand { font-size: var(--step-0); }
+    .site-nav { margin-left: auto; }
+    main { padding-left: 1rem; padding-right: 1rem; }
+}
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+</head>
+<body>
+<header class="site-header"><div class="wrap">
+  <a class="brand" href="index.html">postwisp</a>
+  <nav class="site-nav">
+    <a href="install.html">Install</a>
+    <a href="templates.html">Templates</a>
+    <a href="editor.html">Editor</a>
+    <a href="media.html">Media</a>
+    <a href="accounts.html">Accounts</a>
+    <a href="i18n-feeds.html">i18n &amp; Feeds</a>
+    <a href="operations.html">Operations</a>
+  </nav>
+</div></header>
+
+<main>
+<section class="hero">
+  <span class="badge">Documentation</span>
+  <h1>postwisp</h1>
+  <p>A small, self-hosted, multi-user blog. One binary, four editable HTML
+  templates, no Node toolchain.</p>
+</section>
+
+<div class="section-title">Guides</div>
+<div class="cards">
+  <a class="card" href="install.html">
+    <h2>Install &amp; Setup</h2>
+    <p>Prerequisites, building with Gossamer, deploying to a server, the
+    setup script, and service management.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="templates.html">
+    <h2>Templates &amp; Theming</h2>
+    <p>The four-template theming story, placeholders, hot reload, and the
+    about-page singleton.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="editor.html">
+    <h2>Dashboard &amp; Editor</h2>
+    <p>The <code>/dashboard</code> surface and the single write page at
+    <code>/editor</code>.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="media.html">
+    <h2>Media &amp; Unsplash</h2>
+    <p>Photo, video, and audio uploads, limits and safety, and Unsplash
+    cover photos.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="accounts.html">
+    <h2>Accounts &amp; Security</h2>
+    <p>Author accounts, login rate limits, email recovery, and two-factor
+    login.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="i18n-feeds.html">
+    <h2>i18n, Feeds &amp; Robots</h2>
+    <p>Four languages with localized dates, per-author Atom feeds, favicon,
+    and robots.txt.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+  <a class="card" href="operations.html">
+    <h2>Operations</h2>
+    <p>Environment variables, HTTPS behind Caddy, backups, and health
+    checks.</p>
+    <span class="go">Read &rarr;</span>
+  </a>
+</div>
+
+<div class="section-title">Features</div>
+<ul class="features">
+  <li><strong>One binary</strong>Server, admin dashboard, JSON API, and public pages in a single process.</li>
+  <li><strong>Single editor</strong><code>/editor</code> with heading outline, styled/raw toggle, and word count.</li>
+  <li><strong>Media uploads</strong>Photo, video, and audio with magic-byte sniffing and Range streaming.</li>
+  <li><strong>Unsplash covers</strong>Search and pick a photo as a post's header image.</li>
+  <li><strong>Four-template theming</strong>Plain HTML files, re-read per request — edits go live without a restart.</li>
+  <li><strong>Four languages</strong>English, German, French, and Spanish, with localized dates.</li>
+  <li><strong>Light &amp; dark theme</strong>Per-visitor toggle with a site-wide default; applied pre-paint.</li>
+  <li><strong>Accounts</strong>Admin-created authors, rate-limited logins, email recovery, optional 2FA.</li>
+  <li><strong>Atom feeds</strong>Per-author feeds with absolute URLs that honour <code>X-Forwarded-Proto</code>.</li>
+  <li><strong>Append-only storage</strong>Back up by copying <code>data/</code> while the server is stopped.</li>
+</ul>
+</main>
+
+<footer class="site-footer"><div class="wrap">
+  <span><a href="https://github.com/danpozmanter/postwisp">postwisp on GitHub</a></span>
+  <span>Apache-2.0</span>
+</div></footer>
+</body>
+</html>

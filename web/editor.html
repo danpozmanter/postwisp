@@ -87,7 +87,7 @@
             <button type="button" class="btn ghost" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash Image</button>
             <button type="button" class="btn ghost" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
           </div>
-          <button type="button" class="btn ghost btn-toggle" id="rawbtn" aria-pressed="false" title="Flip between the styled view and the raw markdown source">Raw Markdown</button>
+          <button type="button" class="btn ghost btn-toggle" id="rawbtn" aria-pressed="false" title="Flip between the styled view and the raw markdown source">Raw markdown</button>
         </div>
 
         <div id="source" class="md-editor md-editor-tall"></div>
@@ -467,7 +467,7 @@ function setMode(raw) {
     }
     rawMode = raw;
     $('rawbtn').setAttribute('aria-pressed', String(raw));
-    $('rawbtn').textContent = raw ? 'Styled View' : 'Raw Markdown';
+    $('rawbtn').textContent = raw ? 'Styled view' : 'Raw markdown';
     updateWc();
     syncCover();
     renderOutline();
