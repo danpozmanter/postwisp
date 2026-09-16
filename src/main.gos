@@ -3375,6 +3375,13 @@ fn handle_robots(app: App, req: http::Request) -> http::Response {
 }
 
 
+// /status — plaintext health probe for service managers, uptime checks,
+// and the setup script. No auth, no template: a plain "postwisp ok".
+fn handle_status(req: http::Request) -> http::Response {
+    return http::Response::text(200, "postwisp ok\n")
+}
+
+
 // ---------- public site: settings, published-post summaries, static pages ----------
 //
 // Blog metadata lives as one JSON blob under the kv key postwisp/settings
@@ -4000,6 +4007,7 @@ fn router(app: App) -> router::Router {
         .get("/admin", fn(req: http::Request) -> http::Response { return http::Response::text(302, "").with_header("Location", "/dashboard") })
         .get("/favicon.ico", fn(req: http::Request) -> http::Response { return handle_favicon(app, req) })
         .get("/robots.txt", fn(req: http::Request) -> http::Response { return handle_robots(app, req) })
+        .get("/status", fn(req: http::Request) -> http::Response { return handle_status(req) })
         .get("/api/public/site", fn(req: http::Request) -> http::Response { return handle_public_site(app, req) })
         .get("/api/public/posts", fn(req: http::Request) -> http::Response { return handle_public_posts(app, req) })
         .get("/api/settings", fn(req: http::Request) -> http::Response { return handle_get_settings(app, req) })

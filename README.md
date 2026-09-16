@@ -4,9 +4,12 @@
 binary, four editable HTML templates, no Node toolchain. Gossamer backend
 with terndb as the embedded storage engine.
 
-## Installing (the short version)
+## Getting Started
 
-1. Build the deployable directory (on any machine with the `gos` toolchain):
+One command on the server does the whole first run:
+
+1. **Build** the deployable directory (on any machine with the `gos`
+   toolchain):
 
        ./build.sh          # or .\build.ps1 on Windows
 
@@ -15,26 +18,53 @@ with terndb as the embedded storage engine.
        dist/postwisp            the release binary
        dist/templates/          index.html post.html list.html about.html
        dist/web/                built-in admin/editor/setup pages
-       dist/scripts/setup.sh    first-run walkthrough
+       dist/scripts/setup.sh    first-run setup
 
-2. Copy the **contents** of `dist/` to your server — binary, `templates/`,
-   `web/`, and `scripts/` sitting side by side in one directory.
+2. **Copy** the **contents** of `dist/` to your server — binary,
+   `templates/`, `web/`, and `scripts/` sitting side by side in one
+   directory.
 
-3. On the server, run
+3. **Run the setup script** on the server:
 
        ./scripts/setup.sh
 
-   The script never starts the server itself. Start it in another terminal
-   (or a service unit) with `./postwisp`, then run the walkthrough: it waits
-   for the server, asks you to paste the one-time first-boot token, creates
-   your admin account, logs you in, sets the site theme, and verifies the
-   public pages. Password policy: min 10 chars, at least 1 digit and 1
-   non-alphanumeric.
+   The script detects that it is on Linux and which init system the host
+   uses, asks you for a bind address (the default `127.0.0.1:8080` keeps
+   the server on loopback, ready for a reverse proxy or SSH tunnel), and
+   then asks whether to set up postwisp as a **service** — a systemd
+   system unit via sudo, or a **user unit** on a shared VPS without root
+   (with `linger` enabled so it keeps running after you log out).
+   Declining is perfectly fine: you don't need a service to run postwisp
+   locally, and for local use you just run the server — the script starts
+   it in the background and completes the same walkthrough. On a
+   non-Linux host, or a host without systemd, it also starts the server
+   by hand in the background. Either way it then confirms the server is
+   actually up by checking the plaintext status endpoint — `curl /status`
+   answers `postwisp ok` — and only then walks you through first run: paste the
+   one-time token from the server console (`journalctl -u postwisp`, or
+   `data/server.log` in manual mode), create your admin account (password
+   policy: min 10 chars, at least 1 digit and 1 non-alphanumeric), log in,
+   set the site theme, and optionally paste an Unsplash key. It finishes
+   by verifying the public pages.
 
-4. Edit the templates in `templates/` as you see fit — that's the whole
-   theming story. Each is a plain HTML file with inline CSS (no shared
-   stylesheets, no build step), and the server reads them from disk on
-   every request, so edits show up on the next page load, no restart:
+4. **Manage the service** (the setup summary prints these for your exact
+   install):
+
+       systemctl status postwisp            # or: systemctl --user status postwisp
+       systemctl restart postwisp           # or: systemctl --user restart postwisp
+       systemctl stop postwisp              # or: systemctl --user stop postwisp
+       journalctl -u postwisp -f            # follow the logs
+       curl http://127.0.0.1:8080/status    # health check: "postwisp ok"
+
+5. **Behind a reverse proxy** is the normal shape for a VPS — see
+   [HTTPS](#https) below for a Caddy example.
+
+## Templates
+
+Edit the templates in `templates/` as you see fit — that's the whole
+theming story. Each is a plain HTML file with inline CSS (no shared
+stylesheets, no build step), and the server reads them from disk on
+every request, so edits show up on the next page load, no restart:
 
    | Template | Serves | Notes |
    |---|---|---|

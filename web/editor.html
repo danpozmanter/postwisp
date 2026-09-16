@@ -10,14 +10,10 @@
 <script src="/milkdown.js"></script>
 </head>
 <body>
-<header class="site-header"><div class="wrap">
-  <a class="brand" href="/" id="brand">postwisp</a>
-  <nav class="site-nav">
-    <a href="/posts">Posts</a>
-    <a href="/settings">Settings</a>
-    <a href="/dashboard">Dashboard</a>
-  </nav>
-</div></header>
+<header class="appbar hidden" id="bar">
+  <div><a href="/dashboard" style="text-decoration:none;font-weight:700" id="brand">postwisp</a></div>
+  <div class="row" id="bar-right"></div>
+</header>
 
 <div class="wrap">
   <h1 class="page-title" id="heading">New Post</h1>
@@ -52,6 +48,15 @@
           <input id="title" maxlength="450" placeholder="Post title">
         </div>
       </div>
+
+      <div class="actions">
+        <button type="button" class="btn btn-primary" id="save">Save</button>
+        <button type="button" class="btn" id="publish" title="Make this post live at its public URL">Publish</button>
+        <a class="btn" id="viewlink" hidden>View post</a>
+        <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
+        <span id="msg" class="flash" hidden></span>
+      </div>
+
       <div class="meta-row">
         <div class="field">
           <label for="slug">Slug<span id="slug-state" class="slug-state"></span></label>
@@ -79,24 +84,16 @@
       <div class="editor-shell" id="shell">
         <div class="editor-tools">
           <div class="group">
-            <button type="button" class="btn ghost" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash image</button>
+            <button type="button" class="btn ghost" id="imgbtn" title="Search Unsplash and insert the photo at the cursor">Unsplash Image</button>
             <button type="button" class="btn ghost" id="uploadbtn" title="Upload a photo, video, or audio file">Upload</button>
           </div>
-          <button type="button" class="btn ghost btn-toggle" id="rawbtn" aria-pressed="false" title="Flip between the styled view and the raw markdown source">Raw markdown</button>
+          <button type="button" class="btn ghost btn-toggle" id="rawbtn" aria-pressed="false" title="Flip between the styled view and the raw markdown source">Raw Markdown</button>
         </div>
 
         <div id="source" class="md-editor md-editor-tall"></div>
         <textarea id="raw" class="raw-source" hidden spellcheck="false" placeholder="Begin writing here"></textarea>
       </div>
       <div class="statusline"><span id="wc">0 words · 1 min read</span> &middot; <span id="savestate" class="savestate"></span><span id="slugline"></span></div>
-
-      <div class="actions">
-        <button type="button" class="btn btn-primary" id="save">Save</button>
-        <button type="button" class="btn" id="publish" title="Make this post live at its public URL">publish</button>
-        <a class="btn" id="viewlink" hidden>View post</a>
-        <button type="button" class="btn btn-danger" id="delete" hidden>Delete</button>
-        <span id="msg" class="flash" hidden></span>
-      </div>
     </div>
   </div>
 </div>
@@ -161,6 +158,66 @@ function flash(msg, isErr) {
     m.hidden = false;
     clearTimeout(flash._t);
     flash._t = setTimeout(() => { m.hidden = true; }, 2600);
+}
+
+// ---- top bar ----
+// The same top bar the Dashboard uses (.appbar in /app.css): rendered
+// from scratch once the session is confirmed. The bar starts hidden and
+// only un-hides here, so a logged-out visit never shows an empty bar.
+function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"']/g, c =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+// theme applied pre-paint by /theme-boot.js; toggleTheme only flips it
+// and remembers the choice (same behavior as the Dashboard's toggle).
+function toggleTheme() {
+    const cur = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = cur;
+    localStorage.setItem('postwisp-theme', cur);
+}
+
+function renderBar(me) {
+    $('bar-right').innerHTML =
+        `<span class="who">Welcome, ${esc(me.username)}</span>
+         <a class="btn ghost" href="/editor" title="Write a post in the full editor">New Post</a>
+         <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About Page</button>
+         <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export All Posts (.zip)</a>
+         ${me.role === 'admin' ? '<button class="ghost" onclick="goUsers()">Users</button>' : ''}
+         <a class="btn ghost" href="/settings" title="Title, tagline, theme and other site settings">Settings</a>
+         <button class="ghost" onclick="goAccount()" title="Change your email or password">Account</button>
+         <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
+         <button class="ghost" onclick="doLogout()">Log Out</button>`;
+    $('bar').classList.remove('hidden');
+}
+
+// The Users and Account panels live on the dashboard, so the bar's
+// buttons there are plain links to it.
+function goUsers() { location.href = '/dashboard'; }
+function goAccount() { location.href = '/dashboard'; }
+
+async function doLogout() {
+    try { await jfetch('/api/logout', { method: 'POST', body: '{}' }); } catch (e) {}
+    location.href = '/dashboard';
+}
+
+// Each author maintains one about page: a singleton post with the slug
+// "about". Find yours or create it, then open it in the editor here.
+async function openAbout() {
+    try {
+        const posts = await jfetch('/api/posts');
+        const mine = posts.find(p => p.slug === 'about');
+        if (mine) { location.href = '/editor?id=' + mine.id; return; }
+        const created = await jfetch('/api/posts', { method: 'POST', body: JSON.stringify({
+            title: 'About',
+            slug: 'about',
+            source: 'This site runs on postwisp, a small self-hosted blog.\n\n' +
+                    'Replace this with whatever you want people to know about you or this site.',
+            tags: '',
+            status: 'published'
+        }) });
+        location.href = '/editor?id=' + created.id;
+    } catch (e) { flash(e.message, true); }
 }
 
 // ---- live slug feedback ----
@@ -410,7 +467,7 @@ function setMode(raw) {
     }
     rawMode = raw;
     $('rawbtn').setAttribute('aria-pressed', String(raw));
-    $('rawbtn').textContent = raw ? 'Styled view' : 'Raw markdown';
+    $('rawbtn').textContent = raw ? 'Styled View' : 'Raw Markdown';
     updateWc();
     syncCover();
     renderOutline();
@@ -444,7 +501,7 @@ async function uploadFile(file) {
 // draft offers "publish", a published post offers "unpublish".
 function syncPublishBtn() {
     const pub = postStatus === 'published';
-    $('publish').textContent = pub ? 'unpublish' : 'publish';
+    $('publish').textContent = pub ? 'Unpublish' : 'Publish';
     $('publish').title = pub ? 'Move this post back to drafts'
                              : 'Make this post live at its public URL';
     // the destructive direction gets the same danger styling as delete
@@ -477,7 +534,7 @@ async function save(status) {
             $('viewlink').href = '/' + encodeURIComponent(p.username) + '/' + encodeURIComponent(p.slug);
         }
         history.replaceState(null, '', '/editor?id=' + p.id);
-        $('heading').textContent = 'Edit post';
+        $('heading').textContent = 'Edit Post';
         syncPublishBtn();
         clearDrafts(p.id);
         applySlugResult(null);
@@ -625,16 +682,19 @@ $('delete').onclick = async () => {
 };
 
 (async () => {
-    try { await jfetch('/api/me'); }
+    let me = null;
+    try { me = await jfetch('/api/me'); }
     catch (e) {
         // 401 is the expected logged-out state: show the log-in notice.
         // Anything else is a fault and is named as one, never as "you
-        // need to be logged in".
+        // need to be logged in". The top bar stays hidden either way,
+        // exactly like the Dashboard's.
         if (e.status === 401) { $('gate').hidden = false; return; }
         $('neterr').hidden = false;
         $('neterr').textContent = 'Could not reach the postwisp server: ' + e.message;
         return;
     }
+    renderBar(me);
     $('editor').hidden = false;
     $('outline-col').hidden = false;
 
@@ -645,6 +705,13 @@ $('delete').onclick = async () => {
         const s = await jfetch('/api/settings');
         if (s.unsplash_key) pw._serverUnsplashKey = s.unsplash_key;
     } catch (e) { /* optional: fall back to the browser key */ }
+    // Unsplash-dependent controls only make sense with a key configured:
+    // hide them when there is none (or the fetch failed), and leave the
+    // upload-based controls alone.
+    if (typeof pw === 'undefined' || !pw._serverUnsplashKey) {
+        $('cover-pick').hidden = true;
+        $('imgbtn').hidden = true;
+    }
 
     const id = new URLSearchParams(location.search).get('id');
     let initial = '';
@@ -652,7 +719,7 @@ $('delete').onclick = async () => {
         try {
             const p = await jfetch('/api/posts/' + id);
             postId = p.id;
-            $('heading').textContent = 'Edit post';
+            $('heading').textContent = 'Edit Post';
             $('title').value = p.title;
             $('slug').value = p.slug;
             initial = p.source;

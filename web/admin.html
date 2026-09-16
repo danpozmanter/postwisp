@@ -116,13 +116,13 @@ function renderBar() {
   document.getElementById('bar-right').innerHTML =
     me ? `<span class="who">Welcome, ${esc(me.username)}</span>
          <a class="btn ghost" href="/editor" title="Write a post in the full editor">New Post</a>
-         <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About page</button>
-         <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export all posts (.zip)</a>
+         <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About Page</button>
+         <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export All Posts (.zip)</a>
          ${me.role === 'admin' ? '<button class="ghost" onclick="toggleUsers()">Users</button>' : ''}
          <a class="btn ghost" href="/settings" title="Title, tagline, theme and other site settings">Settings</a>
          <button class="ghost" onclick="showAccount()" title="Change your email or password">Account</button>
          <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
-         <button class="ghost" onclick="doLogout()">Log out</button>` : '';
+         <button class="ghost" onclick="doLogout()">Log Out</button>` : '';
 }
 
 // ---- about page ----
@@ -293,9 +293,9 @@ function renderDashboard() {
         </div>
       </div>
       <div class="row">
-        ${p.status === 'published' ? `<a class="btn ghost" href="/${esc(p.username)}/${esc(p.slug)}" target="_blank">view</a>` : ''}
-        <a class="btn ghost" href="/editor?id=${p.id}">edit</a>
-        <button class="danger" onclick="delPost(${p.id})">delete</button>
+        ${p.status === 'published' ? `<a class="btn ghost" href="/${esc(p.username)}/${esc(p.slug)}" target="_blank">View</a>` : ''}
+        <a class="btn ghost" href="/editor?id=${p.id}">Edit</a>
+        <button class="danger" onclick="delPost(${p.id})">Delete</button>
       </div>
     </div>`;
   const section = (title, list, empty) =>
@@ -353,8 +353,8 @@ function renderMedia() {
         <div class="m"><code>${esc(m.url)}</code></div>
       </div>
       <div class="row">
-        <button class="ghost" onclick="copyMedia('${esc(m.url)}')">copy link</button>
-        <button class="danger" onclick="delMedia('${esc(m.id)}')">delete</button>
+        <button class="ghost" onclick="copyMedia('${esc(m.url)}')">Copy Link</button>
+        <button class="danger" onclick="delMedia('${esc(m.id)}')">Delete</button>
       </div>
     </div>`;
   }).join('');
@@ -373,7 +373,7 @@ async function delMedia(id) {
   try { await api('DELETE', '/api/media/' + id, {}); }
   catch (e) {
     document.getElementById('media-list').innerHTML =
-      `<div class="err">${esc(e.message)}</div><button class="ghost" onclick="toggleMedia();toggleMedia()">back</button>`;
+      `<div class="err">${esc(e.message)}</div><button class="ghost" onclick="toggleMedia();toggleMedia()">Back</button>`;
     return;
   }
   allMedia = allMedia.filter(m => m.id !== id);
@@ -489,7 +489,7 @@ onReady(function () {
 <body>
 <div id="fatal" class="fatal hidden">
   <span id="fatal-msg"></span>
-  <button type="button" onclick="this.parentElement.classList.add('hidden')">dismiss</button>
+  <button type="button" onclick="this.parentElement.classList.add('hidden')">Dismiss</button>
 </div>
 <script>
 // Registered before anything else so that any later failure is displayed,
@@ -526,7 +526,7 @@ window.addEventListener('unhandledrejection', function (ev) {
     <label>Password (≥ 10 chars, a digit, a non-alphanumeric)</label>
     <input type="password" id="setup-password" required>
     <div class="err" id="setup-err"></div>
-    <button type="submit">Create admin</button>
+    <button type="submit">Create Admin</button>
   </form>
 </section>
 
@@ -544,8 +544,8 @@ window.addEventListener('unhandledrejection', function (ev) {
     <label>Password</label>
     <input type="password" id="login-password" required autocomplete="current-password">
     <div class="err" id="login-err"></div>
-    <button type="submit">Log in</button>
-    <button type="button" class="ghost" id="login-recover" style="margin-top:.5rem">Lost username or password?</button>
+    <button type="submit">Log In</button>
+    <button type="button" class="ghost" id="login-recover" style="margin-top:.5rem">Lost Username or Password?</button>
   </form>
 </section>
 
@@ -559,8 +559,8 @@ window.addEventListener('unhandledrejection', function (ev) {
     <input type="text" id="twofactor-code" inputmode="numeric" pattern="[0-9]{6}"
       maxlength="6" required autocomplete="one-time-code" style="letter-spacing:.3em">
     <div class="err" id="twofactor-err"></div>
-    <button type="submit">Log in with the code</button>
-    <button type="button" class="ghost" id="twofactor-back" style="margin-top:.5rem">Back to log in</button>
+    <button type="submit">Log In with the Code</button>
+    <button type="button" class="ghost" id="twofactor-back" style="margin-top:.5rem">Back to Log In</button>
   </form>
 </section>
 
@@ -574,8 +574,8 @@ window.addEventListener('unhandledrejection', function (ev) {
     <input type="email" id="recover-email" required autocomplete="email">
     <div class="err" id="recover-err"></div>
     <p class="m" id="recover-sent" style="color:var(--muted)" hidden></p>
-    <button type="submit">Send recovery mail</button>
-    <button type="button" class="ghost" id="recover-back" style="margin-top:.5rem">Back to log in</button>
+    <button type="submit">Send Recovery Mail</button>
+    <button type="button" class="ghost" id="recover-back" style="margin-top:.5rem">Back to Log In</button>
   </form>
 </section>
 
@@ -590,8 +590,8 @@ window.addEventListener('unhandledrejection', function (ev) {
     <label>Repeat new password</label>
     <input type="password" id="reset-password2" required autocomplete="new-password">
     <div class="err" id="reset-err"></div>
-    <button type="submit">Set password and log in</button>
-    <button type="button" class="ghost" id="reset-back" style="margin-top:.5rem">Request a new recovery mail</button>
+    <button type="submit">Set Password and Log In</button>
+    <button type="button" class="ghost" id="reset-back" style="margin-top:.5rem">Request a New Recovery Mail</button>
   </form>
 </section>
 
@@ -610,7 +610,7 @@ window.addEventListener('unhandledrejection', function (ev) {
         <div><label>Username</label><input type="text" id="new-username" required maxlength="32"></div>
         <div><label>Email</label><input type="email" id="new-email"></div>
         <div><label>Password</label><input type="password" id="new-password" required></div>
-        <div style="align-self:end"><button type="submit">Create author</button></div>
+        <div style="align-self:end"><button type="submit">Create Author</button></div>
       </div>
       <div class="err" id="users-err"></div>
     </form>
@@ -643,7 +643,7 @@ window.addEventListener('unhandledrejection', function (ev) {
         and stays valid for five minutes.</span>
     </label>
     <div id="account-err" class="err"></div>
-    <button type="submit">Save account</button>
+    <button type="submit">Save Account</button>
   </form>
 </section>
 

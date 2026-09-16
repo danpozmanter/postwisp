@@ -1,16 +1,21 @@
 #!/usr/bin/env bash
-# scripts/setup.sh — interactive first-run walkthrough for a postwisp dist
-# directory (binary + templates/ + this script). Run it ON THE SERVER, from
+# scripts/setup.sh — first-run setup for a postwisp dist directory
+# (binary + templates/ + web/ + this script). Run it ON THE SERVER, from
 # the directory you copied dist/'s contents into.
-# Covers: you start the server yourself -> create admin -> login -> choose
-# site theme -> verify the public pages. The script never starts, stops, or
-# restarts the server.
+#
+# On Linux the script does the whole deployment: it detects the OS and the
+# init system, installs and starts postwisp as a service (a systemd system
+# unit via sudo, or a systemd user unit on a rootless/shared VPS — with
+# linger so it survives logout), waits until the server answers its
+# /status health endpoint, then runs the first-run walkthrough: create
+# admin -> login -> choose site theme -> optional Unsplash key -> verify
+# the public pages. On non-Linux hosts (or without systemd, if you prefer)
+# it offers to start the server by hand and walks through the same steps.
 set -euo pipefail
 
-BASE_URL="http://127.0.0.1:8080"
 DATA_DIR="data"
 JAR="/tmp/postwisp-cookies.txt"
-BIN="./postwisp"
+SERVICE_NAME="postwisp"
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32mOK:\033[0m %s\n' "$*"; }
@@ -26,38 +31,278 @@ ask_secret() {
 # minimal JSON string escaping so quotes/backslashes in user input survive
 json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-step "1/6 Prerequisites"
-[ -x "$BIN" ] || die "no postwisp binary in this directory (expected ./$BIN)"
-command -v curl >/dev/null 2>&1 || die "curl not found. Install curl first."
-[ -f templates/index.html ] || die "templates/ is missing next to the binary."
-ok "postwisp binary and templates present."
+# ---------------------------------------------------------------- 1/7 ---
+step "1/7 Detect environment"
 
-step "2/6 Check the server is running"
-echo "The script does not start the server itself. In another terminal (or a"
-echo "service unit), start it from this directory:"
-echo
-echo "    $BIN"
-echo
-echo "It stores everything in ./${DATA_DIR}/ and, on first boot, prints a"
-echo "one-time setup URL containing a token. If ${DATA_DIR}/ already exists"
-echo "with users in it, setup is already done — you can still use this script"
-echo "to log in and set the theme/key."
-echo "Waiting for $BASE_URL (press Ctrl-C to give up)..."
-rm -f "$JAR"
-UP=0
-for _ in $(seq 1 60); do
-    if curl -sf -o /dev/null "$BASE_URL/setup"; then UP=1; break; fi
-    sleep 0.5
+# Resolve this script's own location so the app directory (the one holding
+# the binary, templates/, and web/) is found whether the script is run as
+# ./scripts/setup.sh, scripts/setup.sh, or by absolute path.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$APP_DIR"
+
+# Find the postwisp binary: a copied dist/ directory (the normal server
+# case), the checkout right after ./build.sh, or a local dev build.
+BIN=""
+for CANDIDATE in "$APP_DIR/postwisp" "$APP_DIR/dist/postwisp" "$APP_DIR/target/debug/postwisp"; do
+    if [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
+        BIN="$CANDIDATE"
+        break
+    fi
 done
-[ "$UP" = 1 ] || die "no server on $BASE_URL — start it with ./$BIN and rerun this script"
-ok "Server found at $BASE_URL."
-BOOT_LOG=""
-TOKEN="$(ask "Paste the setup token from the server's console (or press Enter if the database is already initialized):")"
+if [ -z "$BIN" ]; then
+    GOS_HINT="run ./build.sh first"
+    command -v gos >/dev/null 2>&1 && GOS_HINT="run ./build.sh (or gos build) first"
+    die "no postwisp binary found in $APP_DIR/postwisp, $APP_DIR/dist/postwisp, or $APP_DIR/target/debug/postwisp — $GOS_HINT"
+fi
+if [ "$BIN" != "$APP_DIR/postwisp" ]; then
+    echo "NOTE: using a build from the project tree; a production server wants the contents of dist/ copied to its own directory."
+fi
+ok "Found: $BIN"
+
+OS="$(uname -s)"
+if [ "$OS" != "Linux" ]; then
+    echo "This looks like $OS. Automatic service installation is Linux-only"
+    echo "(systemd/OpenRC init scripts); falling back to manual mode: the"
+    echo "walkthrough below still works once you have the server running"
+    echo "yourself with:  $BIN"
+    MANUAL_MODE=1
+else
+    MANUAL_MODE=0
+fi
+
+[ -f "$APP_DIR/templates/index.html" ] || die "templates/ is missing at $APP_DIR/templates — copy the whole contents of dist/ (binary, templates/, web/, scripts/), not just the binary"
+[ -d "$APP_DIR/web" ] || die "web/ is missing at $APP_DIR/web — the built-in admin/editor pages live there; copy the whole contents of dist/"
+command -v curl >/dev/null 2>&1 || die "curl not found. Install curl first (e.g. apt install curl)."
+ok "System: $OS; app directory: $APP_DIR"
+ok "Found: $APP_DIR/templates/"
+ok "Found: $APP_DIR/web/"
+
+# ---------------------------------------------------------------- 2/7 ---
+step "2/7 Choose the bind address"
+echo "By default the server listens on 127.0.0.1:8080 — your machine only,"
+echo "with a reverse proxy (Caddy/nginx for HTTPS) or an SSH tunnel in"
+echo "front. That is the normal shape for a VPS. Choosing 0.0.0.0:8080"
+echo "instead serves your LAN / public interface directly (no TLS)."
+PW_ADDR="$(ask "Bind address — press Enter for 127.0.0.1:8080, or type 0.0.0.0:8080:")"
+[ -z "$PW_ADDR" ] && PW_ADDR="127.0.0.1:8080"
+BASE_URL="http://$PW_ADDR"
+ok "The server will listen on $PW_ADDR (health endpoint: $BASE_URL/status)."
+
+# ---------------------------------------------------------------- 3/7 ---
+SYSTEMD_UNIT=""
+START_CMD=""
+STOP_CMD=""
+SERVICE_STATUS_CMD=""
+LOG_HINT=""
+
+write_unit() {
+    # $1 = "system" or "user"; prints the unit path. The unit content is
+    # identical apart from the [Install] target; all paths are absolute
+    # so the service works no matter where it is started from.
+    local kind="$1"
+    local wanted
+    if [ "$kind" = "system" ]; then wanted="multi-user.target"; else wanted="default.target"; fi
+    cat <<UNIT
+[Unit]
+Description=postwisp blog server
+After=network.target
+
+[Service]
+ExecStart=$BIN
+WorkingDirectory=$APP_DIR
+Environment=PW_ADDR=$PW_ADDR
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=$wanted
+UNIT
+}
+
+if [ "$MANUAL_MODE" = 0 ]; then
+    step "3/7 Set up postwisp as a service (optional)"
+    echo "A service keeps postwisp running on a server (starts at boot,"
+    echo "restarts after crashes). You do NOT need one to run postwisp"
+    echo "locally — choosing 'no' simply starts the server in the"
+    echo "background here, storing everything in ./data/."
+    WANT_SERVICE="$(ask "Set up postwisp as a service? Press Enter for no (run locally), or type 'yes':")"
+    case "$WANT_SERVICE" in
+        yes|y) ;;
+        *) MANUAL_MODE=1 ;;
+    esac
+fi
+
+# Still 0 only when 'yes' was answered above (non-Linux hosts and
+# decliners already have MANUAL_MODE=1).
+if [ "$MANUAL_MODE" = 0 ]; then
+    # --- detect the init system -------------------------------------------
+    INIT_SYSTEM="unknown"
+    if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+        INIT_SYSTEM="systemd"
+    elif [ -e /proc/1/comm ] && grep -qi systemd /proc/1/comm 2>/dev/null; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service >/dev/null 2>&1; then
+        INIT_SYSTEM="openrc"
+    elif [ -x /etc/init.d/cron ] || [ -d /etc/init.d ]; then
+        INIT_SYSTEM="sysvinit"
+    fi
+
+    if [ "$INIT_SYSTEM" = "openrc" ] || [ "$INIT_SYSTEM" = "sysvinit" ]; then
+        echo "This server uses $INIT_SYSTEM. Automatic installation covers"
+        echo "systemd only — here is a manual unit to adapt:"
+        echo
+        write_unit system
+        echo
+        echo "Install it as an $INIT_SYSTEM service yourself, or just run the"
+        echo "server in the background (the next question offers that)."
+        INIT_SYSTEM="none"
+    fi
+
+    if [ "$INIT_SYSTEM" = "systemd" ]; then
+        # --- system unit (with sudo) or user unit (rootless) --------------
+        UNIT_KIND=""
+        if [ "$(id -u)" = "0" ]; then
+            UNIT_KIND="system"
+        else
+            # Not root: ask whether sudo is available for a system unit,
+            # or whether this is a rootless/shared VPS wanting a user unit.
+            echo "You are not root. postwisp can be installed either way:"
+            echo "  - a SYSTEM service (starts at boot, managed with sudo), or"
+            echo "  - a USER service (no root needed — right for a shared VPS;"
+            echo "    with 'linger' it keeps running after you log out)."
+            CHOICE="$(ask "Install a system service or a user service? [system/user]:")"
+            case "$CHOICE" in
+                user) UNIT_KIND="user" ;;
+                system|"" ) UNIT_KIND="system" ;;
+                *) die "please answer 'system' or 'user'" ;;
+            esac
+            if [ "$UNIT_KIND" = "system" ] && ! sudo -n true 2>/dev/null; then
+                echo "Installing a system service needs sudo — you may be asked"
+                echo "for your password once, when the unit file is written."
+            fi
+        fi
+
+        if [ "$UNIT_KIND" = "system" ]; then
+            UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
+            if [ -f "$UNIT_PATH" ]; then
+                echo "A system unit already exists at $UNIT_PATH."
+                KEEP="$(ask "Overwrite it? Press Enter to keep it and just (re)start, or type 'overwrite':")"
+                if [ "$KEEP" = "overwrite" ]; then
+                    write_unit system | sudo tee "$UNIT_PATH" >/dev/null \
+                        || die "could not write $UNIT_PATH (sudo declined?)"
+                    ok "Unit written: $UNIT_PATH"
+                else
+                    ok "Keeping the existing unit."
+                fi
+            else
+                write_unit system | sudo tee "$UNIT_PATH" >/dev/null \
+                    || die "could not write $UNIT_PATH (sudo declined?)"
+                ok "Unit written: $UNIT_PATH"
+            fi
+            echo "Reloading systemd and starting the service (may ask for a password)..."
+            sudo systemctl daemon-reload || die "systemctl daemon-reload failed"
+            sudo systemctl enable --now "$SERVICE_NAME" || die "could not enable/start $SERVICE_NAME — try: sudo systemctl status $SERVICE_NAME"
+            START_CMD="sudo systemctl restart $SERVICE_NAME"
+            STOP_CMD="sudo systemctl stop $SERVICE_NAME"
+            SERVICE_STATUS_CMD="sudo systemctl status $SERVICE_NAME --no-pager"
+            LOG_HINT="journalctl -u $SERVICE_NAME -f"
+            ok "postwisp installed as a system service (starts on boot)."
+        else
+            UNIT_DIR="$HOME/.config/systemd/user"
+            UNIT_PATH="$UNIT_DIR/${SERVICE_NAME}.service"
+            mkdir -p "$UNIT_DIR"
+            if [ -f "$UNIT_PATH" ]; then
+                echo "A user unit already exists at $UNIT_PATH."
+                KEEP="$(ask "Overwrite it? Press Enter to keep it and just (re)start, or type 'overwrite':")"
+                if [ "$KEEP" = "overwrite" ]; then
+                    write_unit user > "$UNIT_PATH" || die "could not write $UNIT_PATH"
+                    ok "Unit written: $UNIT_PATH"
+                else
+                    ok "Keeping the existing unit."
+                fi
+            else
+                write_unit user > "$UNIT_PATH" || die "could not write $UNIT_PATH"
+                ok "Unit written: $UNIT_PATH"
+            fi
+            # Linger: keep the user service alive after you log out.
+            if loginctl enable-linger "$USER" 2>/dev/null; then
+                ok "Linger enabled — the service survives logout."
+            else
+                echo "NOTE: could not enable linger automatically (needs an"
+                echo "admin). Ask your host to run:"
+                echo "    sudo loginctl enable-linger $USER"
+                echo "Until then the service stops when you log out."
+            fi
+            systemctl --user daemon-reload || die "systemctl --user daemon-reload failed"
+            systemctl --user enable --now "$SERVICE_NAME" || die "could not enable/start $SERVICE_NAME — try: systemctl --user status $SERVICE_NAME"
+            START_CMD="systemctl --user restart $SERVICE_NAME"
+            STOP_CMD="systemctl --user stop $SERVICE_NAME"
+            SERVICE_STATUS_CMD="systemctl --user status $SERVICE_NAME --no-pager"
+            LOG_HINT="journalctl --user -u $SERVICE_NAME -f"
+            ok "postwisp installed as a user service."
+        fi
+    else
+        # --- no systemd: offer to start by hand ---------------------------
+        MANUAL_MODE=1
+    fi
+fi
+
+if [ "$MANUAL_MODE" = 1 ]; then
+    if [ -z "$SERVICE_STATUS_CMD" ]; then
+        step "3/7 Start the server"
+        echo "No service (not needed to run locally — the non-Linux or"
+        echo "no-systemd case also lands here), so the server is started"
+        echo "by hand. It stores everything in"
+        echo "./${DATA_DIR}/ and, on first boot, prints a one-time setup URL"
+        echo "with a token."
+        START="$(ask "Start it in the background now? Press Enter for yes, or type 'no' to start it yourself:")"
+        mkdir -p "$DATA_DIR"
+        if [ "$START" != "no" ]; then
+            if [ -f "$DATA_DIR/postwisp.pid" ] && kill -0 "$(cat "$DATA_DIR/postwisp.pid")" 2>/dev/null; then
+                ok "Already running (pid $(cat "$DATA_DIR/postwisp.pid"))."
+            else
+                nohup "$BIN" >> "$DATA_DIR/server.log" 2>&1 &
+                echo $! > "$DATA_DIR/postwisp.pid"
+                ok "Started in the background (pid $(cat "$DATA_DIR/postwisp.pid"), log: $DATA_DIR/server.log)."
+            fi
+        else
+            echo "Start it yourself in another terminal:  $BIN"
+        fi
+        START_CMD="$BIN"
+        STOP_CMD="kill \$(cat $DATA_DIR/postwisp.pid)"
+        SERVICE_STATUS_CMD="kill -0 \$(cat $DATA_DIR/postwisp.pid) && echo running"
+        LOG_HINT="tail -f $DATA_DIR/server.log"
+    fi
+fi
+
+# ---------------------------------------------------------------- 4/7 ---
+step "4/7 Confirm it is running"
+echo "Waiting for the server to answer $BASE_URL/status (up to 30s)..."
+UP=0
+for _ in $(seq 1 30); do
+    if curl -sf "$BASE_URL/status" >/dev/null 2>&1; then UP=1; break; fi
+    sleep 1
+done
+if [ "$UP" = 1 ]; then
+    ok "server is running — $BASE_URL/status says: $(curl -sf "$BASE_URL/status")"
+else
+    echo "The server did not answer. Service status / recent log:"
+    if [ -n "$SERVICE_STATUS_CMD" ]; then
+        eval "$SERVICE_STATUS_CMD" 2>&1 | head -30 || true
+    fi
+    [ -f "$DATA_DIR/server.log" ] && tail -n 20 "$DATA_DIR/server.log" || true
+    die "no server on $BASE_URL. Check the status above; then rerun this script."
+fi
+
+# ---------------------------------------------------------------- 5/7 ---
+rm -f "$JAR"
+TOKEN="$(ask "Paste the setup token from the server's console ($LOG_HINT), or press Enter if the database is already initialized:")"
 if [ -n "$TOKEN" ]; then
     ok "Setup token captured: $TOKEN"
 fi
 
-step "3/6 Create the admin account"
+step "5/7 Create the admin account"
 if [ -z "$TOKEN" ]; then
     echo "No token given, so the admin account is assumed to exist already."
     USERNAME="$(ask "Existing admin username:")"
@@ -86,7 +331,7 @@ else
     ok "Admin account '$USERNAME' created."
 fi
 
-step "4/6 Log in"
+step "6/7 Log in"
 RESP="$(curl -s -w '\n%{http_code}' -c "$JAR" -X POST "$BASE_URL/api/login" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"$(json "$USERNAME")\",\"password\":\"$(json "$PASSWORD")\"}")"
@@ -95,7 +340,7 @@ CODE="$(echo "$RESP" | tail -n1)"
 ok "Logged in; session cookie saved to $JAR."
 curl -sf -b "$JAR" "$BASE_URL/api/me" >/dev/null || die "session check failed (/api/me)."
 
-step "5/6 Choose the site theme"
+step "7/7 Choose the site theme"
 echo "postwisp is dark by default. This choice applies to the whole site"
 echo "(public pages, the post listing, and the admin dashboard)."
 THEME="$(ask "Theme — dark or light? [dark]:")"
@@ -111,7 +356,8 @@ CODE="$(echo "$RESP" | tail -n1)"
 [ "$CODE" = "200" ] || die "theme save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
 ok "Site theme set to '$THEME'."
 
-step "6/6 Unsplash access key (optional)"
+echo
+echo "Unsplash access key (optional)"
 echo "The editor's image search and cover-photo picker use the Unsplash API."
 echo "A free Access Key comes from creating an app at"
 echo "  https://unsplash.com/oauth/applications  (demo tier: 50 requests/hour)."
@@ -146,15 +392,22 @@ ok "About:           $BASE_URL/about     (templates/about.html)"
 echo
 ok "Setup complete."
 echo
-echo "Your blog (the server you started is still running):"
+echo "Your blog (the server keeps running in the background):"
 echo "  Home:             $BASE_URL/"
 echo "  All posts:        $BASE_URL/posts  (?tag=NAME lists one tag)"
 echo "  About:            $BASE_URL/about"
 echo "  Dashboard:        $BASE_URL/dashboard"
 echo
-echo "To stop the server:  however you started it (Ctrl-C in its terminal,"
-echo "or stop the service unit)."
-echo "To start it again:   $BIN"
+echo "Handy commands:"
+if [ -n "$START_CMD" ]; then
+    echo "  Check it is up:   curl $BASE_URL/status   (should say: postwisp ok)"
+    [ "$SERVICE_STATUS_CMD" != "kill -0 \$(cat $DATA_DIR/postwisp.pid) && echo running" ] && \
+        echo "  Service status:   $SERVICE_STATUS_CMD"
+    echo "  Restart:          $START_CMD"
+    echo "  Stop:             $STOP_CMD"
+    echo "  Logs:             $LOG_HINT"
+fi
+echo "  Data lives in:    $APP_DIR/$DATA_DIR/"
 echo
 echo "Last step: edit the templates in ./templates/ as you see fit — the"
 echo "server reads them from disk, so changes show up on the next page"
