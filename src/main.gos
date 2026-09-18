@@ -38,6 +38,7 @@ struct User {
 
 struct Post {
     id: i64
+    nav: String      // public/editor-facing unique hash id (the rowid stays internal)
     user_id: i64
     title: String
     source: String    // markdown
@@ -268,10 +269,70 @@ fn new_app() -> App {
     // back as text (row.vals[n].i == 0), which silently broke session expiry
     // and post ordering. INT64 is lossless here.
     let _ = eng.exec("CREATE TABLE users (username TEXT, email TEXT, password TEXT, role TEXT, created_at INT64)")
-    let _ = eng.exec("CREATE TABLE posts (user_id INT64, title TEXT, source TEXT, content TEXT, tags TEXT, status TEXT, published_at INT64, slug TEXT, created_at INT64, modified_at INT64)")
+    let _ = eng.exec("CREATE TABLE posts (user_id INT64, title TEXT, source TEXT, content TEXT, tags TEXT, status TEXT, published_at INT64, slug TEXT, created_at INT64, modified_at INT64, nav TEXT)")
     let _ = eng.exec("CREATE TABLE sessions (token TEXT, user_id INT64, created_at INT64, expires_at INT64)")
     let _ = eng.exec("CREATE TABLE media (id TEXT, user_id INT64, content_type TEXT, created_at INT64)")
     let _ = eng.exec("CREATE TABLE login_attempts (ip TEXT, username TEXT, at INT64)")
+    // Existing databases were created before posts carried a nav hash. The
+    // engine has no ALTER TABLE, so a legacy database is detected with a
+    // probe SELECT (an unknown column is an error) and the table is
+    // rebuilt: copy the rows into a side table backfilling nav hashes,
+    // drop the original, recreate it with the nav column, copy back.
+    let mut posts_need_nav = false
+    match eng.exec("SELECT nav FROM posts") {
+        Err(_) => posts_need_nav = true
+        Ok(_) => ()
+    }
+    if posts_need_nav {
+        let _ = eng.exec("DROP TABLE IF EXISTS posts_mig")
+        let _ = eng.exec("CREATE TABLE posts_mig (user_id INT64, title TEXT, source TEXT, content TEXT, tags TEXT, status TEXT, published_at INT64, slug TEXT, created_at INT64, modified_at INT64, nav TEXT)")
+        let mut copied = false
+        match eng.exec("SELECT * FROM posts") {
+            Ok(res) => {
+                copied = true
+                for row in res.rows {
+                    let nav = new_token("nav:" + row.rowid.to_string() + ":" + row.vals[7].s + ":" + now_ms().to_string())
+                    exec_sql(&mut eng, "INSERT INTO posts_mig (user_id, title, source, content, tags, status, published_at, slug, created_at, modified_at, nav) VALUES ("
+                        + row.vals[0].i.to_string()
+                        + ", " + sqlq(row.vals[1].s)
+                        + ", " + sqlq(row.vals[2].s)
+                        + ", " + sqlq(row.vals[3].s)
+                        + ", " + sqlq(row.vals[4].s)
+                        + ", " + sqlq(row.vals[5].s)
+                        + ", " + row.vals[6].i.to_string()
+                        + ", " + sqlq(row.vals[7].s)
+                        + ", " + row.vals[8].i.to_string()
+                        + ", " + row.vals[9].i.to_string()
+                        + ", " + sqlq(nav) + ")")
+                }
+            }
+            Err(_) => copied = false
+        }
+        if copied {
+            let _ = eng.exec("DROP TABLE posts")
+            let _ = eng.exec("CREATE TABLE posts (user_id INT64, title TEXT, source TEXT, content TEXT, tags TEXT, status TEXT, published_at INT64, slug TEXT, created_at INT64, modified_at INT64, nav TEXT)")
+            match eng.exec("SELECT * FROM posts_mig") {
+                Ok(res) => {
+                    for row in res.rows {
+                        exec_sql(&mut eng, "INSERT INTO posts (user_id, title, source, content, tags, status, published_at, slug, created_at, modified_at, nav) VALUES ("
+                            + row.vals[0].i.to_string()
+                            + ", " + sqlq(row.vals[1].s)
+                            + ", " + sqlq(row.vals[2].s)
+                            + ", " + sqlq(row.vals[3].s)
+                            + ", " + sqlq(row.vals[4].s)
+                            + ", " + sqlq(row.vals[5].s)
+                            + ", " + row.vals[6].i.to_string()
+                            + ", " + sqlq(row.vals[7].s)
+                            + ", " + row.vals[8].i.to_string()
+                            + ", " + row.vals[9].i.to_string()
+                            + ", " + sqlq(row.vals[10].s) + ")")
+                    }
+                }
+                Err(_) => ()
+            }
+            let _ = eng.exec("DROP TABLE posts_mig")
+        }
+    }
     let store = read_store(&mut eng)
     if store.users.len() == 0 {
         // read_store mints and persists the one-time token when no users
@@ -318,6 +379,7 @@ fn read_store(eng: &mut engine::Engine) -> Store {
             for row in res.rows {
                 let p = Post {
                     id: row.rowid
+                    nav: row.vals[10].s
                     user_id: row.vals[0].i
                     title: row.vals[1].s
                     source: row.vals[2].s
@@ -469,11 +531,22 @@ fn is_alnum_ascii(c: u8) -> bool {
 }
 
 
-fn slug_taken(store: Store, user_id: i64, slug: String, except_post: i64) -> bool {
+fn slug_taken(store: Store, user_id: i64, slug: String, except_nav: String) -> bool {
     for p in store.posts {
-        if p.user_id == user_id && p.slug == slug && p.id != except_post {
+        if p.user_id == user_id && p.slug == slug && p.nav != except_nav {
             return true
         }
+    }
+    false
+}
+
+
+// A nav hash is minted at insert time and never changes, so uniqueness
+// is checked against every post, not just one user's.
+
+fn nav_taken(store: Store, nav: String) -> bool {
+    for p in store.posts {
+        if p.nav == nav { return true }
     }
     false
 }
@@ -822,7 +895,7 @@ fn insert_user_row(eng: &mut engine::Engine, username: String, email: String, pa
 
 
 fn insert_post_row(eng: &mut engine::Engine, p: Post) -> i64 {
-    exec_sql(eng, "INSERT INTO posts VALUES (" + p.user_id.to_string()
+    exec_sql(eng, "INSERT INTO posts (user_id, title, source, content, tags, status, published_at, slug, created_at, modified_at, nav) VALUES (" + p.user_id.to_string()
         + ", " + sqlq(p.title)
         + ", " + sqlq(p.source)
         + ", " + sqlq(p.content)
@@ -832,6 +905,7 @@ fn insert_post_row(eng: &mut engine::Engine, p: Post) -> i64 {
         + ", " + sqlq(p.slug)
         + ", " + p.created_at.to_string()
         + ", " + p.modified_at.to_string()
+        + ", " + sqlq(p.nav)
         + ")")
     match eng.exec("SELECT * FROM posts WHERE user_id = " + p.user_id.to_string()
         + " AND slug = " + sqlq(p.slug)) {
@@ -855,6 +929,7 @@ fn update_post_sql(p: Post) -> String {
     + ", slug = " + sqlq(p.slug)
     + ", created_at = " + p.created_at.to_string()
     + ", modified_at = " + p.modified_at.to_string()
+    + ", nav = " + sqlq(p.nav)
     + " WHERE rowid = " + p.id.to_string()
 }
 
@@ -2153,7 +2228,7 @@ fn handle_update_account(app: App, req: http::Request) -> http::Response {
 
 
 fn post_json(p: Post, username: String) -> String {
-    "{\"id\":" + p.id.to_string()
+    "{\"nav\":" + json_quote(p.nav)
     + ",\"user_id\":" + p.user_id.to_string()
     + ",\"username\":" + json_quote(username)
     + ",\"title\":" + json_quote(p.title)
@@ -2224,13 +2299,14 @@ fn handle_get_post(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
         Ok(me) => {
-            let id = match req.path_value("id").to_i64() {
-                Some(v) => v
-                None => return err_json(400, "bad id")
-            }
+            let nav = req.path_value("id")
             let mut eng = open_eng(app)
             let store = read_store(&mut eng)
-            match find_post(store, id) {
+            let mut found: Option<Post> = None
+            for p in store.posts {
+                if p.nav == nav { found = Some(p) }
+            }
+            match found {
                 None => return err_json(404, "no such post")
                 Some(p) => {
                     if p.user_id != me.id { return err_json(403, "not your post") }
@@ -2250,7 +2326,7 @@ fn handle_slug_check(app: App, req: http::Request) -> http::Response {
             if !valid_slug(slug) { return ok_json("{\"ok\":false,\"reason\":\"invalid\"}") }
             // "except" names the post being edited, so its own slug does
             // not read as taken while the editor has it open
-            let except = query_value(req, "except").to_i64().unwrap_or(0)
+            let except = query_value(req, "except")
             let mut eng = open_eng(app)
             let store = read_store(&mut eng)
             if slug_taken(store, me.id, slug, except) {
@@ -2290,10 +2366,14 @@ fn handle_create_post(app: App, req: http::Request) -> http::Response {
             if !valid_slug(slug) { return err_json(400, "could not derive a slug from the title") }
             let mut eng = open_eng(app)
             let mut store = read_store(&mut eng)
-            if slug_taken(store, me.id, slug, 0) { return err_json(409, "slug taken") }
+            if slug_taken(store, me.id, slug, "") { return err_json(409, "slug taken") }
             let now = now_ms()
+            // one nav hash per post, minted here and never regenerated
+            let mut nav = new_token("nav:" + me.username + ":" + slug + ":" + now.to_string())
+            while nav_taken(store, nav) { nav = new_token("nav:" + me.username + ":" + slug + ":" + now.to_string() + ":" + nav) }
             let mut p = Post {
                 id: 0
+                nav: nav
                 user_id: me.id
                 title: title
                 source: source
@@ -2329,10 +2409,7 @@ fn handle_update_post(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
         Ok(me) => {
-            let id = match req.path_value("id").to_i64() {
-                Some(v) => v
-                None => return err_json(400, "bad id")
-            }
+            let nav = req.path_value("id")
             let f = parse_body(req.body)
             let title = field(f, "title")
             let mut slug = field(f, "slug")
@@ -2344,7 +2421,7 @@ fn handle_update_post(app: App, req: http::Request) -> http::Response {
             let mut store = read_store(&mut eng)
             let mut found: Option<Post> = None
             for p in store.posts {
-                if p.id == id { found = Some(p) }
+                if p.nav == nav { found = Some(p) }
             }
             match found {
                 None => return err_json(404, "no such post")
@@ -2354,7 +2431,7 @@ fn handle_update_post(app: App, req: http::Request) -> http::Response {
                     if !valid_slug(slug) { slug = old.slug }
                     if !valid_slug(slug) { slug = slugify(title) }
                     if !valid_slug(slug) { return err_json(400, "could not derive a slug from the title") }
-                    if slug_taken(store, me.id, slug, id) { return err_json(409, "slug taken") }
+                    if slug_taken(store, me.id, slug, nav) { return err_json(409, "slug taken") }
                     let now = now_ms()
                     let mut newpost = old
                     newpost.title = title
@@ -2377,7 +2454,7 @@ fn handle_update_post(app: App, req: http::Request) -> http::Response {
                     newpost.modified_at = now
                     let mut kept: Vec<Post> = #[]
                     for p in store.posts {
-                        if p.id != id { kept.push(p) }
+                        if p.nav != nav { kept.push(p) }
                     }
                     store.posts = kept
                     store.posts.push(newpost)
@@ -2394,23 +2471,20 @@ fn handle_delete_post(app: App, req: http::Request) -> http::Response {
     match require_user(app, req) {
         Err(r) => return r
         Ok(me) => {
-            let id = match req.path_value("id").to_i64() {
-                Some(v) => v
-                None => return err_json(400, "bad id")
-            }
+            let nav = req.path_value("id")
             let mut eng = open_eng(app)
             let mut store = read_store(&mut eng)
             let mut found = false
             for p in store.posts {
-                if p.id == id && p.user_id == me.id { found = true }
+                if p.nav == nav && p.user_id == me.id { found = true }
             }
             if !found { return err_json(404, "no such post") }
             let mut kept: Vec<Post> = #[]
             for p in store.posts {
-                if !(p.id == id && p.user_id == me.id) { kept.push(p) }
+                if !(p.nav == nav && p.user_id == me.id) { kept.push(p) }
             }
             store.posts = kept
-            exec_sql(&mut eng, "DELETE FROM posts WHERE rowid = " + id.to_string())
+            exec_sql(&mut eng, "DELETE FROM posts WHERE nav = " + sqlq(nav))
             return ok_json("{\"ok\":true}")
         }
     }
@@ -2745,7 +2819,6 @@ fn i18n_catalog() -> Vec<Vec<String>> {
         #["anchor_label", "Link to this section", "Link zu diesem Abschnitt", "Lien vers cette section", "Enlace a esta sección"],
         #["no_tag_posts", "No posts with the tag \"{tag}\".", "Keine Beiträge mit dem Tag \"{tag}\".", "Aucun article avec l'étiquette « {tag} ».", "No hay publicaciones con la etiqueta \"{tag}\"."],
         #["tag_title", "Posts tagged \"{tag}\"", "Beiträge mit dem Tag \"{tag}\"", "Articles étiquetés « {tag} »", "Publicaciones con la etiqueta \"{tag}\""],
-        #["tag_sub", "Every published post with the tag \"{tag}\".", "Alle veröffentlichten Beiträge mit dem Tag \"{tag}\".", "Tous les articles publiés avec l'étiquette « {tag} ».", "Todas las publicaciones con la etiqueta \"{tag}\"."],
         #["about_title", "About", "Über", "À propos", "Acerca de"],
         #["about_default_1", "This site runs on postwisp, a small self-hosted blog.", "Diese Seite läuft auf postwisp, einem kleinen selbst gehosteten Blog.", "Ce site fonctionne avec postwisp, un petit blog auto-hébergé.", "Este sitio funciona con postwisp, un pequeño blog autoalojado."],
         #["about_default_2", "Replace this text with whatever you want people to know about you or this site: log in to the dashboard and write your own About page.", "Ersetze diesen Text durch alles, was Besucher über dich oder diese Seite wissen sollen: melde dich im Dashboard an und schreibe deine eigene About-Seite.", "Remplacez ce texte par ce que vous voulez que les visiteurs sachent sur vous ou ce site : connectez-vous au tableau de bord et rédigez votre propre page « À propos ».", "Sustituye este texto por lo que quieras que los visitantes sepan de ti o de este sitio: inicia sesión en el panel y escribe tu propia página «Acerca de»."],
@@ -3001,7 +3074,7 @@ fn page_shell(title: String, body_html: String, feed_link: String) -> String {
     + "</head><body>"
     + "<header class=\"site-header\"><div class=\"wrap\">"
     + "<a class=\"brand\" href=\"/\">postwisp</a>"
-    + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/dashboard\">Dashboard</a></nav>"
+    + "<nav class=\"site-nav\"><a href=\"/posts\">Posts</a><a href=\"/editor\">Write</a><a href=\"/dashboard#/settings\">Dashboard</a></nav>"
     + "</div></header>"
     + "<main>" + body_html + "</main>"
     + "<footer class=\"site-footer\"><div class=\"wrap\"><a href=\"https://github.com/danpozmanter/postwisp\" target=\"_blank\" rel=\"noopener\">Powered by postwisp</a></div></footer>"
@@ -3072,7 +3145,6 @@ fn site_fields(app: App, lang: String, owner: i64 = -1, owner_name: String = "")
     // {tag} slot from the active chip, so these arrive via data-* attrs
     m.insert("no_tag_posts_attr", escape_html(tr(lang, "no_tag_posts")))
     m.insert("tag_title_attr", escape_html(tr(lang, "tag_title")))
-    m.insert("tag_sub_attr", escape_html(tr(lang, "tag_sub")))
     if theme == "light" { m.insert("theme_attr", " data-theme=\"light\"") }
     else { m.insert("theme_attr", "") }
     return m
@@ -3394,6 +3466,17 @@ fn serve_web_file(app: App, req: http::Request, name: String) -> http::Response 
     match fs::read_to_string(app.web_dir + "/" + name) {
         Ok(html) => return resp_html(200, html)
         Err(_) => return resp_html(404, err_page(app, lang, "404", tr(lang, "err_not_found")))
+    }
+}
+
+// The built-in admin pages (editor, settings) carry the session UI, so a
+// visitor with no session is sent to the dashboard, whose page holds the
+// login flow. A logged-in visit serves the file unchanged.
+
+fn serve_admin_page(app: App, req: http::Request, name: String) -> http::Response {
+    match current_user(app, req) {
+        None => return http::Response::text(302, "").with_header("Location", "/dashboard")
+        Some(_) => return serve_web_file(app, req, name)
     }
 }
 
@@ -3993,14 +4076,15 @@ fn router(app: App) -> router::Router {
         .delete("/api/media/{id}", fn(req: http::Request) -> http::Response { return handle_delete_media(app, req) })
         .get("/theme.css", fn(req: http::Request) -> http::Response { return handle_theme_css(app, req) })
         .get("/app.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, req, "app.css") })
+        .get("/admin-nav.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "admin-nav.js") })
         .get("/theme-boot.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "theme-boot.js") })
         .get("/milkdown.js", fn(req: http::Request) -> http::Response { return serve_web_js(app, req, "milkdown.js") })
         .get("/milkdown.css", fn(req: http::Request) -> http::Response { return serve_web_css(app, req, "milkdown.css") })
         .get("/", fn(req: http::Request) -> http::Response { return handle_home(app, req) })
         .get("/posts", fn(req: http::Request) -> http::Response { return handle_list(app, req) })
         .get("/about", fn(req: http::Request) -> http::Response { return handle_about(app, req) })
-        .get("/editor", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "editor.html") })
-        .get("/settings", fn(req: http::Request) -> http::Response { return serve_web_file(app, req, "settings.html") })
+        .get("/editor", fn(req: http::Request) -> http::Response { return serve_admin_page(app, req, "editor.html") })
+        .get("/settings", fn(req: http::Request) -> http::Response { return serve_admin_page(app, req, "settings.html") })
         // the dashboard page lives at /dashboard; /admin stays as a
         // redirect so bookmarks and old links keep working
         .get("/dashboard", fn(req: http::Request) -> http::Response { return handle_admin(app, req) })
@@ -4038,9 +4122,17 @@ fn main() {
     let app = new_app()
     let addr = listen_addr()
     println("postwisp listening on " + addr + " (data: " + app.dir + ", templates: " + app.tpl_dir + ")")
-    match http::serve(addr, router(app)) {
-        Ok(_) => ()
-        Err(e) => eprintln("serve failed: {}", e)
+    // The server-level body budget matches the app's own max (MAX_AV_BYTES) so
+    // oversized uploads reach the handler and get its clear JSON errors
+    // ("too large (max 5MB for images)" / "(max 50MB)") instead of a silent
+    // HTTP-layer 413 with an empty body.
+    let server = http::Server::new().max_body_bytes(MAX_AV_BYTES)
+    match server.listen(addr) {
+        Err(e) => eprintln("listen failed: {}", e)
+        Ok(_) => match server.serve(router(app)) {
+            Ok(_) => ()
+            Err(e) => eprintln("serve failed: {}", e)
+        }
     }
 }
 
@@ -4995,6 +5087,7 @@ fn reset_sets_password_logs_in_and_kills_old_sessions() {
 fn tpost(id: i64, user_id: i64, title: String, slug: String, status: String, published_at: i64) -> Post {
     Post {
         id: id
+        nav: "nav" + id.to_string()
         user_id: user_id
         title: title
         source: "# " + title

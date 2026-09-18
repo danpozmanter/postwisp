@@ -31,8 +31,8 @@ ask_secret() {
 # minimal JSON string escaping so quotes/backslashes in user input survive
 json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 
-# ---------------------------------------------------------------- 1/7 ---
-step "1/7 Detect environment"
+# ---------------------------------------------------------------- 1/8 ---
+step "1/8 Detect environment"
 
 # Resolve this script's own location so the app directory (the one holding
 # the binary, templates/, and web/) is found whether the script is run as
@@ -78,8 +78,8 @@ ok "System: $OS; app directory: $APP_DIR"
 ok "Found: $APP_DIR/templates/"
 ok "Found: $APP_DIR/web/"
 
-# ---------------------------------------------------------------- 2/7 ---
-step "2/7 Choose the bind address"
+# ---------------------------------------------------------------- 2/8 ---
+step "2/8 Choose the bind address"
 echo "By default the server listens on 127.0.0.1:8080 — your machine only,"
 echo "with a reverse proxy (Caddy/nginx for HTTPS) or an SSH tunnel in"
 echo "front. That is the normal shape for a VPS. Choosing 0.0.0.0:8080"
@@ -89,7 +89,7 @@ PW_ADDR="$(ask "Bind address — press Enter for 127.0.0.1:8080, or type 0.0.0.0
 BASE_URL="http://$PW_ADDR"
 ok "The server will listen on $PW_ADDR (health endpoint: $BASE_URL/status)."
 
-# ---------------------------------------------------------------- 3/7 ---
+# ------------------------------------------------- 3/8 and 4/8 ---
 SYSTEMD_UNIT=""
 START_CMD=""
 STOP_CMD=""
@@ -121,7 +121,7 @@ UNIT
 }
 
 if [ "$MANUAL_MODE" = 0 ]; then
-    step "3/7 Set up postwisp as a service (optional)"
+    step "3/8 Set up postwisp as a service (optional)"
     echo "A service keeps postwisp running on a server (starts at boot,"
     echo "restarts after crashes). You do NOT need one to run postwisp"
     echo "locally — choosing 'no' simply starts the server in the"
@@ -250,7 +250,7 @@ fi
 
 if [ "$MANUAL_MODE" = 1 ]; then
     if [ -z "$SERVICE_STATUS_CMD" ]; then
-        step "3/7 Start the server"
+        step "4/8 Start the server"
         echo "No service (not needed to run locally — the non-Linux or"
         echo "no-systemd case also lands here), so the server is started"
         echo "by hand. It stores everything in"
@@ -276,8 +276,8 @@ if [ "$MANUAL_MODE" = 1 ]; then
     fi
 fi
 
-# ---------------------------------------------------------------- 4/7 ---
-step "4/7 Confirm it is running"
+# ---------------------------------------------------------------- 5/8 ---
+step "5/8 Confirm it is running"
 echo "Waiting for the server to answer $BASE_URL/status (up to 30s)..."
 UP=0
 for _ in $(seq 1 30); do
@@ -295,14 +295,14 @@ else
     die "no server on $BASE_URL. Check the status above; then rerun this script."
 fi
 
-# ---------------------------------------------------------------- 5/7 ---
+# ---------------------------------------------------------------- 6/8 ---
+step "6/8 Create the admin account"
 rm -f "$JAR"
 TOKEN="$(ask "Paste the setup token from the server's console ($LOG_HINT), or press Enter if the database is already initialized:")"
 if [ -n "$TOKEN" ]; then
     ok "Setup token captured: $TOKEN"
 fi
 
-step "5/7 Create the admin account"
 if [ -z "$TOKEN" ]; then
     echo "No token given, so the admin account is assumed to exist already."
     USERNAME="$(ask "Existing admin username:")"
@@ -314,7 +314,15 @@ else
             die "aborted at user request (no admin account created)"
         fi
         EMAIL="$(ask "Admin email:")"
-        PASSWORD="$(ask_secret "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
+        # Ask twice, hidden; loop until the two entries agree.
+        while true; do
+            PASSWORD="$(ask_secret "Password (min 10 chars, 1 digit, 1 non-alphanumeric):")"
+            CONFIRM="$(ask_secret "Confirm password:")"
+            if [ "$PASSWORD" = "$CONFIRM" ]; then
+                break
+            fi
+            printf '\033[1;31mFAILED:\033[0m passwords do not match — try again.\n' >&2
+        done
         RESP="$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/api/setup" \
             -H 'Content-Type: application/json' \
             -d "{\"token\":\"$(json "$TOKEN")\",\"username\":\"$(json "$USERNAME")\",\"email\":\"$(json "$EMAIL")\",\"password\":\"$(json "$PASSWORD")\"}")"
@@ -323,6 +331,21 @@ else
             break
         fi
         printf '\033[1;31mFAILED:\033[0m setup rejected (HTTP %s): %s\n' "$CODE" "$(echo "$RESP" | head -n1)"
+        # The server answers 403 "bad setup token" when the token is
+        # wrong, already used, or the database was initialized on a
+        # previous boot — let the user paste a fresh one and start over.
+        if [ "$CODE" = "403" ] || echo "$RESP" | grep -q 'bad setup token'; then
+            echo "The setup token was rejected — it is wrong, already used, or the"
+            echo "server was restarted with an already-initialized database."
+            echo "Copy the token fresh from the server console ($LOG_HINT)."
+            CHOICE="$(ask "Press Enter to paste a new setup token, or type 'exit' to quit:")"
+            if [ "$CHOICE" = "exit" ]; then
+                die "aborted at user request (no admin account created)"
+            fi
+            TOKEN="$(ask "Paste the setup token from the server's console ($LOG_HINT):")"
+            ok "Setup token captured: $TOKEN"
+            continue
+        fi
         CHOICE="$(ask "Press Enter to re-enter the details, or type 'exit' to quit:")"
         if [ "$CHOICE" = "exit" ]; then
             die "aborted at user request (no admin account created)"
@@ -331,7 +354,7 @@ else
     ok "Admin account '$USERNAME' created."
 fi
 
-step "6/7 Log in"
+step "7/8 Log in"
 RESP="$(curl -s -w '\n%{http_code}' -c "$JAR" -X POST "$BASE_URL/api/login" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"$(json "$USERNAME")\",\"password\":\"$(json "$PASSWORD")\"}")"
@@ -340,7 +363,18 @@ CODE="$(echo "$RESP" | tail -n1)"
 ok "Logged in; session cookie saved to $JAR."
 curl -sf -b "$JAR" "$BASE_URL/api/me" >/dev/null || die "session check failed (/api/me)."
 
-step "7/7 Choose the site theme"
+step "8/8 Choose the blog name and site theme"
+echo "The blog's name appears as the site title in the top navigation, the"
+echo "home page heading, and the browser tab. It is always stored, so the"
+echo "site never falls back to the admin account's name."
+BLOG_NAME="$(ask "Blog name — press Enter to use the default ('postwisp'), or type one:")"
+[ -n "$BLOG_NAME" ] || BLOG_NAME="postwisp"
+RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+    -H 'Content-Type: application/json' \
+    -d "{\"title\":\"$(json "$BLOG_NAME")\"}")"
+CODE="$(echo "$RESP" | tail -n1)"
+[ "$CODE" = "200" ] || die "blog name save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
+ok "Blog name set to '$BLOG_NAME'."
 echo "postwisp is dark by default. This choice applies to the whole site"
 echo "(public pages, the post listing, and the admin dashboard)."
 THEME="$(ask "Theme — dark or light? [dark]:")"

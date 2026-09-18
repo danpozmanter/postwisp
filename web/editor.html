@@ -7,6 +7,7 @@
 <link rel="stylesheet" href="/app.css">
 <link rel="stylesheet" href="/milkdown.css">
 <script src="/theme-boot.js"></script>
+<script src="/admin-nav.js"></script>
 <script src="/milkdown.js"></script>
 </head>
 <body>
@@ -105,7 +106,7 @@
 // site-wide setting as fallback) — no flash of the wrong theme.
 
 const $ = id => document.getElementById(id);
-let postId = null;
+let postId = null;         // the post's nav hash, or null for a new post
 let postStatus = 'draft';   // live status of the post being edited
 let slugTouched = false;
 let md = null;              // the Milkdown editor behind #source
@@ -178,23 +179,16 @@ function toggleTheme() {
 }
 
 function renderBar(me) {
-    $('bar-right').innerHTML =
-        `<span class="who">Welcome, ${esc(me.username)}</span>
-         <a class="btn ghost" href="/editor" title="Write a post in the full editor">New Post</a>
-         <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About Page</button>
-         <a class="btn ghost" href="/api/posts.zip" download title="Download all posts as markdown in a zip">Export All Posts (.zip)</a>
-         ${me.role === 'admin' ? '<button class="ghost" onclick="goUsers()">Users</button>' : ''}
-         <a class="btn ghost" href="/settings" title="Title, tagline, theme and other site settings">Settings</a>
-         <button class="ghost" onclick="goAccount()" title="Change your email or password">Account</button>
-         <button class="ghost" onclick="toggleTheme()" aria-label="Toggle light or dark theme" title="Toggle light/dark theme">◐</button>
-         <button class="ghost" onclick="doLogout()">Log Out</button>`;
-    $('bar').classList.remove('hidden');
+    // The one shared nav (admin-nav.js): the same top bar and admin
+    // sub-nav the dashboard and settings pages render, so navigating
+    // here never changes the nav. No sub-nav entry is current on the
+    // editor, hence the empty activeView.
+    pwRenderAdminNav(me, '');
 }
 
-// The Users and Account panels live on the dashboard, so the bar's
-// buttons there are plain links to it.
-function goUsers() { location.href = '/dashboard'; }
-function goAccount() { location.href = '/dashboard'; }
+// Account lives on the dashboard's Account view, so the deep link carries
+// the new hash scheme.
+function goAccount() { location.href = '/dashboard#/account'; }
 
 async function doLogout() {
     try { await jfetch('/api/logout', { method: 'POST', body: '{}' }); } catch (e) {}
@@ -207,7 +201,7 @@ async function openAbout() {
     try {
         const posts = await jfetch('/api/posts');
         const mine = posts.find(p => p.slug === 'about');
-        if (mine) { location.href = '/editor?id=' + mine.id; return; }
+        if (mine) { location.href = '/editor?nav=' + mine.nav; return; }
         const created = await jfetch('/api/posts', { method: 'POST', body: JSON.stringify({
             title: 'About',
             slug: 'about',
@@ -216,7 +210,7 @@ async function openAbout() {
             tags: '',
             status: 'published'
         }) });
-        location.href = '/editor?id=' + created.id;
+        location.href = '/editor?nav=' + created.nav;
     } catch (e) { flash(e.message, true); }
 }
 
@@ -228,7 +222,7 @@ async function openAbout() {
 let slugTimer = null;
 function slugCheckUrl(slug) {
     let u = '/api/slug-check?slug=' + encodeURIComponent(slug);
-    if (postId) u += '&except=' + encodeURIComponent(String(postId));
+    if (postId) u += '&except=' + encodeURIComponent(postId);
     return u;
 }
 function applySlugResult(r) {
@@ -489,7 +483,11 @@ async function uploadFile(file) {
         body: file,
     }).then(async resp => {
         const d = await resp.json().catch(() => ({}));
-        if (!resp.ok) throw new Error(d.error || 'upload failed');
+        if (!resp.ok) {
+            // A bare 413 (or any non-JSON answer) has no error field to show.
+            throw new Error(d && d.error ? d.error
+                : 'upload failed (HTTP ' + resp.status + (resp.status === 413 ? ', file too large' : '') + ')');
+        }
         return d;
     });
     const hint = file.type.startsWith('video/') ? '?embed=video'
@@ -522,9 +520,9 @@ async function save(status) {
     });
     try {
         const p = postId
-            ? await jfetch('/api/posts/' + postId, { method: 'PUT', body: body })
+            ? await jfetch('/api/posts/' + encodeURIComponent(postId), { method: 'PUT', body: body })
             : await jfetch('/api/posts', { method: 'POST', body: body });
-        postId = p.id;
+        postId = p.nav;
         postStatus = p.status;
         $('slug').value = p.slug;
         $('slugline').textContent = '/' + p.username + '/' + p.slug;
@@ -533,7 +531,7 @@ async function save(status) {
         if (p.status === 'published') {
             $('viewlink').href = '/' + encodeURIComponent(p.username) + '/' + encodeURIComponent(p.slug);
         }
-        history.replaceState(null, '', '/editor?id=' + p.id);
+        history.replaceState(null, '', '/editor?nav=' + encodeURIComponent(p.nav));
         $('heading').textContent = 'Edit Post';
         syncPublishBtn();
         clearDrafts(p.id);
@@ -675,7 +673,7 @@ $('publish').onclick = () => save(postStatus === 'published' ? 'draft' : 'publis
 $('delete').onclick = async () => {
     if (!postId || !confirm('Delete this post permanently?')) return;
     try {
-        await jfetch('/api/posts/' + postId, { method: 'DELETE' });
+        await jfetch('/api/posts/' + encodeURIComponent(postId), { method: 'DELETE' });
         clearDrafts(postId);
         location.href = '/dashboard';
     } catch (e) { flash(e.message, true); }
@@ -713,12 +711,12 @@ $('delete').onclick = async () => {
         $('imgbtn').hidden = true;
     }
 
-    const id = new URLSearchParams(location.search).get('id');
+    const nav = new URLSearchParams(location.search).get('nav');
     let initial = '';
-    if (id) {
+    if (nav) {
         try {
-            const p = await jfetch('/api/posts/' + id);
-            postId = p.id;
+            const p = await jfetch('/api/posts/' + encodeURIComponent(nav));
+            postId = p.nav;
             $('heading').textContent = 'Edit Post';
             $('title').value = p.title;
             $('slug').value = p.slug;

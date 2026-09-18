@@ -1,0 +1,263 @@
+# Builds release archives for every supported platform on a version tag
+# (push a tag like v0.1.0), then publishes them to the GitHub release.
+#
+# The macOS archives also carry scripts/install.sh, so macOS users can
+# install with `curl -fsSL <raw install.sh URL> | sh` or by running
+# ./install.sh from the extracted archive.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  # Pinned to the same toolchain release the test workflow develops
+  # against (keep in step with `gossamer-version` in project.toml).
+  GOSSAMER_VERSION: v0.61.1
+
+jobs:
+  build-linux-x86_64:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: |
+          VERSION="$(awk -F'"' '
+            /^\[project\]$/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 ~ /^version = / { print $2; exit }
+          ' project.toml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: gos build --release
+
+      # project.toml's `output` (target/debug/postwisp) governs where the
+      # toolchain links the binary, release included.
+      - name: Stage tarball payload
+        run: |
+          BASE="postwisp-${VERSION}-linux-x86_64"
+          mkdir "$BASE"
+          cp target/debug/postwisp "$BASE/postwisp"
+          cp -r templates "$BASE/templates"
+          cp -r web "$BASE/web"
+          mkdir "$BASE/scripts"
+          cp scripts/setup.sh "$BASE/scripts/setup.sh"
+          cp scripts/README-env.md "$BASE/README-env.md"
+          cp README.md LICENSE "$BASE/"
+          tar -czf "${BASE}.tar.gz" "$BASE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postwisp-linux-x86_64
+          path: postwisp-*-linux-x86_64.tar.gz
+
+  build-linux-aarch64:
+    name: Linux aarch64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: |
+          VERSION="$(awk -F'"' '
+            /^\[project\]$/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 ~ /^version = / { print $2; exit }
+          ' project.toml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # `gos build --target aarch64-unknown-linux-musl` needs the aarch64
+      # musl runtime archive, which the x86_64 toolchain install does not
+      # ship. It comes from the same pinned gossamer release's aarch64
+      # tarball.
+      - name: Fetch aarch64 musl runtime archive
+        run: |
+          VER_NUM="${GOSSAMER_VERSION#v}"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "$TMP/gos-aarch64.tar.gz" \
+            "https://github.com/gossamer-lang/gossamer/releases/download/${GOSSAMER_VERSION}/gos-${VER_NUM}-linux-aarch64.tar.gz"
+          tar -xzf "$TMP/gos-aarch64.tar.gz" -C "$TMP"
+          RUNTIME_LIB="$(find "$TMP" -path '*/gos-*/libgossamer_runtime-musl.a' | head -n1)"
+          echo "GOS_RUNTIME_LIB_AARCH64_UNKNOWN_LINUX_MUSL=$(cd "$(dirname "$RUNTIME_LIB")" && pwd)/$(basename "$RUNTIME_LIB")" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: gos build --release --target aarch64-unknown-linux-musl
+
+      # project.toml's `output` (target/debug/postwisp) governs where the
+      # toolchain links the binary, --target included.
+      - name: Stage tarball payload
+        run: |
+          BASE="postwisp-${VERSION}-linux-aarch64"
+          mkdir "$BASE"
+          cp target/debug/postwisp "$BASE/postwisp"
+          cp -r templates "$BASE/templates"
+          cp -r web "$BASE/web"
+          mkdir "$BASE/scripts"
+          cp scripts/setup.sh "$BASE/scripts/setup.sh"
+          cp scripts/README-env.md "$BASE/README-env.md"
+          cp README.md LICENSE "$BASE/"
+          tar -czf "${BASE}.tar.gz" "$BASE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postwisp-linux-aarch64
+          path: postwisp-*-linux-aarch64.tar.gz
+
+  build-macos:
+    name: macOS ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: macos-15
+          - arch: x86_64
+            runner: macos-15-intel
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        run: |
+          VERSION="$(awk -F'"' '
+            /^\[project\]$/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 ~ /^version = / { print $2; exit }
+          ' project.toml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      # Each runner builds its own arch natively (no cross-compiling).
+      - name: Build
+        run: gos build --release
+
+      - name: Stage zip payload
+        run: |
+          BASE="postwisp-${VERSION}-macos-${{ matrix.arch }}"
+          mkdir -p "$BASE/scripts"
+          chmod +x target/debug/postwisp
+          cp target/debug/postwisp "$BASE/postwisp"
+          cp -r templates "$BASE/templates"
+          cp -r web "$BASE/web"
+          cp scripts/setup.sh "$BASE/scripts/setup.sh"
+          cp scripts/README-env.md "$BASE/README-env.md"
+          cp README.md LICENSE "$BASE/"
+          # The macOS-only install script; see scripts/install.sh.
+          cp scripts/install.sh "$BASE/install.sh"
+          chmod +x "$BASE/install.sh"
+          # Ad-hoc signature: no identity needed, but macOS refuses to
+          # run a completely unsigned binary downloaded from the internet.
+          codesign --force --sign - --timestamp=none "$BASE/postwisp"
+          zip -r "${BASE}.zip" "$BASE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postwisp-macos-${{ matrix.arch }}
+          path: postwisp-*-macos-${{ matrix.arch }}.zip
+
+  build-windows-x86_64:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # The gos installer is a POSIX sh script, so run it under the
+      # Git-for-Windows bash that windows runners ship with.
+      - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
+        shell: bash
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Read project version
+        shell: bash
+        run: |
+          VERSION="$(awk -F'"' '
+            /^\[project\]$/ { in_section = 1; next }
+            /^\[/ { in_section = 0 }
+            in_section && $1 ~ /^version = / { print $2; exit }
+          ' project.toml)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: bash
+        run: gos build --release
+
+      - name: Stage zip payload
+        shell: bash
+        run: |
+          BASE="postwisp-${VERSION}-windows-x86_64"
+          mkdir -p "$BASE/scripts"
+          # The toolchain links the binary as postwisp.exe on Windows
+          # (or, matching `output` in project.toml, as plain postwisp);
+          # pick whichever exists.
+          BIN="target/debug/postwisp.exe"
+          [ -f "$BIN" ] || BIN="target/debug/postwisp"
+          cp "$BIN" "$BASE/postwisp.exe"
+          cp -r templates "$BASE/templates"
+          cp -r web "$BASE/web"
+          cp scripts/setup.sh "$BASE/scripts/setup.sh"
+          cp scripts/README-env.md "$BASE/README-env.md"
+          cp README.md LICENSE "$BASE/"
+          7z a "$BASE.zip" "$BASE"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postwisp-windows-x86_64
+          path: postwisp-*-windows-x86_64.zip
+
+  publish:
+    name: Publish release
+    needs: [build-linux-x86_64, build-linux-aarch64, build-macos, build-windows-x86_64]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          find artifacts -mindepth 2 -maxdepth 2 -type f \
+            \( -name '*.tar.gz' -o -name '*.zip' -o -name '*.exe' \) \
+            -exec mv {} release/ \;
+          # The macOS archives carry install.sh inside, so macOS users
+          # can install from a release without cloning the repo.
+          cd release
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/SHA256SUMS

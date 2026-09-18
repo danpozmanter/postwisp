@@ -6,18 +6,21 @@
 <title>Blog Settings — postwisp</title>
 <link rel="stylesheet" href="/app.css">
 <script src="/theme-boot.js"></script>
+<script src="/admin-nav.js"></script>
 </head>
 <body>
-<header class="site-header"><div class="wrap">
-  <a class="brand" href="/" id="brand">postwisp</a>
-  <nav class="site-nav">
-    <a href="/posts">Posts</a>
-    <a href="/editor">Write</a>
-    <a href="/dashboard">Dashboard</a>
-  </nav>
-</div></header>
+<!-- The one top bar every admin page shares (admin-nav.js): same markup,
+     same render function as /dashboard and /editor, so navigating here
+     never changes the nav. Hidden until the session confirms. -->
+<header class="appbar hidden" id="bar">
+  <div><a href="/dashboard" style="text-decoration:none;font-weight:700">postwisp</a></div>
+  <div class="row" id="bar-right"></div>
+</header>
 
 <div class="wrap">
+  <div class="row admin-links" id="admin-links"
+       style="flex-wrap:wrap;align-items:center;gap:.4rem;margin:.75rem 0 .5rem"></div>
+
   <h1 class="page-title">Blog Settings</h1>
   <p class="page-sub">
     These control the name, tagline, description and footer shown on the
@@ -107,6 +110,16 @@
 
 const $ = id => document.getElementById(id);
 
+// The shared top bar + admin sub-nav (admin-nav.js): one /api/me answer
+// rendered by the same function /dashboard and /editor use, so the nav is
+// identical on every admin page. me rides for the gate below.
+let me = null;
+async function navBoot() {
+  try { me = await jfetch('/api/me'); }
+  catch (e) { me = null; }
+  pwRenderAdminNav(me, 'settings');
+}
+
 async function jfetch(u, opts) {
     const r = await fetch(u, Object.assign({
         headers: { 'Content-Type': 'application/json' },
@@ -182,6 +195,10 @@ $('save').onclick = async () => {
     $('language').value = ['en', 'de', 'fr', 'es'].indexOf(s.language) >= 0 ? s.language : 'en';
     if (s.unsplash_key) $('ukey').value = s.unsplash_key;
 })();
+
+// the shared admin nav, after this page's elements exist
+navBoot().catch(e => { /* the bar stays hidden; the form's own error shows */ });
+
 </script>
 </body>
 </html>

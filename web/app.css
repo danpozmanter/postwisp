@@ -173,6 +173,8 @@ header.appbar .who { color: var(--fg-muted); font-size: var(--step--1); }
 header.appbar .row { flex-wrap: nowrap; }
 
 /* ------------------------------------------------- buttons */
+/* author display rules override the UA's [hidden] default, so guard it */
+[hidden] { display: none !important; }
 button, .btn {
     appearance: none;
     background: var(--accent);

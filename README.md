@@ -84,6 +84,27 @@ optional development checks (see [Development](#development)).
    curl http://127.0.0.1:8080/status    # "postwisp ok"
    ```
 
+### Install from a release
+
+Prebuilt archives are published on the
+[Releases](https://github.com/danpozmanter/postwisp/releases) page for macOS
+(x86_64 and arm64), Linux (x86_64 and arm64), and Windows (x86_64). Download
+the archive for your platform, extract it, and — on macOS — run:
+
+```sh
+./install.sh             # or --system for /usr/local
+```
+
+or install straight from the terminal (macOS):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/danpozmanter/postwisp/main/scripts/install.sh | sh
+```
+
+On Linux and Windows, deploy the extracted `postwisp` binary (or
+`postwisp.exe`) with `templates/`, `web/`, and `scripts/` beside it, as in
+step 3 above.
+
 ## Templates
 
 Each template is a plain HTML file with inline CSS (no shared stylesheets, no

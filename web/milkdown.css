@@ -1405,6 +1405,26 @@ img.ProseMirror-separator {
   max-width: min(92vw, 30rem);
 }
 
+/* Floating menus (slash menu, selection toolbar, block handle) draw
+   their glyphs from --crepe-color-outline — bridged to --line, a
+   hairline tone that vanishes on the dark surface. Give the floating
+   surfaces a border of their own and lift their glyphs to --fg-muted,
+   which reads on both themes. */
+.milkdown .milkdown-slash-menu,
+.milkdown .milkdown-toolbar {
+  border: 1px solid var(--line-soft);
+}
+.milkdown .milkdown-toolbar .toolbar-item svg,
+.milkdown .milkdown-slash-menu .menu-groups .menu-group li svg,
+.milkdown .milkdown-block-handle .operation-item svg {
+  color: var(--fg-muted);
+  fill: var(--fg-muted);
+}
+.milkdown .milkdown-block-handle .operation-item.active svg {
+  color: var(--accent);
+  fill: var(--accent);
+}
+
 /* the writing surface reads like the published post: the site's type
    scale, serif body, accent links and quote bars; scroll-margin keeps a
    heading jumped to from the outline clear of the sticky header + bar */

@@ -216,8 +216,8 @@ const driver = `
     eq('slug: taken named', document.getElementById('slug-state').textContent, '✗ taken — pick another');
     applySlugResult({ ok: false, reason: 'invalid' });
     eq('slug: malformed named', document.getElementById('slug-state').textContent, 'letters, digits, single hyphens');
-    postId = 7;
-    eq('slug: own post excluded from the check', slugCheckUrl('a'), '/api/slug-check?slug=a&except=7');
+    postId = 'nav-7';
+    eq('slug: own post excluded from the check', slugCheckUrl('a'), '/api/slug-check?slug=a&except=nav-7');
     postId = null;
 
     if (failures) { print(out.join('\\n')); throw new Error(failures + ' check(s) failed'); }

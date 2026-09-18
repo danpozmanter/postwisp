@@ -10,6 +10,13 @@ const fs = require('fs');
 const path = require('path');
 
 const html = fs.readFileSync(path.join(__dirname, '..', 'web', 'admin.html'), 'utf8');
+// The shared admin nav lives in its own file; the New Post link, the
+// Admin link and the sub-nav row all render from it, so its bytes are
+// what the nav checks assert against.
+const navJs = fs.readFileSync(path.join(__dirname, '..', 'web', 'admin-nav.js'), 'utf8');
+// the region of admin-nav.js where the sub-nav row is built
+const subNavStart = navJs.indexOf('const subHtml');
+const subNavRegion = navJs.slice(subNavStart, navJs.indexOf('subs.forEach', subNavStart));
 
 // ---- consolidation: the shipped markup itself ----------------------
 // These assert the page the server sends, before any script runs.
@@ -18,13 +25,22 @@ const markupChecks = [
     ['no editor stylesheet on the dashboard', html.includes('/milkdown.css'), false],
     ['no embedded editor view', html.includes('view-editor'), false],
     ['no raw-toggle button', html.includes('dash-rawbtn'), false],
-    ['New Post opens /editor', /href="\/editor"[^>]*title="Write a post in the full editor"[^>]*>New Post</.test(html), true],
-    ['each post edit link opens /editor', html.includes('href="/editor?id=${p.id}"'), true],
-    // ---- page titles in Proper Case ----
-    ['dashboard heading "Your Posts" is Proper Case', /<h1[^>]*>\s*Your Posts\s*</.test(html), true],
-    ['panel heading "Media Library" is Proper Case', /<h2>\s*Media Library\s*</.test(html), true],
-    ['panel heading "Users" is Proper Case', /<h2>\s*Users\s*</.test(html), true],
-    ['account heading "Your Account" is Proper Case', /<h1[^>]*>\s*Your Account\s*</.test(html), true],
+    ['New Post link is in the shared nav, opens /editor', /href="\/editor"[^>]*title="Write a post in the full editor"[^>]*>New Post</.test(navJs), true],
+    ['each post edit link opens /editor', html.includes('href="/editor?nav=${p.nav}"'), true],
+    // ---- page titles in Proper Case (the five hash views' <h1>s) ----
+    ['h1 "Dashboard Posts" is Proper Case', /<h1[^>]*>\s*Dashboard Posts\s*</.test(html), true],
+    ['h1 "Account" is Proper Case', /<h1[^>]*>\s*Account\s*</.test(html), true],
+    ['h1 "Users" is Proper Case', /<h1[^>]*>\s*Users\s*</.test(html), true],
+    ['h1 "Media Library" is Proper Case', /<h1[^>]*>\s*Media Library\s*</.test(html), true],
+    ['h1 "Settings" is Proper Case', /<h1[^>]*>\s*Settings\s*</.test(html), true],
+    ['old "Your Posts" heading is gone', /<h1[^>]*>\s*Your Posts\s*/.test(html), false],
+    ['sub-nav order: Settings first, Export All Posts last', (() => {
+        const labels = ['Settings', 'Account', 'Users', 'Media Library', 'Dashboard Posts', 'Export All Posts'];
+        const pos = labels.map(l => subNavRegion.indexOf(l));
+        if (pos.some(p => p < 0)) return false;
+        return pos.every((p, i) => i === 0 || p > pos[i - 1]);
+    })(), true],
+    ['Admin in the top bar points at the Settings view', /href="\/dashboard#\/settings"[^>]*title="[^"]*"[^>]*>Admin</.test(navJs), true],
     ['login heading "Log In" is Proper Case', /<h1>\s*Log In\s*</.test(html), true],
     ['two-factor heading "Login Code" is Proper Case', /<h1>\s*Login Code\s*</.test(html), true],
     ['recovery heading "Recover Your Account" is Proper Case', /<h1>\s*Recover Your Account\s*</.test(html), true],
@@ -47,7 +63,11 @@ if (start < 0 || startEnd < 0) {
     console.error('admin.html: no inline script found');
     process.exit(1);
 }
-const pageScript = html.slice(start + '<script>'.length, startEnd);
+const pageScript = html.slice(start + '<script>'.length, startEnd) +
+    // the page's catch blocks call showFatal(), which the LAST inline
+    // block defines — evaluate it alongside the page script
+    '\n' + html.slice(html.lastIndexOf('<script>') + '<script>'.length,
+                      html.indexOf('</script>', html.lastIndexOf('<script>')));
 
 // ---- DOM stub ------------------------------------------------------
 function makeEl(id) {
@@ -118,16 +138,16 @@ const driver = `
 
     // ---- the post list routes every edit to /editor ----
     allPosts = [
-        { id: 5, title: 'Hello <b>world</b>', status: 'draft', username: 'dan',
+        { nav: 'nav-5', title: 'Hello <b>world</b>', status: 'draft', username: 'dan',
           slug: 'hello', source: 'x', tags: 'a,b', modified_at: 1700000000000 },
-        { id: 9, title: 'Published one', status: 'published', username: 'dan',
+        { nav: 'nav-9', title: 'Published one', status: 'published', username: 'dan',
           slug: 'pub', source: 'y', tags: '', published_at: 1700000000000 },
     ];
     renderDashboard();
     const rendered = document.getElementById('dash-lists').innerHTML;
-    eq('draft edit link opens /editor', rendered.includes('href="/editor?id=5"'), true);
-    eq('published edit link opens /editor', rendered.includes('href="/editor?id=9"'), true);
-    eq('draft title link opens /editor', rendered.includes('href="/editor?id=5"'), true);
+    eq('draft edit link opens /editor', rendered.includes('href="/editor?nav=nav-5"'), true);
+    eq('published edit link opens /editor', rendered.includes('href="/editor?nav=nav-9"'), true);
+    eq('draft title link opens /editor', rendered.includes('href="/editor?nav=nav-5"'), true);
     eq('titles are escaped', rendered.includes('Hello &lt;b&gt;world&lt;/b&gt;'), true);
     eq('tags render as chips', rendered.includes('chip'), true);
 

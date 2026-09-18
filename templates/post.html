@@ -248,7 +248,14 @@ article h2:hover .anchor, article h3:hover .anchor, article h4:hover .anchor,
     if (!art || !fig) return;
     var img = art.querySelector('img');
     if (!img) return;
-    var cap = img.getAttribute('alt') || '';
+    // Milkdown rewrites an image's alt to a size ratio on round-trip and
+    // keeps the real caption in the title, so the title is the caption
+    // source and a bare-ratio alt ("1.00") is ignored.
+    var cap = img.getAttribute('title') || '';
+    if (!cap) {
+        var alt = img.getAttribute('alt') || '';
+        if (!/^\d+(\.\d+)?$/.test(alt)) cap = alt;
+    }
     // the figure sits above the h1, so the cover reads as the page header
     while (fig.firstChild) fig.removeChild(fig.firstChild);
     fig.appendChild(img);
