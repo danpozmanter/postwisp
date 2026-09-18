@@ -363,7 +363,7 @@ CODE="$(echo "$RESP" | tail -n1)"
 ok "Logged in; session cookie saved to $JAR."
 curl -sf -b "$JAR" "$BASE_URL/api/me" >/dev/null || die "session check failed (/api/me)."
 
-step "8/8 Choose the blog name and site theme"
+step "8/8 Choose the blog name, subheader, and site theme"
 echo "The blog's name appears as the site title in the top navigation, the"
 echo "home page heading, and the browser tab. It is always stored, so the"
 echo "site never falls back to the admin account's name."
@@ -375,6 +375,31 @@ RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
 CODE="$(echo "$RESP" | tail -n1)"
 [ "$CODE" = "200" ] || die "blog name save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
 ok "Blog name set to '$BLOG_NAME'."
+echo "The subheader is a few words shown under the site title on the home"
+echo "page — for example, what the blog is about. Press Enter to skip (an"
+echo "existing subheader, if any, is kept unchanged), or type 'none' (without"
+echo "the quotes) to remove an existing subheader."
+TAGLINE="$(ask "Subheader — press Enter to skip, 'none' to remove it, or type a few words:")"
+# Trim leading/trailing whitespace so a spaces-only answer behaves like blank.
+TAGLINE="${TAGLINE#"${TAGLINE%%[![:space:]]*}"}"
+TAGLINE="${TAGLINE%"${TAGLINE##*[![:space:]]}"}"
+if [ "$TAGLINE" = "none" ]; then
+    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+        -H 'Content-Type: application/json' \
+        -d '{"tagline":""}')"
+    CODE="$(echo "$RESP" | tail -n1)"
+    [ "$CODE" = "200" ] || die "subheader removal rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
+    ok "Subheader removed."
+elif [ -n "$TAGLINE" ]; then
+    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+        -H 'Content-Type: application/json' \
+        -d "{\"tagline\":\"$(json "$TAGLINE")\"}")"
+    CODE="$(echo "$RESP" | tail -n1)"
+    [ "$CODE" = "200" ] || die "subheader save rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
+    ok "Subheader set to '$TAGLINE'."
+else
+    echo "Skipped — any existing subheader is kept (you can change it later in Settings)."
+fi
 echo "postwisp is dark by default. This choice applies to the whole site"
 echo "(public pages, the post listing, and the admin dashboard)."
 THEME="$(ask "Theme — dark or light? [dark]:")"

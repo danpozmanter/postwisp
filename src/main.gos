@@ -3119,13 +3119,19 @@ fn site_fields(app: App, lang: String, owner: i64 = -1, owner_name: String = "")
     // a fresh account's pages name their author; site-wide it is postwisp
     let title_dflt = if owner_name.len() > 0 { owner_name } else { "postwisp" }
     let title = get_setting(f, "title", title_dflt)
-    let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
+    let tagline = get_setting(f, "tagline", "")
     let footer = get_setting(f, "footer", "")
     let mut theme = get_setting(f, "theme", "dark")
     if theme != "light" && theme != "dark" { theme = "dark" }
     m.insert("title", escape_html(title))
     m.insert("site_title", escape_html(title))
     m.insert("tagline", escape_html(tagline))
+    // an empty tagline leaves no subheader element on the page at all
+    if tagline.len() > 0 {
+        m.insert("tagline_html", "<p id=\"hero-tagline\">" + escape_html(tagline) + "</p>")
+    } else {
+        m.insert("tagline_html", "")
+    }
     m.insert("footer", compose_footer_html(footer, credit_on(f)))
     m.insert("footer_html", compose_footer_html(footer, credit_on(f)))
     m.insert("lang_attr", " lang=\"" + lang + "\"")
@@ -3611,7 +3617,7 @@ fn settings_json_for(app: App, owner: i64, owner_name: String = "", tail: String
     let f = settings_map_for(app, owner)
     let title_dflt = if owner_name.len() > 0 { owner_name } else { "postwisp" }
     let title = get_setting(f, "title", title_dflt)
-    let tagline = get_setting(f, "tagline", "Notes from a small self-hosted blog")
+    let tagline = get_setting(f, "tagline", "")
     let description = get_setting(f, "description", "")
     let footer = get_setting(f, "footer", "")
     let mut theme = get_setting(f, "theme", "dark")
@@ -3673,7 +3679,7 @@ fn handle_put_settings(app: App, req: http::Request) -> http::Response {
             let f = parse_body(req.body)
             let cur = settings_map_for(app, u.id)
             let title = get_setting(f, "title", get_setting(cur, "title", u.username))
-            let tagline = get_setting(f, "tagline", get_setting(cur, "tagline", "Notes from a small self-hosted blog"))
+            let tagline = get_setting(f, "tagline", get_setting(cur, "tagline", ""))
             let description = get_setting(f, "description", get_setting(cur, "description", ""))
             let footer = get_setting(f, "footer", get_setting(cur, "footer", ""))
             let mut credit = get_setting(f, "show_credit", get_setting(cur, "show_credit", "true"))

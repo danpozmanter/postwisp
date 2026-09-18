@@ -181,7 +181,7 @@ footer.site-footer {
 <main class="wrap">
 <section class="hero">
   <h1 id="hero-title">{{site_title}}</h1>
-  <p id="hero-tagline">{{tagline}}</p>
+  {{tagline_html}}
 </section>
 
 <div class="section-title">{{latest}}</div>
@@ -208,7 +208,10 @@ footer.site-footer {
     try { site = Object.assign(site, await jget('/api/public/site')); } catch (e) { /* defaults */ }
     document.title = site.title;
     document.getElementById('hero-title').textContent = site.title;
-    document.getElementById('hero-tagline').textContent = site.tagline || '';
+    if (document.getElementById('hero-tagline')) {
+        document.getElementById('hero-tagline').textContent = site.tagline || '';
+        document.getElementById('hero-tagline').hidden = !site.tagline;
+    }
     document.getElementById('footer-text').innerHTML = site.footer_html || pw.esc(site.footer || '');
 
     let posts = [];

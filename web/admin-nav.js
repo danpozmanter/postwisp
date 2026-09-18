@@ -63,7 +63,7 @@ function pwRenderAdminNav(me, activeView) {
   // the admin landing (the Settings view), never at the posts list.
   right.innerHTML =
     `<span class="who">Welcome, ${pwEsc(me.username)}</span>
-     <a class="btn ghost" href="/posts" title="The public list of published posts">Posts</a>
+     <a class="btn ghost" href="/dashboard#/posts" title="Manage your drafts and published posts">Posts</a>
      <a class="btn ghost" href="/editor" title="Write a post in the full editor">New Post</a>
      <button class="ghost" onclick="openAbout()" title="Create or edit your about page">About Page</button>
      <a class="btn ghost" href="/dashboard#/settings" title="Site settings, your account, users, media and posts">Admin</a>
