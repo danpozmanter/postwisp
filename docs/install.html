@@ -162,9 +162,23 @@ scripts/check-*.js</code>) — never to build or run postwisp.</div>
 <p>On the build machine:</p>
 <pre><code>git clone https://github.com/danpozmanter/postwisp
 cd postwisp
-./build.sh              # Windows: .\build.ps1</code></pre>
-<p>That compiles the release binary and assembles <code>dist/</code>
-containing:</p>
+./build-deploy.sh             # cross-build for your server (default linux-x64)
+./build-deploy.sh linux-arm64 # e.g. an ARM server</code></pre>
+<p>On Windows (PowerShell):</p>
+<pre><code>.\build-deploy.ps1             # cross-build for your server (default linux-x64)
+.\build-deploy.ps1 linux-arm64 # e.g. an ARM server</code></pre>
+<p><code>build-deploy.sh</code> (or <code>build-deploy.ps1</code>) cross-builds
+for the deployment target — <code>linux-x64</code>
+(default, static musl), <code>linux-arm64</code>,
+<code>macos-arm64</code>, <code>macos-x64</code>, or <code>win-x64</code> —
+and sets up the cross-build prerequisites itself. It cleans
+<code>dist/</code> before filling it, and <code>--dir=DIR</code>
+(<code>-Dir DIR</code> in PowerShell) builds into a different directory.
+To try postwisp on the build machine itself, use
+<code>./build-local.sh</code> (<code>.\build-local.ps1</code> on Windows;
+native build, same <code>dist/</code> layout, same
+<code>--dir=</code>/<code>-Dir</code> option).</p>
+<p>Either script assembles the target directory containing:</p>
 <pre><code>dist/postwisp            the release binary
 dist/templates/          index.html post.html list.html about.html
 dist/web/                built-in admin/editor/setup pages

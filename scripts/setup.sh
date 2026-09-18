@@ -42,7 +42,8 @@ APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$APP_DIR"
 
 # Find the postwisp binary: a copied dist/ directory (the normal server
-# case), the checkout right after ./build.sh, or a local dev build.
+# case), the checkout right after ./build-local.sh or ./build-deploy.sh,
+# or a local dev build.
 BIN=""
 for CANDIDATE in "$APP_DIR/postwisp" "$APP_DIR/dist/postwisp" "$APP_DIR/target/debug/postwisp"; do
     if [ -f "$CANDIDATE" ] && [ -x "$CANDIDATE" ]; then
@@ -51,8 +52,8 @@ for CANDIDATE in "$APP_DIR/postwisp" "$APP_DIR/dist/postwisp" "$APP_DIR/target/d
     fi
 done
 if [ -z "$BIN" ]; then
-    GOS_HINT="run ./build.sh first"
-    command -v gos >/dev/null 2>&1 && GOS_HINT="run ./build.sh (or gos build) first"
+    GOS_HINT="run ./build-local.sh (or ./build-deploy.sh) first"
+    command -v gos >/dev/null 2>&1 && GOS_HINT="run ./build-local.sh, ./build-deploy.sh, or gos build first"
     die "no postwisp binary found in $APP_DIR/postwisp, $APP_DIR/dist/postwisp, or $APP_DIR/target/debug/postwisp — $GOS_HINT"
 fi
 if [ "$BIN" != "$APP_DIR/postwisp" ]; then

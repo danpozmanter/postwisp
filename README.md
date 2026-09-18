@@ -53,8 +53,25 @@ optional development checks (see [Development](#development)).
    ```sh
    git clone https://github.com/danpozmanter/postwisp
    cd postwisp
-   ./build.sh              # Windows: .\build.ps1
+   ./build-deploy.sh             # cross-build for your server (default linux-x64)
+   ./build-deploy.sh linux-arm64 # e.g. an ARM server
    ```
+
+   On Windows (PowerShell), the same builds are:
+
+   ```powershell
+   .\build-deploy.ps1             # cross-build for your server (default linux-x64)
+   .\build-deploy.ps1 linux-arm64 # e.g. an ARM server
+   ```
+
+   `build-deploy.sh` (or `build-deploy.ps1`) cross-builds for the deployment
+   target — `linux-x64`
+   (default, static musl), `linux-arm64`, `macos-arm64`, `macos-x64`, or
+   `win-x64` — and sets up the cross-build prerequisites itself. It cleans
+   `dist/` before filling it, and `--dir=DIR` (`-Dir DIR` in PowerShell)
+   builds into a different directory. To try postwisp on the build machine
+   itself, use `./build-local.sh` (`.\build-local.ps1` on Windows; native
+   build, same `dist/` layout, same `--dir=`/`-Dir` option).
 
 3. **Deploy**: copy the **contents** of `dist/` to your server — binary,
    `templates/`, `web/`, and `scripts/` side by side in one directory.
