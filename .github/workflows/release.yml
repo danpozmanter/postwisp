@@ -99,6 +99,12 @@ jobs:
           RUNTIME_LIB="$(find "$TMP" -path '*/gos-*/libgossamer_runtime-musl.a' | head -n1)"
           echo "GOS_RUNTIME_LIB_AARCH64_UNKNOWN_LINUX_MUSL=$(cd "$(dirname "$RUNTIME_LIB")" && pwd)/$(basename "$RUNTIME_LIB")" >> "$GITHUB_ENV"
 
+      # The musl cross link drives the rustup aarch64-musl linker
+      # component; ubuntu-latest runners ship rustup but not this target,
+      # and the build fails without it.
+      - name: Add aarch64 musl Rust target (linker)
+        run: rustup target add aarch64-unknown-linux-musl
+
       - name: Build
         run: gos build --release --target aarch64-unknown-linux-musl
 
@@ -186,13 +192,21 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # The gos installer is a POSIX sh script, so run it under the
-      # Git-for-Windows bash that windows runners ship with.
+      # The gos installer is a POSIX sh script and refuses to run on
+      # Windows (it exits with "unsupported host OS" under Git-for-Windows
+      # bash), so download the Windows asset from the pinned gossamer
+      # release directly. The zip puts gos.exe at its root with
+      # gossamer_runtime.lib beside it, so the extracted directory itself
+      # goes on PATH.
       - name: Install the Gossamer toolchain (${{ env.GOSSAMER_VERSION }})
         shell: bash
         run: |
-          curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          VER_NUM="${GOSSAMER_VERSION#v}"
+          TMP="$(mktemp -d)"
+          curl -fsSL -o "$TMP/gos-windows.zip" \
+            "https://github.com/gossamer-lang/gossamer/releases/download/${GOSSAMER_VERSION}/gos-${VER_NUM}-windows-x86_64.zip"
+          7z x -y "$TMP/gos-windows.zip" -o"$TMP/gos"
+          echo "$TMP/gos" >> "$GITHUB_PATH"
 
       - name: Read project version
         shell: bash
