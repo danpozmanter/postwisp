@@ -18,7 +18,7 @@ permissions:
 env:
   # Pinned to the same toolchain release the test workflow develops
   # against (keep in step with `gossamer-version` in project.toml).
-  GOSSAMER_VERSION: v0.61.1
+  GOSSAMER_VERSION: v0.64.0
 
 jobs:
   build-linux-x86_64:
