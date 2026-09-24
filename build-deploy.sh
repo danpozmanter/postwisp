@@ -104,7 +104,7 @@ case "$TRIPLE" in
             # if none is published for it, fall back to the release
             # workflow's known-good pin.
             TOOLCHAIN_VER="$(gos --version | awk '{print $2}')"
-            VERSIONS="v${TOOLCHAIN_VER} v0.61.1"
+            VERSIONS="v${TOOLCHAIN_VER} v0.64.0 v0.61.1"
             TMP="$(mktemp -d)"
             trap 'rm -rf "$TMP"' EXIT
             for V in $VERSIONS; do

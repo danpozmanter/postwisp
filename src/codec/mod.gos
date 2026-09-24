@@ -32,9 +32,6 @@ pub const TAG_DT: u8 = 9
 /// replaces it before the statement runs.
 pub const TAG_PARAM: u8 = 10
 
-/// The calendar spelling of a datetime, exposed for [`crate::codec::json`].
-pub fn datetime_text(ms: i64) -> String { datetime::text(ms) }
-
 /// A single column value: the tag selects which payload field is meaningful.
 pub struct Value {
     pub tag: u8
@@ -87,12 +84,17 @@ impl Display for Value {
         if self.tag == TAG_BOOL { return self.b.to_string() }
         if self.tag == TAG_TEXT { return self.s }
         if self.tag == TAG_F32 || self.tag == TAG_F64 { return self.f.to_string() }
-        if self.tag == TAG_DT { return datetime::text(self.i) }
+        if self.tag == TAG_DT { return datetime::render(self.i) }
         self.i.to_string()
     }
 }
 
 /// The inclusive value range a fixed-width integer tag can hold, or None for other tags.
+/// Whether values tagged `tag` are whole numbers, at whatever width.
+pub fn is_int(tag: u8) -> bool {
+    tag == TAG_I8 || tag == TAG_I16 || tag == TAG_I32 || tag == TAG_I64
+}
+
 pub fn int_range(tag: u8) -> Option<(i64, i64)> {
     match tag {
         TAG_I8 => Some((-128, 127))
@@ -287,14 +289,19 @@ pub fn decode_row_into(buf: Vec<u8>, count: i64, out: &mut Vec<Value>) -> bool {
 
 /// Decodes `count` values laid out back to back from the start of `buf`.
 pub fn decode_row(buf: Vec<u8>, count: i64) -> Result<Vec<Value>, String> {
+    decode_row_at(buf, 0, buf.len(), count)
+}
+
+/// Decodes `count` values laid out back to back in `buf[start..end]`, for a
+/// row read where it lies inside a larger buffer.
+pub fn decode_row_at(buf: Vec<u8>, start: i64, end: i64, count: i64) -> Result<Vec<Value>, String> {
     let mut vals: Vec<Value> = #[]
-    let mut p: i64 = 0
-    let mut i: i64 = 0
-    while i < count {
+    let mut p = start
+    for _ in 0..count {
         let mut next: i64 = 0
         vals.push(decode_at(buf, p, &mut next)?)
+        if next > end { return Err("decode: a value runs past the end of its row") }
         p = next
-        i += 1
     }
     Ok(vals)
 }

@@ -1,4 +1,8 @@
 # Changelog
+## 0.1.1 - 2026-09-24
+- Updated to Gossamer 0.64.0.
+- Updated the vendored terndb storage engine to 0.3.0.
+
 ## 0.1.0 - 2026-09-17
 - Self-hosted multi-user blog in one binary: server, JSON API, admin dashboard, and public pages.
 - Markdown editor at `/editor` with a styled/raw toggle and a heading outline.

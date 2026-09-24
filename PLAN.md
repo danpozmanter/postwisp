@@ -29,7 +29,7 @@ process to deploy**.
 - **Embedded, not the TCP server.** One process, one binary, no socket RTT,
   and the single-writer rule is enforced by the router's single-threaded
   request handling instead of a protocol. The engine is **vendored** into
-  `src/` (`engine/`, `sql/`, `kv/`, `codec/` — terndb 0.2.0's module tree) — no external
+  `src/` (`engine/`, `sql/`, `kv/`, `codec/` — terndb 0.3.0's module tree) — no external
   dependency in `project.toml`. **[deviation: was a path dependency]**
 - **Two data paths, matched to how each is read.** The dashboard and the API
   go through SQL (`SELECT ... ORDER BY ... LIMIT` — what the engine is good

@@ -153,6 +153,7 @@ if ($triple -like '*-linux-musl') {
         if ((gos --version) -match '^gos\s+(\S+)') { $gosVersion = $Matches[1] }
         $versions = @()
         if ($gosVersion) { $versions += "v$gosVersion" }
+        $versions += 'v0.64.0'
         $versions += 'v0.61.1'
         $script:RuntimeTmp = Join-Path ([System.IO.Path]::GetTempPath()) ([System.Guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $script:RuntimeTmp -Force | Out-Null

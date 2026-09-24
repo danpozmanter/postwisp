@@ -3321,13 +3321,13 @@ fn feed_xml(base: String, username: String, feed_title: String, mine: Vec<Post>)
     xml += "<link href=\"" + escape_html(root + "/feed.xml") + "\" rel=\"self\" type=\"application/atom+xml\"/>\n"
     xml += "<id>" + escape_html(root + "/feed.xml") + "</id>\n"
     xml += "<author><name>" + escape_html(username) + "</name></author>\n"
-    xml += "<updated>" + (if mine.len() > 0 { codec::datetime::text(mine[0].published_at) } else { codec::datetime::text(now_ms()) }) + "</updated>\n"
+    xml += "<updated>" + (if mine.len() > 0 { codec::datetime::render(mine[0].published_at) } else { codec::datetime::render(now_ms()) }) + "</updated>\n"
     for p in mine {
         let link = escape_html(root + "/" + p.slug)
         xml += "<entry>\n<title>" + escape_html(p.title) + "</title>\n"
         xml += "<link href=\"" + link + "\" rel=\"alternate\" type=\"text/html\"/>\n"
         xml += "<id>" + link + "</id>\n"
-        xml += "<updated>" + codec::datetime::text(p.published_at) + "</updated>\n"
+        xml += "<updated>" + codec::datetime::render(p.published_at) + "</updated>\n"
         xml += "<content type=\"html\">" + escape_html(p.content) + "</content>\n"
         xml += "</entry>\n"
     }
@@ -3940,8 +3940,8 @@ fn push_string_bytes(buf: &mut Vec<u8>, s: String) {
 fn post_stamp(ms: i64) -> PostStamp {
     // codec::datetime::render gives 2025-01-15T10:30:45.123Z; split it apart so the
     // entry name and the DOS timestamp agree on one datetime.
-    let date_s = codec::datetime::text(ms).split("T")[0]
-    let time_s = codec::datetime::text(ms).split("T")[1].split(".")[0]
+    let date_s = codec::datetime::render(ms).split("T")[0]
+    let time_s = codec::datetime::render(ms).split("T")[1].split(".")[0]
     let dp = date_s.split("-")
     let tp = time_s.split(":")
     let mut y = dp[0].to_i64().unwrap_or(1980)

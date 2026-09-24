@@ -33,7 +33,7 @@ To **build** postwisp you need:
 
 - A Linux, macOS, or Windows machine.
 - The [Gossamer](https://github.com/gossamer-lang/gossamer) toolchain,
-  `^v0.58.3`:
+  `^v0.64.0`:
 
   ```sh
   curl -fsSL https://raw.githubusercontent.com/gossamer-lang/gossamer/main/scripts/install.sh | sh
