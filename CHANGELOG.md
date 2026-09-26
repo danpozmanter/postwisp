@@ -1,4 +1,7 @@
 # Changelog
+## 0.1.2 - 2026-09-26
+- setup.sh: clear failure messages when the server is unreachable, bind-address validation, tab-safe JSON escaping, and a private (mktemp) cookie jar.
+- Added the first tests for the kv log framing (src/kv/log.gos) and ORDER BY resolution (src/engine/order.gos).
 ## 0.1.1 - 2026-09-24
 - Updated to Gossamer 0.64.0.
 - Updated the vendored terndb storage engine to 0.3.0.

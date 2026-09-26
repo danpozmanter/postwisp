@@ -61,3 +61,35 @@ pub (package) fn rows(eng: &mut engine::Engine, def: &mut engine::TableDef, filt
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::engine
+
+    fn table() -> engine::TableDef {
+        engine::TableDef { name: "posts", cols: #["id", "title"], tags: #[0, 0] }
+    }
+
+    #[test]
+    fn resolve_orders_by_rowid_case_insensitively() {
+        let mut def = table()
+        assert_eq(super::resolve(&mut def, "rowid"), Ok(super::ROWID))
+        assert_eq(super::resolve(&mut def, "ROWID"), Ok(super::ROWID))
+    }
+
+    #[test]
+    fn resolve_maps_a_column_to_its_index() {
+        let mut def = table()
+        assert_eq(super::resolve(&mut def, "id"), Ok(0))
+        assert_eq(super::resolve(&mut def, "title"), Ok(1))
+    }
+
+    #[test]
+    fn resolve_names_the_unknown_column() {
+        let mut def = table()
+        match super::resolve(&mut def, "slug") {
+            Ok(i) => panic("slug resolved to {}", i),
+            Err(e) => assert(e.contains("slug"), "error names the column: " + e),
+        }
+    }
+}

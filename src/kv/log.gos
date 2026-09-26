@@ -108,6 +108,53 @@ pub (package) fn key_from(bytes: Vec<u8>) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use std::fs
+
+    fn fresh(name: String) -> String {
+        let dir = "/tmp/terndb_kv_test/" + name
+        let _ = fs::remove_dir_all(dir)
+        let _ = fs::create_dir_all(dir)
+        dir
+    }
+
+    #[test]
+    fn parse_gen_reads_the_file_stem() {
+        assert_eq(super::parse_gen("3.data", ".data"), Some(3))
+        // Leading zeros are a file name, not part of the number.
+        assert_eq(super::parse_gen("007.hint", ".hint"), Some(7))
+    }
+
+    #[test]
+    fn parse_gen_rejects_names_that_are_not_generations() {
+        // A stem that is not all digits is someone else's file.
+        assert_eq(super::parse_gen("x.data", ".data"), None)
+        // The suffix must match too.
+        assert_eq(super::parse_gen("12.hint", ".data"), None)
+        // An empty stem names no generation.
+        assert_eq(super::parse_gen(".data", ".data"), None)
+    }
+
+    #[test]
+    fn data_generations_lists_data_files_sorted() {
+        let dir = fresh("data_generations")
+        for name in #["10.data", "2.data", "1.hint", "notes.txt"] {
+            let _ = fs::write(dir + "/" + name, #[])
+        }
+        match super::data_generations(dir) {
+            Ok(gens) => assert_eq(gens, #[2, 10])
+            Err(e) => panic("data_generations: {}", e),
+        }
+    }
+
+    #[test]
+    fn key_from_rejects_invalid_utf8() {
+        assert_eq(super::key_from(#[104, 105]), Some("hi"))
+        assert_eq(super::key_from(#[255]), None)
+    }
+}
+
 pub (package) fn pack_loc(offset: i64, vlen: i64) -> i64 { (offset << VLEN_BITS) | vlen }
 
 pub (package) fn pack_gc(gen: i64, crc: i64) -> i64 { (gen << 32) | crc }

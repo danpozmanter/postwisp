@@ -14,8 +14,14 @@
 set -euo pipefail
 
 DATA_DIR="data"
-JAR="/tmp/postwisp-cookies.txt"
 SERVICE_NAME="postwisp"
+# The user the service runs as. USER is not exported in every shell (su,
+# sudo, cron), so fall back to id rather than failing under `set -u`.
+PW_USER="${USER:-$(id -un)}"
+# A per-run cookie jar in a private temporary file, not a predictable
+# /tmp path another local user could pre-create or read.
+JAR="$(mktemp "${TMPDIR:-/tmp}/postwisp-cookies.XXXXXX")"
+trap 'rm -f "$JAR"' EXIT
 
 step() { printf '\n\033[1;36m== %s ==\033[0m\n' "$*"; }
 ok()   { printf '\033[1;32mOK:\033[0m %s\n' "$*"; }
@@ -28,8 +34,25 @@ ask_secret() {
     echo >&2
     printf '%s' "$ans"
 }
-# minimal JSON string escaping so quotes/backslashes in user input survive
-json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+# minimal JSON string escaping so quotes/backslashes/tabs in pasted input
+# survive (a literal tab would make the JSON body invalid)
+json() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g'; }
+
+# api: an API call that says clearly when the server cannot be reached at
+# all, instead of answering an empty HTTP status. All arguments pass
+# through to curl; it prints the response with the HTTP status on the last
+# line, exactly like curl -s -w '\n%{http_code}'.
+api() {
+    local resp code
+    if ! resp="$(curl -s -w '\n%{http_code}' "$@")"; then
+        die "could not reach the server at $BASE_URL — is it still running? Check: ${SERVICE_STATUS_CMD:-the service status}"
+    fi
+    code="${resp##*$'\n'}"
+    case "$code" in
+        ''|*[!0-9]*) die "the server at $BASE_URL answered no HTTP status — is it still running? Check: ${SERVICE_STATUS_CMD:-the service status}" ;;
+    esac
+    printf '%s' "$resp"
+}
 
 # ---------------------------------------------------------------- 1/8 ---
 step "1/8 Detect environment"
@@ -87,6 +110,9 @@ echo "front. That is the normal shape for a VPS. Choosing 0.0.0.0:8080"
 echo "instead serves your LAN / public interface directly (no TLS)."
 PW_ADDR="$(ask "Bind address — press Enter for 127.0.0.1:8080, or type 0.0.0.0:8080:")"
 [ -z "$PW_ADDR" ] && PW_ADDR="127.0.0.1:8080"
+if ! printf '%s' "$PW_ADDR" | grep -Eq '^[A-Za-z0-9._-]+:[0-9]{1,5}$'; then
+    die "invalid bind address '$PW_ADDR' — use host:port, e.g. 127.0.0.1:8080 or 0.0.0.0:8080"
+fi
 BASE_URL="http://$PW_ADDR"
 ok "The server will listen on $PW_ADDR (health endpoint: $BASE_URL/status)."
 
@@ -227,12 +253,12 @@ if [ "$MANUAL_MODE" = 0 ]; then
                 ok "Unit written: $UNIT_PATH"
             fi
             # Linger: keep the user service alive after you log out.
-            if loginctl enable-linger "$USER" 2>/dev/null; then
+            if loginctl enable-linger "$PW_USER" 2>/dev/null; then
                 ok "Linger enabled — the service survives logout."
             else
                 echo "NOTE: could not enable linger automatically (needs an"
                 echo "admin). Ask your host to run:"
-                echo "    sudo loginctl enable-linger $USER"
+                echo "    sudo loginctl enable-linger $PW_USER"
                 echo "Until then the service stops when you log out."
             fi
             systemctl --user daemon-reload || die "systemctl --user daemon-reload failed"
@@ -324,7 +350,7 @@ else
             fi
             printf '\033[1;31mFAILED:\033[0m passwords do not match — try again.\n' >&2
         done
-        RESP="$(curl -s -w '\n%{http_code}' -X POST "$BASE_URL/api/setup" \
+        RESP="$(api -X POST "$BASE_URL/api/setup" \
             -H 'Content-Type: application/json' \
             -d "{\"token\":\"$(json "$TOKEN")\",\"username\":\"$(json "$USERNAME")\",\"email\":\"$(json "$EMAIL")\",\"password\":\"$(json "$PASSWORD")\"}")"
         CODE="$(echo "$RESP" | tail -n1)"
@@ -356,7 +382,7 @@ else
 fi
 
 step "7/8 Log in"
-RESP="$(curl -s -w '\n%{http_code}' -c "$JAR" -X POST "$BASE_URL/api/login" \
+RESP="$(api -c "$JAR" -X POST "$BASE_URL/api/login" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"$(json "$USERNAME")\",\"password\":\"$(json "$PASSWORD")\"}")"
 CODE="$(echo "$RESP" | tail -n1)"
@@ -370,7 +396,7 @@ echo "home page heading, and the browser tab. It is always stored, so the"
 echo "site never falls back to the admin account's name."
 BLOG_NAME="$(ask "Blog name — press Enter to use the default ('postwisp'), or type one:")"
 [ -n "$BLOG_NAME" ] || BLOG_NAME="postwisp"
-RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+RESP="$(api -b "$JAR" -X PUT "$BASE_URL/api/settings" \
     -H 'Content-Type: application/json' \
     -d "{\"title\":\"$(json "$BLOG_NAME")\"}")"
 CODE="$(echo "$RESP" | tail -n1)"
@@ -385,14 +411,14 @@ TAGLINE="$(ask "Subheader — press Enter to skip, 'none' to remove it, or type 
 TAGLINE="${TAGLINE#"${TAGLINE%%[![:space:]]*}"}"
 TAGLINE="${TAGLINE%"${TAGLINE##*[![:space:]]}"}"
 if [ "$TAGLINE" = "none" ]; then
-    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+    RESP="$(api -b "$JAR" -X PUT "$BASE_URL/api/settings" \
         -H 'Content-Type: application/json' \
         -d '{"tagline":""}')"
     CODE="$(echo "$RESP" | tail -n1)"
     [ "$CODE" = "200" ] || die "subheader removal rejected (HTTP $CODE): $(echo "$RESP" | head -n1)"
     ok "Subheader removed."
 elif [ -n "$TAGLINE" ]; then
-    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+    RESP="$(api -b "$JAR" -X PUT "$BASE_URL/api/settings" \
         -H 'Content-Type: application/json' \
         -d "{\"tagline\":\"$(json "$TAGLINE")\"}")"
     CODE="$(echo "$RESP" | tail -n1)"
@@ -409,7 +435,7 @@ while [ "$THEME" != "dark" ] && [ "$THEME" != "light" ]; do
     THEME="$(ask "Please type 'dark' or 'light':")"
     [ -z "$THEME" ] && THEME="dark"
 done
-RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+RESP="$(api -b "$JAR" -X PUT "$BASE_URL/api/settings" \
     -H 'Content-Type: application/json' \
     -d "{\"theme\":\"$THEME\"}")"
 CODE="$(echo "$RESP" | tail -n1)"
@@ -429,7 +455,7 @@ if [ -n "$UKEY" ]; then
     # both paths agree from the first login.
     printf '# postwisp environment — read by the server at boot.\n# See README-env.md in this directory.\nPW_UNSPLASH_KEY=%s\n' "$UKEY" > env
     chmod 600 env
-    RESP="$(curl -s -w '\n%{http_code}' -b "$JAR" -X PUT "$BASE_URL/api/settings" \
+    RESP="$(api -b "$JAR" -X PUT "$BASE_URL/api/settings" \
         -H 'Content-Type: application/json' \
         -d "{\"unsplash_key\":\"$(json "$UKEY")\"}")"
     CODE="$(echo "$RESP" | tail -n1)"
